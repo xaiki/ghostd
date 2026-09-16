@@ -86,3 +86,39 @@ func TestUntaggedCallerCanStillReadViaIdentify(t *testing.T) {
 		t.Fatalf("this identity should not carry the deployer tag")
 	}
 }
+
+func TestCapabilityAuthorization(t *testing.T) {
+	for _, tc := range []struct {
+		name, raw string
+		allow     bool
+	}{
+		{"explicit", `{"deploy":true}`, true},
+		{"false", `{"deploy":false}`, false},
+		{"empty", `{}`, false},
+		{"null", `null`, false},
+		{"wrong type", `{"deploy":"true"}`, false},
+		{"malformed", `{`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := taggedResponse("operator@example.com")
+			resp.CapMap = tailcfg.PeerCapMap{DeployCapability: {tailcfg.RawMessage(tc.raw)}}
+			a := NewAuthenticator(fakeWhoIs{resp: resp}, "tag:stack-deployer")
+			id, err := a.AuthorizeDeployer(context.Background(), "100.64.0.1:1234")
+			if (err == nil) != tc.allow {
+				t.Fatalf("allowed=%v, error=%v", tc.allow, err)
+			}
+			if tc.allow && (id.Login != "operator@example.com" || len(id.Tags) != 0) {
+				t.Fatal("user identity changed")
+			}
+		})
+	}
+}
+
+func TestUnrelatedCapabilityDoesNotAuthorize(t *testing.T) {
+	resp := taggedResponse("operator@example.com")
+	resp.CapMap = tailcfg.PeerCapMap{"example.com/other": {`{"deploy":true}`}}
+	a := NewAuthenticator(fakeWhoIs{resp: resp}, "tag:stack-deployer")
+	if _, err := a.AuthorizeDeployer(context.Background(), "100.64.0.1:1234"); err == nil {
+		t.Fatal("unrelated capability authorized")
+	}
+}

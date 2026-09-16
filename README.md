@@ -29,10 +29,27 @@ Do not expose the listener through a public proxy.
 
 Each RPC resolves its caller using the local tailscaled `WhoIs` API. Any recognized
 peer allowed to reach the port can read state. `Apply` and `Confirm` additionally
-require the caller's **node** to carry `tag:stack-deployer` (configurable).
-Configure tag ownership and network access in your tailnet policy; ghostd does
-not manage either. A user login or membership in a similarly named group does
-not substitute for the node tag.
+require either the configured node tag (`tag:stack-deployer` by default) or a
+`ghostd.local/cap/deploy` application capability containing `{"deploy": true}`.
+Capabilities are read from local tailscaled's `WhoIs` response on every call,
+including confirmation; callers cannot supply them in RPC payloads. Missing,
+false, or malformed permissions do not authorize mutations.
+
+Keep workstations user-owned. Grant authorized users access to specific server
+Tailscale IPs in the tailnet policy (example addresses/identities only):
+
+```json
+{"grants": [{
+  "src": ["operator@example.com"],
+  "dst": ["100.64.0.10"],
+  "ip": ["tcp:7443"],
+  "app": {"ghostd.local/cap/deploy": [{"deploy": true}]}
+}]}
+```
+
+Merge this rule into existing policy; do not replace the policy with this example.
+Use the actual listener port if changed. No workstation tags or SSH policy changes
+are required. The node-tag path remains available for dedicated automation.
 
 Treat deployer access as host-administrator access. Interface configuration can
 contain root-executed ifupdown hooks, and the legacy `forward` action executes an
@@ -186,7 +203,7 @@ that file. No gRPC reflection service is enabled.
    recovery before retrying. A second apply to the same domain is rejected while
    a pending lease remains.
 
-For example, using `grpcurl` and `jq` from a deployer-tagged machine (each grpcurl
+For example, using `grpcurl` and `jq` from an authorized deployer (each grpcurl
 invocation opens a separate connection):
 
 ```sh
@@ -262,7 +279,7 @@ until all pending leases have been confirmed or recovered.
 | Flag | Default | Purpose |
 | --- | --- | --- |
 | `--port` | `7443` | TCP listener and firewall reachability-guard port |
-| `--deployer-tag` | `tag:stack-deployer` | Required caller node tag for mutations |
+| `--deployer-tag` | `tag:stack-deployer` | Alternative caller node tag for mutations |
 | `--tailscale-interface` | `tailscale0` | Interface allowed by the reachability guard |
 | `--store-dir` | `/var/lib/smarthome-ghostd/last-good` | Durable transaction storage |
 | `--watchdog-sec` | `0` | Watchdog interval setting; match systemd `WatchdogSec` |

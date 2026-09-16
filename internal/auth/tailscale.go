@@ -6,10 +6,12 @@ package auth
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 
 	"tailscale.com/client/tailscale/apitype"
+	"tailscale.com/tailcfg"
 )
 
 // WhoIs is the one thing this package needs from tailscaled — narrowed from
@@ -18,12 +20,14 @@ type WhoIs interface {
 	WhoIs(ctx context.Context, remoteAddr string) (*apitype.WhoIsResponse, error)
 }
 
-// Identity is what one caller's WhoIs answer proved: a real tailnet login,
-// cryptographically backed by WireGuard and the tailnet control plane — not
-// "whichever Unix uid opened the socket".
+// DeployCapability is destination-scoped by the tailnet policy engine.
+const DeployCapability tailcfg.PeerCapability = "ghostd.local/cap/deploy"
+
+// Identity is the caller identity and permissions proved by local tailscaled.
 type Identity struct {
-	Login string
-	Tags  []string
+	Login     string
+	Tags      []string
+	CanDeploy bool
 }
 
 func (id Identity) HasTag(tag string) bool {
@@ -38,8 +42,8 @@ func (id Identity) HasTag(tag string) bool {
 var ErrNotOnTailnet = errors.New("auth: caller is not a recognized tailnet peer")
 
 // Authenticator resolves a remote address to an Identity via WhoIs, and
-// authorizes mutating calls against one ACL tag. Reachability itself is the
-// first gate: the RPC listener only ever binds the tailscale interface
+// authorizes mutations using a destination-scoped capability or node tag.
+// Reachability itself is the first gate: the RPC listener only ever binds the tailscale interface
 // (cmd/ghostd/main.go), so a caller reaching this code already dialed in over
 // the tailnet — WhoIs is what turns "reached the socket" into "is this
 // identity", the gate FIREWALL.md means by "never Unix login".
@@ -59,29 +63,35 @@ func (a *Authenticator) Identify(ctx context.Context, remoteAddr string) (Identi
 	if err != nil {
 		return Identity{}, fmt.Errorf("%w: %v", ErrNotOnTailnet, err)
 	}
-	if resp.Node == nil {
+	if resp == nil || resp.Node == nil {
 		return Identity{}, fmt.Errorf("%w: WhoIs answered no node", ErrNotOnTailnet)
 	}
 	login := ""
 	if resp.UserProfile != nil {
 		login = resp.UserProfile.LoginName
 	}
-	return Identity{Login: login, Tags: resp.Node.Tags}, nil
+	canDeploy := false
+	for _, raw := range resp.CapMap[DeployCapability] {
+		var permission struct {
+			Deploy bool `json:"deploy"`
+		}
+		if err := json.Unmarshal([]byte(raw), &permission); err == nil && permission.Deploy {
+			canDeploy = true
+		}
+	}
+	return Identity{Login: login, Tags: resp.Node.Tags, CanDeploy: canDeploy}, nil
 }
 
-// AuthorizeDeployer is the gate on every mutating RPC (Apply, Confirm):
-// only the identity carrying the configured ACL tag — reusing
-// machines/tailscale_policy.py's tag-owner machinery on the Python side,
-// not a credential store this daemon invents itself — may call them.
-// GetState carries no such requirement (use Identify alone): any tailnet
-// member may read state.
+// AuthorizeDeployer accepts an explicit deploy capability from local tailscaled,
+// or the configured node tag for dedicated automation. User-owned workstations
+// need no identity changes. GetState requires only Identify.
 func (a *Authenticator) AuthorizeDeployer(ctx context.Context, remoteAddr string) (Identity, error) {
 	id, err := a.Identify(ctx, remoteAddr)
 	if err != nil {
 		return Identity{}, err
 	}
-	if !id.HasTag(a.deployerTag) {
-		return Identity{}, fmt.Errorf("auth: %s is not tagged %s; mutating calls refused",
+	if !id.CanDeploy && !id.HasTag(a.deployerTag) {
+		return Identity{}, fmt.Errorf("auth: %s lacks ghostd deploy capability and tag %s; mutating calls refused",
 			id.Login, a.deployerTag)
 	}
 	return id, nil

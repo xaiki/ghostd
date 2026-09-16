@@ -31,12 +31,14 @@ import (
 const validDesiredStateJSON = `{"zones":{"trusted":{"interfaces":["tailscale0"]}}}`
 
 type fakeWhoIs struct {
+	caps tailcfg.PeerCapMap
 	tags []string
 }
 
 func (f fakeWhoIs) WhoIs(ctx context.Context, remoteAddr string) (*apitype.WhoIsResponse, error) {
 	return &apitype.WhoIsResponse{
 		Node:        &tailcfg.Node{Tags: f.tags},
+		CapMap:      f.caps,
 		UserProfile: &tailcfg.UserProfile{LoginName: "test@example.com"},
 	}, nil
 }
@@ -574,5 +576,42 @@ func TestConfirmReadCannotOutliveDeadline(t *testing.T) {
 	d, _ = s.store.Domain("firewall", NftRuleset)
 	if d.Pending == nil || len(leases.calls) != 1 {
 		t.Fatal("late confirmation disarmed recovery")
+	}
+}
+
+func TestCapabilityCallerPassesMutationGateAndRevocationClosesIt(t *testing.T) {
+	s, _, _, _ := newTestServer(t, nil)
+	s.authenticator = auth.NewAuthenticator(fakeWhoIs{caps: tailcfg.PeerCapMap{
+		auth.DeployCapability: {`{"deploy":true}`},
+	}}, "tag:stack-deployer")
+	// Invalid payload proves authorization succeeded without mutating the host.
+	_, err := s.Apply(withPeer(context.Background()), &pb.ApplyRequest{Domain: "firewall", DesiredStateJson: "invalid"})
+	if err == nil || strings.Contains(err.Error(), "auth:") {
+		t.Fatalf("capability did not pass auth: %v", err)
+	}
+	s.authenticator = auth.NewAuthenticator(fakeWhoIs{}, "tag:stack-deployer")
+	_, err = s.Apply(withPeer(context.Background()), &pb.ApplyRequest{Domain: "firewall", DesiredStateJson: validDesiredStateJSON})
+	if err == nil || !strings.Contains(err.Error(), "auth:") {
+		t.Fatalf("revocation not enforced: %v", err)
+	}
+	_, err = s.Confirm(withPeer(context.Background()), &pb.ConfirmRequest{LeaseId: "unknown"})
+	if err == nil || !strings.Contains(err.Error(), "auth:") {
+		t.Fatalf("confirm revocation not enforced: %v", err)
+	}
+}
+
+func TestCapabilityCallerAppliesAndConfirms(t *testing.T) {
+	s, _, _, _ := newTestServer(t, nil)
+	s.authenticator = auth.NewAuthenticator(fakeWhoIs{caps: tailcfg.PeerCapMap{
+		auth.DeployCapability: {`{"deploy":true}`},
+	}}, "tag:stack-deployer")
+	ctx := withPeer(context.Background())
+	applied, err := s.Apply(ctx, &pb.ApplyRequest{Domain: "firewall", DesiredStateJson: validDesiredStateJSON, DeadManSwitchSeconds: 300})
+	if err != nil {
+		t.Fatal(err)
+	}
+	confirmed, err := s.Confirm(freshPeer(ctx), &pb.ConfirmRequest{LeaseId: applied.GetLeaseId()})
+	if err != nil || !confirmed.GetOk() {
+		t.Fatalf("Confirm: %v, %v", confirmed, err)
 	}
 }
