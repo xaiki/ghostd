@@ -43,8 +43,8 @@ func (ExecRunner) RunStdin(ctx context.Context, name string, script string, args
 // ReadRulesetJSON is GetState's firewall half, and what Confirm persists as
 // last-confirmed state: the live kernel ruleset, structured (nft -j), not
 // a text scrape — the same "diffable, not a blob" requirement FIREWALL.md
-// put on GetState generally. It is also what Restore below replays,
-// unchanged — nft's own JSON format round-trips through `-j -f -`.
+// put on GetState generally. Restore replays the owned objects after removing
+// kernel handles, which have positioning semantics in explicit add commands.
 func ReadRulesetJSON(ctx context.Context, runner Runner) (string, error) {
 	out, err := runner.Output(ctx, "nft", "-j", "list", "ruleset")
 	if err != nil {
@@ -119,7 +119,19 @@ func Restore(ctx context.Context, runner Runner, rulesetJSON []byte) error {
 	table := map[string]any{"table": map[string]string{"family": "inet", "name": tableName}}
 	commands := []any{map[string]any{"add": table}, map[string]any{"delete": table}}
 	for _, entry := range dump.Nftables {
-		commands = append(commands, map[string]any{"add": entry})
+		// A list-output handle identifies the old kernel object. In an
+		// explicit add-rule command it instead means "append after this
+		// handle", which no longer exists after deleting our table.
+		clean := make(map[string]any, len(entry))
+		for kind, body := range entry {
+			var obj map[string]json.RawMessage
+			if err := json.Unmarshal(body, &obj); err != nil {
+				return fmt.Errorf("nft: invalid snapshot %s: %w", kind, err)
+			}
+			delete(obj, "handle")
+			clean[kind] = obj
+		}
+		commands = append(commands, map[string]any{"add": clean})
 	}
 	script, err := json.Marshal(map[string]any{"nftables": commands})
 	if err != nil {

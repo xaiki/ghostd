@@ -8,6 +8,38 @@ import (
 	"testing"
 )
 
+type restoreCapture struct{ script string }
+
+func (r *restoreCapture) Output(context.Context, string, ...string) ([]byte, error) {
+	panic("restore must not split its atomic transaction with a read")
+}
+func (r *restoreCapture) RunStdin(_ context.Context, _ string, script string, _ ...string) ([]byte, error) {
+	r.script = script
+	return nil, nil
+}
+
+func TestRestoreDropsKernelHandlesButPreservesRuleOrder(t *testing.T) {
+	raw := []byte(`{"nftables":[
+	 {"table":{"family":"inet","name":"stack_ghostd","handle":51}},
+	 {"chain":{"family":"inet","table":"stack_ghostd","name":"input","handle":52}},
+	 {"rule":{"family":"inet","table":"stack_ghostd","chain":"input","handle":53,"expr":[{"accept":null}]}},
+	 {"rule":{"family":"inet","table":"stack_ghostd","chain":"input","handle":54,"expr":[{"drop":null}]}}
+	]}`)
+	r := &restoreCapture{}
+	if err := Restore(context.Background(), r, raw); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(r.script, `"handle"`) {
+		t.Fatalf("stale kernel handles replayed: %s", r.script)
+	}
+	if !strings.Contains(string(raw), `"handle":53`) {
+		t.Fatal("saved snapshot mutated")
+	}
+	if strings.Index(r.script, `"accept"`) >= strings.Index(r.script, `"drop"`) {
+		t.Fatal("rule order changed")
+	}
+}
+
 func TestOwnedRulesetExcludesOtherWriters(t *testing.T) {
 	raw := []byte(`{"nftables":[{"metainfo":{"json_schema_version":1}},{"table":{"family":"inet","name":"safety_net"}},{"table":{"family":"inet","name":"stack_ghostd"}},{"chain":{"family":"inet","table":"stack_ghostd","name":"input"}},{"rule":{"family":"inet","table":"safety_net","chain":"input"}}]}`)
 	out, err := OwnedRuleset(raw)
@@ -98,6 +130,16 @@ func TestIntegrationReplaceAndRollback(t *testing.T) {
 	}
 	if !strings.Contains(read(), "12345") {
 		t.Fatal("snapshot not restored")
+	}
+	// Boot recovery must also work with no live owned table at all.
+	if _, err := r.RunStdin(ctx, "nft", "delete table inet stack_ghostd\n", "-f", "-"); err != nil {
+		t.Fatal(err)
+	}
+	if err := Restore(ctx, r, before); err != nil {
+		t.Fatal(err)
+	}
+	if count(read()) != count(string(before)) {
+		t.Fatal("boot restore lost or duplicated rules")
 	}
 	if err := Restore(ctx, r, absent); err != nil {
 		t.Fatal(err)
