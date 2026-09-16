@@ -1,0 +1,33 @@
+# smarthome-ghostd — see FIREWALL.md at the repo root.
+#
+# Installed by machines/host_ghostd.py (FIREWALL.md Phase 3), not by hand.
+# Not templated: the binary path and flags are fixed by that installer,
+# so this file is committed as the literal unit content it writes.
+[Unit]
+Description=smarthome-ghostd — tailnet-authenticated firewall/netconfig/ingress daemon
+Documentation=https://github.com/ (see FIREWALL.md in the smarthome repo)
+# tailscaled.service: ghostd binds its RPC listener to the tailnet address
+# alone and refuses to start without one (cmd/ghostd/main.go) — no point
+# starting before tailscaled has a chance to be up. network-pre.target:
+# same reasoning one layer down, for whatever brings the interface
+# tailscaled itself rides up. Neither is a hard Requires=: a host whose
+# tailscaled is flapping should not take ghostd down with it — the boot-time
+# last-good restore (which does not depend on either) is what keeps the
+# host's own firewall/netconfig state intact regardless.
+After=network-pre.target tailscaled.service
+Wants=network-pre.target tailscaled.service
+
+[Service]
+Type=notify
+ExecStart=/opt/smarthome/ghostd/ghostd --watchdog-sec=30
+Restart=always
+RestartSec=5
+WatchdogSec=30
+# Root is the point: this daemon owns nftables/netconfig, the same
+# surfaces firewalld's polkit grant used to reach for a different user.
+# What changed is the authentication path (FIREWALL.md), not the
+# privilege level the work itself has always needed.
+User=root
+
+[Install]
+WantedBy=multi-user.target

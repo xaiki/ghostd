@@ -1,0 +1,60 @@
+syntax = "proto3";
+
+package ghostd;
+
+option go_package = "smarthome/ghostd/proto";
+
+// HostState is smarthome-ghostd's whole RPC surface (FIREWALL.md): the
+// daemon does not decide policy, it executes a state Nornir already
+// resolved. GetState answers with clean, diffable current state; Apply
+// enacts a fully-resolved declarative target behind a dead-man's-switch;
+// Confirm — called from a *fresh* connection, after independently
+// reproving reachability — cancels that switch. No Confirm before the
+// deadline reverts to the last state that ever passed Confirm.
+service HostState {
+  rpc GetState(GetStateRequest) returns (State);
+  rpc Apply(ApplyRequest) returns (ApplyResponse);
+  rpc Confirm(ConfirmRequest) returns (ConfirmResponse);
+}
+
+message GetStateRequest {}
+
+// State is deliberately a thin envelope around raw, structured JSON per
+// domain rather than a typed nftables/netconfig schema in proto itself:
+// each domain's real shape is still being designed (Phase 4/5), and the
+// envelope is what lets GetState/Apply exist now without churning the
+// wire format every time a domain's internals change.
+message State {
+  // `nft -j list ruleset` output, verbatim. Empty until Phase 4.
+  string nft_ruleset_json = 1;
+  // machines.net_ifaces's own live-read shape (persisted interfaces.d file
+  // bytes + `ip -j addr show` + /proc/sys/net/ipv4/ip_forward), as JSON.
+  // Empty until Phase 5.
+  string netconfig_json = 2;
+}
+
+message ApplyRequest {
+  // The fully-resolved declarative target Nornir computed — not a diff.
+  string desired_state_json = 1;
+  // How long the dead-man's-switch waits for Confirm before reverting to
+  // the last confirmed state. Required; the caller does not get to apply
+  // with no revert path.
+  int32 dead_man_switch_seconds = 2;
+  // Which domain desired_state_json is for: "firewall" or "netconfig".
+  // Required — the two domains' desired_state_json shapes are incompatible,
+  // and routing one to the wrong renderer on a guess is not a survivable
+  // mistake to auto-detect.
+  string domain = 3;
+}
+
+message ApplyResponse {
+  string lease_id = 1;
+}
+
+message ConfirmRequest {
+  string lease_id = 1;
+}
+
+message ConfirmResponse {
+  bool ok = 1;
+}
