@@ -50,6 +50,8 @@ func Render(ds DesiredState, guard ReachabilityGuard) (string, error) {
 	names := sortedZoneNames(ds.Zones)
 
 	var b strings.Builder
+	b.WriteString("# Atomic replacement: ensure the table exists, delete it, then recreate it below.\n")
+	b.WriteString("# nft applies this entire file as one transaction; other tables are untouched.\n")
 	fmt.Fprintf(&b, "add table inet %s\ndelete table inet %s\n", tableName, tableName)
 	fmt.Fprintf(&b, "table inet %s {\n", tableName)
 

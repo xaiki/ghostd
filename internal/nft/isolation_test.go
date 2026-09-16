@@ -1,0 +1,140 @@
+package nft
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"os"
+	"os/exec"
+	"testing"
+	"time"
+)
+
+// Invoked by the parent test inside a client network namespace.
+func TestIntegrationPacketProbe(t *testing.T) {
+	target := os.Getenv("GHOSTD_PACKET_TARGET")
+	if target == "" {
+		t.Skip("client subprocess only")
+	}
+	proto := os.Getenv("GHOSTD_PACKET_PROTO")
+	conn, err := net.DialTimeout(proto, target, 500*time.Millisecond)
+	if err == nil {
+		defer conn.Close()
+		if proto == "udp" {
+			conn.SetDeadline(time.Now().Add(500 * time.Millisecond))
+			_, err = conn.Write([]byte("probe"))
+			if err == nil {
+				var reply [32]byte
+				_, err = conn.Read(reply[:])
+			}
+		}
+	}
+	allowed := os.Getenv("GHOSTD_PACKET_ALLOW") == "1"
+	if (err == nil) != allowed {
+		t.Fatalf("%s %s: allowed=%v, got %v", proto, target, allowed, err)
+	}
+}
+
+// Real listeners and packets, not just a textual assertion about rules. Run in
+// a disposable Linux VM under unshare -n: this also creates temporary netns.
+func TestIntegrationGuestCannotReachLANServices(t *testing.T) {
+	if os.Getenv("GHOSTD_NFT_INTEGRATION") != "1" {
+		t.Skip("requires disposable Linux network namespaces")
+	}
+	ctx := context.Background()
+	command := func(args ...string) {
+		t.Helper()
+		if out, err := exec.Command("ip", args...).CombinedOutput(); err != nil {
+			t.Fatalf("ip %v: %v: %s", args, err, out)
+		}
+	}
+	command("link", "set", "lo", "up")
+	names := map[string]string{}
+	for i, zone := range []string{"guest", "lan"} {
+		ns := fmt.Sprintf("ghostd-%s-%d", zone, os.Getpid())
+		dev := "gd-" + zone
+		names[zone] = ns
+		command("netns", "add", ns)
+		defer exec.Command("ip", "netns", "delete", ns).Run()
+		command("link", "add", dev, "type", "veth", "peer", "name", dev+"-peer")
+		command("link", "set", dev+"-peer", "netns", ns)
+		subnet := fmt.Sprintf("192.0.%d", 2+i)
+		command("addr", "add", subnet+".1/24", "dev", dev)
+		command("link", "set", dev, "up")
+		command("-n", ns, "addr", "add", subnet+".2/24", "dev", dev+"-peer")
+		command("-n", ns, "link", "set", dev+"-peer", "up")
+		command("-n", ns, "route", "add", "default", "via", subnet+".1")
+	}
+	for _, port := range []int{22, 53, 2049, 18080, 8443} {
+		listener, err := net.Listen("tcp4", fmt.Sprintf("0.0.0.0:%d", port))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer listener.Close()
+		go func(l net.Listener) {
+			for {
+				c, err := l.Accept()
+				if err != nil {
+					return
+				}
+				c.Close()
+			}
+		}(listener)
+	}
+	for _, port := range []int{69, 5353} {
+		listener, err := net.ListenPacket("udp4", fmt.Sprintf("0.0.0.0:%d", port))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer listener.Close()
+		go func(l net.PacketConn) {
+			var b [32]byte
+			for {
+				n, addr, err := l.ReadFrom(b[:])
+				if err != nil {
+					return
+				}
+				l.WriteTo(b[:n], addr)
+			}
+		}(listener)
+	}
+	ds := DesiredState{Zones: map[string]Zone{
+		"guest": {Interfaces: []string{"gd-guest"}, Ports: []PortRule{{Port: 53, Proto: "tcp"}, {Port: 5353, Proto: "udp"}}},
+		"lan":   {Interfaces: []string{"gd-lan"}, SSH: &SSHRule{Port: 22}, Ports: []PortRule{{Port: 2049, Proto: "tcp"}}},
+	}, Ingress: &Ingress{Interfaces: []string{"gd-lan"}, HTTPPort: 18080}}
+	script, err := Render(ds, guard())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Commit(ctx, ExecRunner{}, script); err != nil {
+		t.Fatal(err)
+	}
+	defer Restore(ctx, ExecRunner{}, []byte(`{"nftables":[]}`))
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	probe := func(zone, proto, address string, allow bool) {
+		t.Helper()
+		cmd := exec.Command("ip", "netns", "exec", names[zone], exe, "-test.run=^TestIntegrationPacketProbe$", "-test.v")
+		flag := "0"
+		if allow {
+			flag = "1"
+		}
+		cmd.Env = append(os.Environ(), "GHOSTD_PACKET_TARGET="+address, "GHOSTD_PACKET_PROTO="+proto, "GHOSTD_PACKET_ALLOW="+flag)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%s probe: %v: %s", zone, err, out)
+		}
+	}
+	probe("guest", "tcp", "192.0.2.1:53", true)
+	probe("guest", "udp", "192.0.2.1:5353", true)
+	for _, port := range []int{22, 2049, 18080, 8443} {
+		probe("guest", "tcp", fmt.Sprintf("192.0.2.1:%d", port), false)
+	}
+	probe("guest", "udp", "192.0.2.1:69", false)
+	// Even addressing the router's LAN IP cannot escape the incoming guest zone.
+	probe("guest", "tcp", "192.0.3.1:2049", false)
+	probe("lan", "tcp", "192.0.3.1:2049", true)
+	probe("lan", "tcp", "192.0.3.1:80", true)
+	probe("lan", "tcp", "192.0.3.1:443", true)
+}
