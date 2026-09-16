@@ -64,11 +64,10 @@ func (*GetStateRequest) Descriptor() ([]byte, []int) {
 // wire format every time a domain's internals change.
 type State struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// `nft -j list ruleset` output, verbatim. Empty until Phase 4.
+	// `nft -j list ruleset` output, verbatim.
 	NftRulesetJson string `protobuf:"bytes,1,opt,name=nft_ruleset_json,json=nftRulesetJson,proto3" json:"nft_ruleset_json,omitempty"`
 	// machines.net_ifaces's own live-read shape (persisted interfaces.d file
 	// bytes + `ip -j addr show` + /proc/sys/net/ipv4/ip_forward), as JSON.
-	// Empty until Phase 5.
 	NetconfigJson string `protobuf:"bytes,2,opt,name=netconfig_json,json=netconfigJson,proto3" json:"netconfig_json,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -123,7 +122,7 @@ type ApplyRequest struct {
 	// The fully-resolved declarative target Nornir computed — not a diff.
 	DesiredStateJson string `protobuf:"bytes,1,opt,name=desired_state_json,json=desiredStateJson,proto3" json:"desired_state_json,omitempty"`
 	// How long the dead-man's-switch waits for Confirm before reverting to
-	// the last confirmed state. Required; the caller does not get to apply
+	// the pre-apply snapshot. Required; the caller does not get to apply
 	// with no revert path.
 	DeadManSwitchSeconds int32 `protobuf:"varint,2,opt,name=dead_man_switch_seconds,json=deadManSwitchSeconds,proto3" json:"dead_man_switch_seconds,omitempty"`
 	// Which domain desired_state_json is for: "firewall" or "netconfig".

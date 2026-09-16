@@ -2,6 +2,9 @@ package state
 
 import (
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -74,7 +77,7 @@ func TestCancelStopsTheArmedUnit(t *testing.T) {
 		t.Fatalf("expected arm + cancel calls, got %v", runner.calls)
 	}
 	cancelCall := runner.calls[1]
-	if cancelCall[0] != "systemctl" || cancelCall[1] != "stop" {
+	if cancelCall[0] != "systemctl" || cancelCall[1] != "stop" || cancelCall[2] != "smarthome-ghostd-revert-lease-1.timer" {
 		t.Fatalf("expected systemctl stop, got %v", cancelCall)
 	}
 }
@@ -108,5 +111,53 @@ func TestNewLeaseIDsAreUniqueAndOpaque(t *testing.T) {
 	}
 	if a == "" {
 		t.Fatalf("expected a non-empty lease id")
+	}
+}
+
+func TestIntegrationTimerCancellation(t *testing.T) {
+	if os.Getenv("GHOSTD_SYSTEMD_INTEGRATION") != "1" {
+		t.Skip("requires disposable Linux systemd")
+	}
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "fired")
+	binary := filepath.Join(dir, "revert")
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\n: > "+marker+"\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	// Fedora's disposable VM forbids systemd from executing tmp_t files.
+	// Label only this temporary test executable like an installed binary.
+	if exec.Command("selinuxenabled").Run() == nil {
+		if out, err := exec.Command("chcon", "-t", "bin_t", binary).CombinedOutput(); err != nil {
+			t.Fatalf("label test executable: %v: %s", err, out)
+		}
+	}
+	leases := NewLeases(binary, ExecRunner{})
+	id := NewLeaseID()
+	if err := leases.Arm(id, "firewall", 2*time.Second, dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := leases.Cancel(id); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(3 * time.Second)
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatal("cancelled timer still fired")
+	}
+	id = NewLeaseID()
+	if err := leases.Arm(id, "firewall", time.Second, dir); err != nil {
+		t.Fatal(err)
+	}
+	defer leases.Cancel(id)
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(marker); err == nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		out, _ := exec.Command("systemctl", "status", unitName(id)+".timer", unitName(id)+".service", "--no-pager").CombinedOutput()
+		t.Logf("systemd state: %s", out)
+		t.Fatalf("unconfirmed timer did not fire: %v", err)
 	}
 }

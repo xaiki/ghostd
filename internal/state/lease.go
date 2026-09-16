@@ -1,6 +1,7 @@
 package state
 
 import (
+	"context"
 	"fmt"
 	"os/exec"
 	"sync"
@@ -19,7 +20,9 @@ type CommandRunner interface {
 type ExecRunner struct{}
 
 func (ExecRunner) Run(name string, args ...string) error {
-	return exec.Command(name, args...).Run()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return exec.CommandContext(ctx, name, args...).Run()
 }
 
 // Leases arms and cancels the dead-man's-switch for in-flight Apply calls.
@@ -63,7 +66,7 @@ func NewLeaseID() string {
 // the daemon that armed it has since crashed, restarted, or lost whatever
 // it remembered about this lease. Its own argv is the one channel
 // guaranteed to reach it.
-func (l *Leases) Arm(leaseID string, domain string, timeout time.Duration) error {
+func (l *Leases) Arm(leaseID string, domain string, timeout time.Duration, storeDir ...string) error {
 	if timeout <= 0 {
 		return fmt.Errorf("state: dead-man's-switch timeout must be positive, got %s", timeout)
 	}
@@ -75,8 +78,12 @@ func (l *Leases) Arm(leaseID string, domain string, timeout time.Duration) error
 		"--unit=" + unit,
 		"--description=smarthome-ghostd dead-man's-switch revert",
 		fmt.Sprintf("--on-active=%ds", int(timeout.Seconds())),
+		"--timer-property=AccuracySec=100ms",
 		"--",
 		l.binaryPath, "--revert-lease=" + leaseID, "--revert-domain=" + domain,
+	}
+	if len(storeDir) > 0 {
+		args = append(args, "--store-dir="+storeDir[0])
 	}
 	if err := l.runner.Run("systemd-run", args...); err != nil {
 		return fmt.Errorf("state: arm dead-man's-switch for lease %s: %w", leaseID, err)
@@ -87,21 +94,21 @@ func (l *Leases) Arm(leaseID string, domain string, timeout time.Duration) error
 	return nil
 }
 
-// Cancel disarms a lease's revert timer — called only after the caller has
-// re-proven reachability over a fresh connection (see FIREWALL.md; Confirm
-// in internal/rpc is the only caller).
+// Cancel stops the timer after the durable transaction has been confirmed.
+// A service already triggered by that timer observes no pending lease and exits.
+// On a command failure keep the local entry so cleanup can be retried.
 func (l *Leases) Cancel(leaseID string) error {
 	l.mu.Lock()
 	unit, armed := l.units[leaseID]
-	if armed {
-		delete(l.units, leaseID)
-	}
 	l.mu.Unlock()
 	if !armed {
 		return fmt.Errorf("state: lease %s is not armed", leaseID)
 	}
-	if err := l.runner.Run("systemctl", "stop", unit); err != nil {
+	if err := l.runner.Run("systemctl", "stop", unit+".timer"); err != nil {
 		return fmt.Errorf("state: cancel dead-man's-switch for lease %s: %w", leaseID, err)
 	}
+	l.mu.Lock()
+	delete(l.units, leaseID)
+	l.mu.Unlock()
 	return nil
 }

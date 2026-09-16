@@ -2,6 +2,8 @@ package nft
 
 import (
 	"fmt"
+	"net/netip"
+	"regexp"
 	"sort"
 	"strings"
 )
@@ -36,27 +38,19 @@ var builtinServices = map[string][]PortRule{
 // real export ever needs it, rather than guessed at now.
 var nfsPorts = []int{111, 2049, 20048}
 
-// Render turns a validated DesiredState into a complete nft(8) script —
-// one atomic `table inet stack_ghostd { ... }` definition, replacing
-// whatever this table held before (nft loads a script transactionally: a
-// `table inet X { ... }` block with the same name as an existing table
-// replaces it in one kernel transaction, never a flicker of "table
-// missing"). Callers must still run `nft -c -f -` on the result before
-// ever loading it (see internal/rpc.Server.Apply) — this function renders,
-// it does not validate nft's own grammar.
-//
-// Every zone is walked in sorted name order and every interface list is
-// rendered in sorted order — nft ruleset text becomes part of what
-// Confirm persists as "last-confirmed state" (see internal/rpc.Server),
-// so two renders of the same DesiredState must produce byte-identical
-// text for that persistence to be meaningful.
+// Render replaces only our table in one atomic nft transaction. An add is
+// idempotent, so add/delete works on both the first and subsequent applies.
 func Render(ds DesiredState, guard ReachabilityGuard) (string, error) {
+	if !validInterface(guard.TailscaleInterface) || !validPort(guard.Port) {
+		return "", fmt.Errorf("nft: invalid reachability guard")
+	}
 	if err := validate(ds); err != nil {
 		return "", err
 	}
 	names := sortedZoneNames(ds.Zones)
 
 	var b strings.Builder
+	fmt.Fprintf(&b, "add table inet %s\ndelete table inet %s\n", tableName, tableName)
 	fmt.Fprintf(&b, "table inet %s {\n", tableName)
 
 	writeInputChain(&b, ds, guard, names)
@@ -73,12 +67,64 @@ func Render(ds DesiredState, guard ReachabilityGuard) (string, error) {
 	return b.String(), nil
 }
 
+var zoneName = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
+var interfaceName = regexp.MustCompile(`^[a-zA-Z0-9_.:-]{1,15}$`)
+
+func validInterface(name string) bool {
+	return interfaceName.MatchString(name) && name != "." && name != ".."
+}
+func validPort(port int) bool { return port >= 1 && port <= 65535 }
+
 func validate(ds DesiredState) error {
 	if len(ds.Zones) == 0 {
 		return fmt.Errorf("nft: no zones declared")
 	}
+	if ds.Ingress != nil {
+		if !validPort(ds.Ingress.HTTPPort) || len(ds.Ingress.Interfaces) == 0 {
+			return fmt.Errorf("nft: ingress requires interfaces and a valid HTTP port")
+		}
+		for _, iface := range ds.Ingress.Interfaces {
+			if !validInterface(iface) {
+				return fmt.Errorf("nft: invalid ingress interface %q", iface)
+			}
+		}
+	}
+	assigned := map[string]string{}
 	hasReachableZone := false
 	for name, zone := range ds.Zones {
+		if !zoneName.MatchString(name) {
+			return fmt.Errorf("nft: invalid zone name %q", name)
+		}
+		if zone.Target != "" && !strings.EqualFold(zone.Target, "DROP") && !strings.EqualFold(zone.Target, "ACCEPT") {
+			return fmt.Errorf("nft: invalid target %q", zone.Target)
+		}
+		for _, iface := range zone.Interfaces {
+			if !validInterface(iface) {
+				return fmt.Errorf("nft: invalid interface %q", iface)
+			}
+			if previous, ok := assigned[iface]; ok {
+				return fmt.Errorf("nft: interface %q repeated in zones %q and %q", iface, previous, name)
+			}
+			assigned[iface] = name
+		}
+		if zone.SSH != nil && !validPort(zone.SSH.Port) {
+			return fmt.Errorf("nft: invalid SSH port")
+		}
+		for _, rule := range zone.Ports {
+			if !validPort(rule.Port) || (rule.Proto != "tcp" && rule.Proto != "udp") {
+				return fmt.Errorf("nft: invalid port rule %+v", rule)
+			}
+		}
+		if zone.NFS != nil {
+			for _, source := range zone.NFS.Exports {
+				prefix, err := netip.ParsePrefix(source)
+				addr, addrErr := netip.ParseAddr(source)
+				if (err != nil || !prefix.Addr().Is4()) && (addrErr != nil || !addr.Is4()) {
+					return fmt.Errorf("nft: NFS source must be an IPv4 address or CIDR: %q", source)
+				}
+			}
+		}
+
 		if name == "trusted" || zone.SSH != nil {
 			hasReachableZone = true
 		}
@@ -130,6 +176,11 @@ func writeInputChain(b *strings.Builder, ds DesiredState, guard ReachabilityGuar
 	b.WriteString("    type filter hook input priority 0; policy drop;\n")
 	b.WriteString("    ct state established,related accept\n")
 	b.WriteString("    iifname \"lo\" accept\n")
+	// IPv6 addressing needs NDP/RA even when no application service is open.
+	// Neighbor/router discovery is link-local in scope (hop limit 255); ICMP
+	// errors are required for path MTU discovery and transport correctness.
+	b.WriteString("    meta l4proto ipv6-icmp icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem } accept\n")
+	b.WriteString("    meta l4proto ipv6-icmp icmpv6 type { nd-router-solicit, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert } ip6 hoplimit 255 accept\n")
 	// The reachability guard: hardcoded here, never derived from
 	// ds.Zones, so a desired_state that never mentions the tailnet
 	// interface at all still leaves this daemon reachable.
@@ -166,8 +217,8 @@ func writePreroutingChain(b *strings.Builder, ds DesiredState) {
 	b.WriteString("    type nat hook prerouting priority -100;\n")
 	if ds.Ingress != nil {
 		for _, iface := range sortedStrings(ds.Ingress.Interfaces) {
-			fmt.Fprintf(b, "    iifname %q tcp dport 80 dnat to :%d\n", iface, ds.Ingress.HTTPPort)
-			fmt.Fprintf(b, "    iifname %q tcp dport 443 dnat to :8443\n", iface)
+			fmt.Fprintf(b, "    iifname %q fib daddr type local tcp dport 80 dnat to :%d\n", iface, ds.Ingress.HTTPPort)
+			fmt.Fprintf(b, "    iifname %q fib daddr type local tcp dport 443 dnat to :8443\n", iface)
 		}
 	}
 	b.WriteString("  }\n")

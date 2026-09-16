@@ -24,6 +24,17 @@ func TestRenderRejectsNoZones(t *testing.T) {
 	}
 }
 
+func TestRenderPreservesIPv6ControlTrafficWithoutOpeningApplicationPorts(t *testing.T) {
+	script, err := Render(minimalDesiredState(), guard())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(script, "nd-neighbor-solicit, nd-neighbor-advert } ip6 hoplimit 255 accept") ||
+		!strings.Contains(script, "packet-too-big") {
+		t.Fatal("IPv6 NDP/PMTU blocked by default drop")
+	}
+}
+
 func TestRenderRejectsNoReachableZone(t *testing.T) {
 	ds := DesiredState{Zones: map[string]Zone{
 		"iot": {Interfaces: []string{"end0.50"}},
@@ -175,10 +186,10 @@ func TestRenderIngressDNATAndAccept(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
-	if !strings.Contains(script, `iifname "end0" tcp dport 80 dnat to :18080`) {
+	if !strings.Contains(script, `iifname "end0" fib daddr type local tcp dport 80 dnat to :18080`) {
 		t.Fatalf("expected an 80->http_port DNAT rule in:\n%s", script)
 	}
-	if !strings.Contains(script, `iifname "end0" tcp dport 443 dnat to :8443`) {
+	if !strings.Contains(script, `iifname "end0" fib daddr type local tcp dport 443 dnat to :8443`) {
 		t.Fatalf("expected a 443->8443 DNAT rule in:\n%s", script)
 	}
 	if !strings.Contains(script, `iifname { "end0" } tcp dport { 18080, 8443 } accept`) {
@@ -208,5 +219,46 @@ func TestParseDesiredStateRoundTrips(t *testing.T) {
 	}
 	if ds.Zones["mgmt"].SSH.Port != 22 {
 		t.Fatalf("got %+v", ds)
+	}
+}
+
+func TestRenderRejectsUnsafeOrAmbiguousFields(t *testing.T) {
+	cases := map[string]func(*DesiredState){
+		"zone syntax": func(ds *DesiredState) { ds.Zones["x { accept; }"] = ds.Zones["mgmt"] },
+		"protocol syntax": func(ds *DesiredState) {
+			z := ds.Zones["mgmt"]
+			z.Ports = []PortRule{{Port: 22, Proto: "tcp; flush ruleset;"}}
+			ds.Zones["mgmt"] = z
+		},
+		"source syntax": func(ds *DesiredState) {
+			z := ds.Zones["mgmt"]
+			z.NFS = &NFSRule{Exports: []string{"0.0.0.0/0 accept; drop"}}
+			ds.Zones["mgmt"] = z
+		},
+		"SSH port": func(ds *DesiredState) { ds.Zones["mgmt"].SSH.Port = 0 },
+		"port overflow": func(ds *DesiredState) {
+			z := ds.Zones["mgmt"]
+			z.Ports = []PortRule{{Port: 65536, Proto: "tcp"}}
+			ds.Zones["mgmt"] = z
+		},
+		"shared interface":   func(ds *DesiredState) { ds.Zones["other"] = Zone{Interfaces: []string{"end0.10"}} },
+		"wildcard interface": func(ds *DesiredState) { z := ds.Zones["mgmt"]; z.Interfaces = []string{"end*"}; ds.Zones["mgmt"] = z },
+		"unknown target":     func(ds *DesiredState) { z := ds.Zones["mgmt"]; z.Target = "ACCEPP"; ds.Zones["mgmt"] = z },
+		"ingress port":       func(ds *DesiredState) { ds.Ingress = &Ingress{Interfaces: []string{"end0"}, HTTPPort: -1} },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			ds := minimalDesiredState()
+			mutate(&ds)
+			if _, err := Render(ds, guard()); err == nil {
+				t.Fatal("invalid policy accepted")
+			}
+		})
+	}
+}
+
+func TestRenderRejectsMissingReachabilityGuard(t *testing.T) {
+	if _, err := Render(minimalDesiredState(), ReachabilityGuard{}); err == nil {
+		t.Fatal("guard omitted")
 	}
 }

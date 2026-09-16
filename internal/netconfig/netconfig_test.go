@@ -178,7 +178,7 @@ func TestApplyVlanToleratesAnAlreadyExistingLink(t *testing.T) {
 		if calls == 1 {
 			return nil, errFake // link add fails: already exists
 		}
-		return nil, nil // link show succeeds: it really is there
+		return []byte(`[{"ifname":"eth0","ifindex":2},{"ifname":"eth0.10","link_index":2,"linkinfo":{"info_kind":"vlan","info_data":{"id":10}}}]`), nil
 	}}
 	ds := DesiredState{Actions: [][]string{{"vlan", "eth0", "eth0.10", "10"}}}
 	if err := Apply(context.Background(), wrapped, ds); err != nil {
@@ -304,7 +304,7 @@ func TestApplyIdempotentAddrToleratesAnAlreadyPresentAddress(t *testing.T) {
 		if calls == 1 {
 			return nil, errFake // addr add fails: already assigned
 		}
-		return []byte("inet 10.0.0.5/24 scope global eth0.10"), nil // show confirms it
+		return []byte(`[{"ifname":"eth0.10","addr_info":[{"local":"10.0.0.5","prefixlen":24}]}]`), nil // show confirms it
 	}}
 	ds := DesiredState{Actions: [][]string{{"addr", "eth0.10", "10.0.0.5/24"}}}
 	if err := Apply(context.Background(), wrapped, ds); err != nil {
@@ -352,5 +352,110 @@ func TestApplyUpFailureIsReported(t *testing.T) {
 	ds := DesiredState{Actions: [][]string{{"up", "eth0.10"}}}
 	if err := Apply(context.Background(), runner, ds); err == nil {
 		t.Fatal("expected an 'ip link set up' failure to be reported")
+	}
+}
+
+// Uses only uniquely named test files inside the disposable VM; no interface
+// reload, link deletion or host addressing changes are performed.
+func TestIntegrationSnapshotRestoresFilesAndAbsence(t *testing.T) {
+	if os.Getenv("GHOSTD_NETCONFIG_INTEGRATION") != "1" {
+		t.Skip("requires disposable Linux filesystem")
+	}
+	if err := os.MkdirAll(InterfacesDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	existing, err := os.CreateTemp(InterfacesDir, "stack-ghostd-test-*.conf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := existing.Name()
+	existing.Close()
+	defer os.Remove(path)
+	missing := path + "-new"
+	defer os.Remove(missing)
+	if err := os.WriteFile(path, []byte("original\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	desired := DesiredState{Files: map[string]string{path: "changed\n", missing: "new\n"}}
+	ctx := context.Background()
+	r := &fakeRunner{}
+	snapshot, err := Snapshot(ctx, r, desired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Apply(ctx, r, desired); err != nil {
+		t.Fatal(err)
+	}
+	if err := Rollback(ctx, r, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(path)
+	if err != nil || string(content) != "original\n" {
+		t.Fatalf("restore: %s %v", content, err)
+	}
+	if _, err := os.Stat(missing); !os.IsNotExist(err) {
+		t.Fatal("new file survived rollback")
+	}
+}
+
+func TestFailedAddrAddRequiresExactAddressAndPrefix(t *testing.T) {
+	for _, live := range []string{
+		`[{"ifname":"eth0.10","addr_info":[{"local":"10.0.0.50","prefixlen":24}]}]`,
+		`[{"ifname":"eth0.10","addr_info":[{"local":"10.0.0.5","prefixlen":32}]}]`,
+		`[{"ifname":"eth0.20","addr_info":[{"local":"10.0.0.5","prefixlen":24}]}]`,
+	} {
+		calls := 0
+		r := &sequencedRunner{onCall: func(name string, args []string) ([]byte, error) {
+			calls++
+			if calls == 1 {
+				return nil, errFake
+			}
+			return []byte(live), nil
+		}}
+		if err := Apply(context.Background(), r, DesiredState{Actions: [][]string{{"addr", "eth0.10", "10.0.0.5/24"}}}); err == nil {
+			t.Fatalf("accepted mismatched live address: %s", live)
+		}
+	}
+}
+
+func TestExistingVLANMustMatchParentAndID(t *testing.T) {
+	for _, live := range []string{
+		`[{"ifname":"eth0","ifindex":2},{"ifname":"eth0.10","link_index":2,"linkinfo":{"info_kind":"vlan","info_data":{"id":20}}}]`,
+		`[{"ifname":"eth0","ifindex":2},{"ifname":"eth0.10","link_index":3,"linkinfo":{"info_kind":"vlan","info_data":{"id":10}}}]`,
+		`[{"ifname":"eth0","ifindex":2},{"ifname":"eth0.10","link_index":2,"linkinfo":{"info_kind":"dummy"}}]`,
+	} {
+		calls := 0
+		r := &sequencedRunner{onCall: func(name string, args []string) ([]byte, error) {
+			calls++
+			if calls == 1 {
+				return nil, errFake
+			}
+			return []byte(live), nil
+		}}
+		if err := Apply(context.Background(), r, DesiredState{Actions: [][]string{{"vlan", "eth0", "eth0.10", "10"}}}); err == nil {
+			t.Fatalf("accepted mismatched link: %s", live)
+		}
+	}
+}
+
+func TestIntegrationExistingLinkAndAddressChecks(t *testing.T) {
+	if os.Getenv("GHOSTD_NETCONFIG_INTEGRATION") != "1" {
+		t.Skip("requires disposable Linux network namespace")
+	}
+	ctx := context.Background()
+	r := ExecRunner{}
+	if out, err := r.Output(ctx, "ip", "link", "add", "ghostdtest0", "type", "dummy"); err != nil {
+		t.Fatalf("dummy: %v %s", err, out)
+	}
+	defer r.Output(ctx, "ip", "link", "delete", "ghostdtest0")
+	ds := DesiredState{Actions: [][]string{{"vlan", "ghostdtest0", "ghostdtest0.10", "10"}, {"addr", "ghostdtest0.10", "192.0.2.1/24"}}}
+	for i := 0; i < 2; i++ {
+		if err := Apply(ctx, r, ds); err != nil {
+			t.Fatalf("apply %d: %v", i, err)
+		}
+	}
+	ds.Actions = [][]string{{"vlan", "ghostdtest0", "ghostdtest0.10", "20"}}
+	if err := Apply(ctx, r, ds); err == nil {
+		t.Fatal("mismatched VLAN accepted")
 	}
 }

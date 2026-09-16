@@ -85,3 +85,22 @@ func TestNewStoreCreatesTheDirectoryPrivately(t *testing.T) {
 		t.Fatalf("expected mode 0700, got %o", info.Mode().Perm())
 	}
 }
+
+func TestStoreResolvesRelativeDirectoryForTimerProcess(t *testing.T) {
+	absolute := t.TempDir()
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	relative, err := filepath.Rel(cwd, absolute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewStore(relative)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.Dir() != absolute {
+		t.Fatalf("timer would receive relative directory %q", store.Dir())
+	}
+}

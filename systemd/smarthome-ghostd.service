@@ -1,11 +1,6 @@
-# smarthome-ghostd — see FIREWALL.md at the repo root.
-#
-# Installed by machines/host_ghostd.py (FIREWALL.md Phase 3), not by hand.
-# Not templated: the binary path and flags are fixed by that installer,
-# so this file is committed as the literal unit content it writes.
+# ghostd — installation and recovery instructions: README.md.
 [Unit]
 Description=smarthome-ghostd — tailnet-authenticated firewall/netconfig/ingress daemon
-Documentation=https://github.com/ (see FIREWALL.md in the smarthome repo)
 # tailscaled.service: ghostd binds its RPC listener to the tailnet address
 # alone and refuses to start without one (cmd/ghostd/main.go) — no point
 # starting before tailscaled has a chance to be up. network-pre.target:

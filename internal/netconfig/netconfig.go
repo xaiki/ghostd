@@ -19,10 +19,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -31,6 +33,11 @@ import (
 // `/etc/network/interfaces.d/stack-*.conf` into. Validate refuses any
 // desired-state file path outside it.
 const InterfacesDir = "/etc/network/interfaces.d"
+
+var forwardingFiles = map[string]bool{
+	"/etc/sysctl.d/99-stack-forward.conf":    true,
+	"/etc/sysctl.d/99-stack-no-forward.conf": true,
+}
 
 // Runner runs one command to completion and returns its combined output —
 // the seam tests fake. Real callers use ExecRunner.
@@ -82,7 +89,13 @@ var knownActions = map[string]int{
 // internal/nft.Render's own validation gets before ValidateSyntax) and
 // internally by Apply itself, defensively.
 func Validate(ds DesiredState) error {
-	for path := range ds.Files {
+	for path, content := range ds.Files {
+		if forwardingFiles[path] {
+			if content != "" && content != "net.ipv4.ip_forward=0\n" && content != "net.ipv4.ip_forward=1\n" {
+				return fmt.Errorf("netconfig: invalid forwarding file %s", path)
+			}
+			continue
+		}
 		clean := filepath.Clean(path)
 		if clean != path || !strings.HasPrefix(clean, InterfacesDir+string(filepath.Separator)) {
 			return fmt.Errorf("netconfig: refusing to write %q: not inside %s", path, InterfacesDir)
@@ -99,6 +112,12 @@ func Validate(ds DesiredState) error {
 		}
 		if got := len(action) - 1; got != want {
 			return fmt.Errorf("netconfig: action %q wants %d argument(s), got %d", action[0], want, got)
+		}
+		if action[0] == "sysctl" && action[1] != "net.ipv4.ip_forward=0" && action[1] != "net.ipv4.ip_forward=1" {
+			return fmt.Errorf("netconfig: only IPv4 forwarding sysctl is supported")
+		}
+		if action[0] == "forward" && action[1] != "/etc/stack-forward.sh" {
+			return fmt.Errorf("netconfig: unknown forwarding script")
 		}
 	}
 	return validateNoConflictingAddresses(ds.Actions)
@@ -187,16 +206,61 @@ func Apply(ctx context.Context, runner Runner, ds DesiredState) error {
 		return err
 	}
 	for _, path := range sortedKeys(ds.Files) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if err := writeFile(path, ds.Files[path]); err != nil {
 			return err
 		}
 	}
 	for _, action := range ds.Actions {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if err := applyAction(ctx, runner, action); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// A colliding name is not proof that an existing link is the requested VLAN.
+func checkVLAN(ctx context.Context, runner Runner, base, dev, vlanID string) error {
+	out, err := runner.Output(ctx, "ip", "-j", "-d", "link", "show")
+	if err != nil {
+		return err
+	}
+	var links []struct {
+		Name   string `json:"ifname"`
+		Index  int    `json:"ifindex"`
+		Parent int    `json:"link_index"`
+		Link   string `json:"link"`
+		Info   struct {
+			Kind string `json:"info_kind"`
+			Data struct {
+				ID int `json:"id"`
+			} `json:"info_data"`
+		} `json:"linkinfo"`
+	}
+	if err := json.Unmarshal(out, &links); err != nil {
+		return err
+	}
+	id, err := strconv.Atoi(vlanID)
+	if err != nil {
+		return err
+	}
+	parent := 0
+	for _, link := range links {
+		if link.Name == base {
+			parent = link.Index
+		}
+	}
+	for _, link := range links {
+		if link.Name == dev && parent != 0 && (link.Parent == parent || (link.Parent == 0 && link.Link == base)) && link.Info.Kind == "vlan" && link.Info.Data.ID == id {
+			return nil
+		}
+	}
+	return fmt.Errorf("existing %s does not match VLAN %s on %s", dev, vlanID, base)
 }
 
 func applyAction(ctx context.Context, runner Runner, action []string) error {
@@ -205,7 +269,7 @@ func applyAction(ctx context.Context, runner Runner, action []string) error {
 		base, dev, vlanID := action[1], action[2], action[3]
 		if _, err := runner.Output(ctx, "ip", "link", "add", "link", base, "name", dev,
 			"type", "vlan", "id", vlanID); err != nil {
-			if _, chkErr := runner.Output(ctx, "ip", "link", "show", dev); chkErr != nil {
+			if chkErr := checkVLAN(ctx, runner, base, dev, vlanID); chkErr != nil {
 				return fmt.Errorf("netconfig: create vlan %s on %s: %w", dev, base, err)
 			}
 		}
@@ -213,9 +277,16 @@ func applyAction(ctx context.Context, runner Runner, action []string) error {
 	case "addr":
 		dev, ip := action[1], action[2]
 		if _, err := runner.Output(ctx, "ip", "addr", "add", ip, "dev", dev); err != nil {
-			out, chkErr := runner.Output(ctx, "ip", "-o", "addr", "show", "dev", dev)
-			bare := strings.SplitN(ip, "/", 2)[0]
-			if chkErr != nil || !strings.Contains(string(out), bare) {
+			addrs, chkErr := readAddrs(ctx, runner)
+			wanted, parseErr := netip.ParsePrefix(ip)
+			found := false
+			for _, address := range addrs[dev] {
+				actual, err := netip.ParsePrefix(address)
+				if err == nil && parseErr == nil && actual == wanted {
+					found = true
+				}
+			}
+			if chkErr != nil || !found {
 				return fmt.Errorf("netconfig: add %s to %s: %w", ip, dev, err)
 			}
 		}
@@ -257,6 +328,16 @@ type LiveState struct {
 
 func readInterfacesFiles() (map[string]string, error) {
 	files := map[string]string{}
+	for path := range forwardingFiles {
+		content, err := os.ReadFile(path)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		files[path] = string(content)
+	}
 	entries, err := os.ReadDir(InterfacesDir)
 	if os.IsNotExist(err) {
 		return files, nil

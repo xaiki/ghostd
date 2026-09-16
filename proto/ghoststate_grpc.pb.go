@@ -28,13 +28,13 @@ const (
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
-// HostState is smarthome-ghostd's whole RPC surface (FIREWALL.md): the
+// HostState is ghostd's whole RPC surface (README.md): the
 // daemon does not decide policy, it executes a state Nornir already
 // resolved. GetState answers with clean, diffable current state; Apply
 // enacts a fully-resolved declarative target behind a dead-man's-switch;
 // Confirm — called from a *fresh* connection, after independently
 // reproving reachability — cancels that switch. No Confirm before the
-// deadline reverts to the last state that ever passed Confirm.
+// deadline restores the pre-apply snapshot.
 type HostStateClient interface {
 	GetState(ctx context.Context, in *GetStateRequest, opts ...grpc.CallOption) (*State, error)
 	Apply(ctx context.Context, in *ApplyRequest, opts ...grpc.CallOption) (*ApplyResponse, error)
@@ -83,13 +83,13 @@ func (c *hostStateClient) Confirm(ctx context.Context, in *ConfirmRequest, opts 
 // All implementations must embed UnimplementedHostStateServer
 // for forward compatibility.
 //
-// HostState is smarthome-ghostd's whole RPC surface (FIREWALL.md): the
+// HostState is ghostd's whole RPC surface (README.md): the
 // daemon does not decide policy, it executes a state Nornir already
 // resolved. GetState answers with clean, diffable current state; Apply
 // enacts a fully-resolved declarative target behind a dead-man's-switch;
 // Confirm — called from a *fresh* connection, after independently
 // reproving reachability — cancels that switch. No Confirm before the
-// deadline reverts to the last state that ever passed Confirm.
+// deadline restores the pre-apply snapshot.
 type HostStateServer interface {
 	GetState(context.Context, *GetStateRequest) (*State, error)
 	Apply(context.Context, *ApplyRequest) (*ApplyResponse, error)

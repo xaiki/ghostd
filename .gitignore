@@ -1,0 +1,4 @@
+/bin/
+/ghostd
+*.test
+*.out

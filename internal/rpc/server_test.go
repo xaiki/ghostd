@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/peer"
@@ -42,6 +45,7 @@ type fakeNftRunner struct {
 	output       []byte
 	err          error
 	outputCalls  int
+	outputDelay  time.Duration
 	validateErr  error
 	commitErr    error
 	validateArgs []string
@@ -51,6 +55,7 @@ type fakeNftRunner struct {
 
 func (f *fakeNftRunner) Output(ctx context.Context, name string, args ...string) ([]byte, error) {
 	f.outputCalls++
+	time.Sleep(f.outputDelay)
 	return f.output, f.err
 }
 
@@ -77,6 +82,7 @@ func (f *fakeLeaseRunner) Run(name string, args ...string) error {
 
 type fakeNetconfigRunner struct {
 	err        error
+	applyErr   error
 	outputJSON string
 }
 
@@ -84,14 +90,21 @@ func (f *fakeNetconfigRunner) Output(ctx context.Context, name string, args ...s
 	if f.err != nil {
 		return nil, f.err
 	}
+	if name == "sysctl" && len(args) > 0 && args[0] == "-q" && f.applyErr != nil {
+		return nil, f.applyErr
+	}
 	if name == "ip" {
 		return []byte(f.outputJSON), nil
 	}
-	return nil, nil
+	return []byte("0"), nil
 }
 
 func withPeer(ctx context.Context) context.Context {
 	return peer.NewContext(ctx, &peer.Peer{Addr: &net.TCPAddr{IP: net.ParseIP("100.64.0.9"), Port: 1234}})
+}
+
+func freshPeer(ctx context.Context) context.Context {
+	return peer.NewContext(ctx, &peer.Peer{Addr: &net.TCPAddr{IP: net.ParseIP("100.64.0.9"), Port: 5678}})
 }
 
 func testGuard() nft.ReachabilityGuard {
@@ -293,21 +306,22 @@ func TestConfirmCancelsTheLeaseAndPersistsLiveStateAsLastGood(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
-	confirmed, err := server.Confirm(ctx, &pb.ConfirmRequest{LeaseId: applied.GetLeaseId()})
+	confirmed, err := server.Confirm(freshPeer(ctx), &pb.ConfirmRequest{LeaseId: applied.GetLeaseId()})
 	if err != nil {
 		t.Fatalf("Confirm: %v", err)
 	}
 	if !confirmed.GetOk() {
 		t.Fatalf("expected Confirm to report ok")
 	}
-	saved, err := server.store.Load(NftRuleset)
+	record, err := server.store.Domain(domainFirewall, NftRuleset)
+	saved := record.Confirmed
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
 	if string(saved) != `{"nftables":[]}` {
 		t.Fatalf("expected the live ruleset to be persisted as last-good, got %q", saved)
 	}
-	if nftRunner.outputCalls != 1 { // only Confirm's persist step reads live state
+	if nftRunner.outputCalls != 2 { // only Confirm's persist step reads live state
 		t.Fatalf("expected exactly one nft read from Confirm, got %d calls", nftRunner.outputCalls)
 	}
 	if nftRunner.stdinCalls != 2 { // Apply's validate + commit
@@ -322,31 +336,27 @@ func TestConfirmOfAnAlreadyConfirmedLeaseFails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
-	if _, err := server.Confirm(ctx, &pb.ConfirmRequest{LeaseId: applied.GetLeaseId()}); err != nil {
+	if _, err := server.Confirm(freshPeer(ctx), &pb.ConfirmRequest{LeaseId: applied.GetLeaseId()}); err != nil {
 		t.Fatalf("first Confirm: %v", err)
 	}
-	if _, err := server.Confirm(ctx, &pb.ConfirmRequest{LeaseId: applied.GetLeaseId()}); err == nil {
+	if _, err := server.Confirm(freshPeer(ctx), &pb.ConfirmRequest{LeaseId: applied.GetLeaseId()}); err == nil {
 		t.Fatalf("a second Confirm on the same lease must not silently succeed")
 	}
 }
 
-func TestConfirmOfARestartedDaemonFailsButDoesNotCorrupt(t *testing.T) {
+func TestConfirmRequiresFreshConnection(t *testing.T) {
 	server, _, _, _ := newTestServer(t, []string{"tag:stack-deployer"})
 	ctx := withPeer(context.Background())
 	applied, err := server.Apply(ctx, &pb.ApplyRequest{Domain: "firewall", DesiredStateJson: validDesiredStateJSON, DeadManSwitchSeconds: 300})
 	if err != nil {
-		t.Fatalf("Apply: %v", err)
+		t.Fatal(err)
 	}
-	// Simulate the daemon having restarted: the in-memory pending record is
-	// gone, but the lease itself (in Leases) is a separate, still-armed
-	// object in this same test process, mirroring how it would still be
-	// armed via a real systemd unit after a daemon restart.
-	server.mu.Lock()
-	delete(server.pending, applied.GetLeaseId())
-	server.mu.Unlock()
-	_, err = server.Confirm(ctx, &pb.ConfirmRequest{LeaseId: applied.GetLeaseId()})
-	if status.Code(err) != codes.Internal {
-		t.Fatalf("expected Internal (lost pending record), got %v", err)
+	if _, err := server.Confirm(ctx, &pb.ConfirmRequest{LeaseId: applied.LeaseId}); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("same connection: %v", err)
+	}
+	d, _ := server.store.Domain("firewall", NftRuleset)
+	if d.Pending == nil {
+		t.Fatal("rejected confirm disarmed rollback")
 	}
 }
 
@@ -397,7 +407,7 @@ func TestApplyNetconfigArmsALeaseAndRunsActions(t *testing.T) {
 
 func TestApplyNetconfigLeaseStaysArmedWhenExecutionFails(t *testing.T) {
 	server, _, netconfigRunner, _ := newTestServer(t, []string{"tag:stack-deployer"})
-	netconfigRunner.err = errors.New("sysctl: permission denied")
+	netconfigRunner.applyErr = errors.New("sysctl: permission denied")
 	_, err := server.Apply(withPeer(context.Background()),
 		&pb.ApplyRequest{Domain: "netconfig", DesiredStateJson: validNetconfigDesiredStateJSON, DeadManSwitchSeconds: 300})
 	if status.Code(err) != codes.Internal || !strings.Contains(err.Error(), "stays armed") {
@@ -412,10 +422,11 @@ func TestConfirmNetconfigPersistsTheAppliedDesiredStateNotALiveRead(t *testing.T
 	if err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
-	if _, err := server.Confirm(ctx, &pb.ConfirmRequest{LeaseId: applied.GetLeaseId()}); err != nil {
+	if _, err := server.Confirm(freshPeer(ctx), &pb.ConfirmRequest{LeaseId: applied.GetLeaseId()}); err != nil {
 		t.Fatalf("Confirm: %v", err)
 	}
-	saved, err := server.store.Load(NetconfigState)
+	record, err := server.store.Domain(domainNetconfig, NetconfigState)
+	saved := record.Confirmed
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -449,10 +460,10 @@ func TestFirewallAndNetconfigLeasesAreIndependent(t *testing.T) {
 		t.Fatalf("netconfig Apply: %v", err)
 	}
 	// Confirming one must not disturb the other's still-armed lease.
-	if _, err := server.Confirm(ctx, &pb.ConfirmRequest{LeaseId: fw.GetLeaseId()}); err != nil {
+	if _, err := server.Confirm(freshPeer(ctx), &pb.ConfirmRequest{LeaseId: fw.GetLeaseId()}); err != nil {
 		t.Fatalf("Confirm firewall: %v", err)
 	}
-	if _, err := server.Confirm(ctx, &pb.ConfirmRequest{LeaseId: nc.GetLeaseId()}); err != nil {
+	if _, err := server.Confirm(freshPeer(ctx), &pb.ConfirmRequest{LeaseId: nc.GetLeaseId()}); err != nil {
 		t.Fatalf("Confirm netconfig (should still be independently armed): %v", err)
 	}
 }
@@ -462,3 +473,106 @@ func TestFirewallAndNetconfigLeasesAreIndependent(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 var _ netconfig.Runner = (*fakeNetconfigRunner)(nil)
+
+func TestFirstApplySnapshotsBeforeCommitAndBlocksOverlap(t *testing.T) {
+	s, runner, _, _ := newTestServer(t, []string{"tag:stack-deployer"})
+	runner.commitErr = errors.New("commit failed")
+	req := &pb.ApplyRequest{Domain: "firewall", DesiredStateJson: validDesiredStateJSON, DeadManSwitchSeconds: 300}
+	_, err := s.Apply(withPeer(context.Background()), req)
+	if err == nil {
+		t.Fatal("expected commit failure")
+	}
+	d, err := s.store.Domain("firewall", NftRuleset)
+	if err != nil || d.Pending == nil || string(d.Pending.Snapshot) != `{"nftables":[]}` || len(d.Confirmed) != 0 {
+		t.Fatalf("first apply must retain absence as a rollback target: %+v %v", d, err)
+	}
+	runner.commitErr = nil
+	if _, err := s.Apply(withPeer(context.Background()), req); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("overlapping apply accepted: %v", err)
+	}
+}
+
+func TestExpiredLeaseCannotConfirm(t *testing.T) {
+	s, _, _, _ := newTestServer(t, []string{"tag:stack-deployer"})
+	ctx := withPeer(context.Background())
+	applied, err := s.Apply(ctx, &pb.ApplyRequest{Domain: "firewall", DesiredStateJson: validDesiredStateJSON, DeadManSwitchSeconds: 300})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, _ := s.store.Domain("firewall", NftRuleset)
+	d.Pending.Deadline = time.Now().Add(-time.Second)
+	if err := s.store.SaveDomain("firewall", d); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Confirm(freshPeer(ctx), &pb.ConfirmRequest{LeaseId: applied.LeaseId}); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("expired confirm: %v", err)
+	}
+}
+
+func TestFailedPersistKeepsLeaseArmed(t *testing.T) {
+	s, _, _, leaseRunner := newTestServer(t, []string{"tag:stack-deployer"})
+	ctx := withPeer(context.Background())
+	applied, err := s.Apply(ctx, &pb.ApplyRequest{Domain: "firewall", DesiredStateJson: validDesiredStateJSON, DeadManSwitchSeconds: 300})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(s.store.Dir(), "firewall-transaction.json.tmp"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Confirm(freshPeer(ctx), &pb.ConfirmRequest{LeaseId: applied.LeaseId}); status.Code(err) != codes.Internal {
+		t.Fatalf("persist failure: %v", err)
+	}
+	d, _ := s.store.Domain("firewall", NftRuleset)
+	if d.Pending == nil || len(leaseRunner.calls) != 1 {
+		t.Fatal("failed persist cancelled rollback")
+	}
+}
+
+func TestFailedApplyCannotBeConfirmed(t *testing.T) {
+	for _, domain := range []string{"firewall", "netconfig"} {
+		t.Run(domain, func(t *testing.T) {
+			s, fw, nc, leases := newTestServer(t, []string{"tag:stack-deployer"})
+			fw.commitErr, nc.applyErr = errors.New("failed"), errors.New("failed")
+			desired := validDesiredStateJSON
+			if domain == "netconfig" {
+				desired = validNetconfigDesiredStateJSON
+			}
+			_, err := s.Apply(withPeer(context.Background()), &pb.ApplyRequest{Domain: domain, DesiredStateJson: desired, DeadManSwitchSeconds: 300})
+			if err == nil {
+				t.Fatal("expected apply failure")
+			}
+			d, err := s.store.Domain(domain, legacyName(domain))
+			if err != nil || d.Pending == nil {
+				t.Fatalf("missing rollback: %v", err)
+			}
+			_, err = s.Confirm(freshPeer(context.Background()), &pb.ConfirmRequest{LeaseId: d.Pending.ID})
+			if status.Code(err) != codes.FailedPrecondition {
+				t.Fatalf("failed apply confirmed: %v", err)
+			}
+			if len(leases.calls) != 1 {
+				t.Fatal("rollback timer cancelled")
+			}
+		})
+	}
+}
+
+func TestConfirmReadCannotOutliveDeadline(t *testing.T) {
+	s, r, _, leases := newTestServer(t, []string{"tag:stack-deployer"})
+	applied, err := s.Apply(withPeer(context.Background()), &pb.ApplyRequest{Domain: "firewall", DesiredStateJson: validDesiredStateJSON, DeadManSwitchSeconds: 300})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, _ := s.store.Domain("firewall", NftRuleset)
+	d.Pending.Deadline = time.Now().Add(20 * time.Millisecond)
+	if err := s.store.SaveDomain("firewall", d); err != nil {
+		t.Fatal(err)
+	}
+	r.outputDelay = 40 * time.Millisecond
+	if _, err := s.Confirm(freshPeer(context.Background()), &pb.ConfirmRequest{LeaseId: applied.LeaseId}); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("late read confirmed: %v", err)
+	}
+	d, _ = s.store.Domain("firewall", NftRuleset)
+	if d.Pending == nil || len(leases.calls) != 1 {
+		t.Fatal("late confirmation disarmed recovery")
+	}
+}

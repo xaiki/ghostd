@@ -1,4 +1,4 @@
-// Package rpc wires the gRPC surface (proto/hoststate.proto) to
+// Package rpc wires the gRPC surface (proto/ghoststate.proto) to
 // internal/auth, internal/state, internal/nft and internal/netconfig. No
 // policy decisions live here: every method either reads live state or
 // enacts a state Nornir already resolved — see FIREWALL.md.
@@ -6,7 +6,7 @@ package rpc
 
 import (
 	"context"
-	"sync"
+	"log"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -20,15 +20,10 @@ import (
 	pb "smarthome/ghostd/proto"
 )
 
-// NftRuleset is the state.Store blob name for the firewall domain's
-// last-confirmed ruleset — named once so Save/Load/boot-restore cannot
-// drift onto different keys.
+// Legacy blob names are read only when a domain has no transaction record.
+// New confirmations atomically persist confirmed bytes and clear the pending
+// lease in <domain>-transaction.json (state.DomainState).
 const NftRuleset = "nft-ruleset.json"
-
-// NetconfigState is the state.Store blob name for the netconfig domain's
-// last-confirmed DesiredState (see internal/netconfig.Restore's own doc on
-// why this persists the applied desired state, not a live re-read, unlike
-// NftRuleset).
 const NetconfigState = "netconfig-state.json"
 
 // domainFirewall and domainNetconfig are the only values ApplyRequest.domain
@@ -39,21 +34,6 @@ const (
 	domainNetconfig = "netconfig"
 )
 
-// pendingApply is what Confirm needs to persist the right thing under the
-// right key for a lease Apply already armed. Kept in-memory, on this one
-// running daemon process, deliberately: the dead-man's-switch's own revert
-// path (internal/state.Leases.Arm) does not depend on it at all — the
-// domain travels to that separate process via the revert command's own
-// argv (--revert-domain=) precisely because this map cannot survive a
-// crash or restart. If the daemon does restart between Apply and Confirm,
-// Confirm fails (the lease is gone from this map) and the dead-man's-switch
-// reverts on schedule — safe, if less convenient than confirming, and
-// never a wrong or silent outcome.
-type pendingApply struct {
-	domain           string
-	desiredStateJSON string
-}
-
 type Server struct {
 	pb.UnimplementedHostStateServer
 
@@ -63,17 +43,13 @@ type Server struct {
 	nftRunner       nft.Runner
 	netconfigRunner netconfig.Runner
 	guard           nft.ReachabilityGuard
-
-	mu      sync.Mutex
-	pending map[string]pendingApply
 }
 
 func NewServer(authenticator *auth.Authenticator, store *state.Store,
 	leases *state.Leases, nftRunner nft.Runner, netconfigRunner netconfig.Runner,
 	guard nft.ReachabilityGuard) *Server {
 	return &Server{authenticator: authenticator, store: store, leases: leases,
-		nftRunner: nftRunner, netconfigRunner: netconfigRunner, guard: guard,
-		pending: make(map[string]pendingApply)}
+		nftRunner: nftRunner, netconfigRunner: netconfigRunner, guard: guard}
 }
 
 func peerAddr(ctx context.Context) (string, error) {
@@ -128,6 +104,15 @@ func (s *Server) Apply(ctx context.Context, req *pb.ApplyRequest) (*pb.ApplyResp
 				"an Apply with no revert path is exactly the failure this daemon exists to prevent")
 	}
 
+	// Bound command execution even when a client supplies no RPC deadline.
+	// The independent revert process must not wait forever for our store lock.
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(req.GetDeadManSwitchSeconds())*time.Second)
+	defer cancel()
+	unlock, err := s.store.Lock()
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "%v", err)
+	}
+	defer unlock()
 	switch req.GetDomain() {
 	case domainFirewall:
 		return s.applyFirewall(ctx, req)
@@ -152,20 +137,26 @@ func (s *Server) applyFirewall(ctx context.Context, req *pb.ApplyRequest) (*pb.A
 		return nil, status.Errorf(codes.InvalidArgument, "rpc: %v", err)
 	}
 
-	leaseID := state.NewLeaseID()
-	timeout := time.Duration(req.GetDeadManSwitchSeconds()) * time.Second
-	if err := s.leases.Arm(leaseID, domainFirewall, timeout); err != nil {
-		return nil, status.Errorf(codes.Internal, "%v", err)
+	raw, err := nft.ReadRulesetJSON(ctx, s.nftRunner)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "snapshot: %v", err)
 	}
-	s.recordPending(leaseID, domainFirewall, req.GetDesiredStateJson())
+	snapshot, err := nft.OwnedRuleset([]byte(raw))
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "snapshot: %v", err)
+	}
+	leaseID, err := s.begin(ctx, req, snapshot)
+	if err != nil {
+		return nil, err
+	}
 	if err := nft.Commit(ctx, s.nftRunner, script); err != nil {
 		// The lease stays armed: if this host is now in some half-applied
-		// state, the dead-man's-switch reverting to last-confirmed in
+		// state, the dead-man's-switch restoring the pre-apply snapshot in
 		// GetDeadManSwitchSeconds() is exactly the safety net that
 		// matters most here, not something to disarm on a commit failure.
 		return nil, status.Errorf(codes.Internal, "rpc: %v (dead-man's-switch for lease %s stays armed)", err, leaseID)
 	}
-	return &pb.ApplyResponse{LeaseId: leaseID}, nil
+	return s.finishApply(ctx, req.GetDomain(), leaseID)
 }
 
 func (s *Server) applyNetconfig(ctx context.Context, req *pb.ApplyRequest) (*pb.ApplyResponse, error) {
@@ -177,41 +168,74 @@ func (s *Server) applyNetconfig(ctx context.Context, req *pb.ApplyRequest) (*pb.
 		return nil, status.Errorf(codes.InvalidArgument, "rpc: %v", err)
 	}
 
-	leaseID := state.NewLeaseID()
-	timeout := time.Duration(req.GetDeadManSwitchSeconds()) * time.Second
-	if err := s.leases.Arm(leaseID, domainNetconfig, timeout); err != nil {
-		return nil, status.Errorf(codes.Internal, "%v", err)
+	snapshot, err := netconfig.Snapshot(ctx, s.netconfigRunner, desired)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "snapshot: %v", err)
 	}
-	s.recordPending(leaseID, domainNetconfig, req.GetDesiredStateJson())
+	leaseID, err := s.begin(ctx, req, snapshot)
+	if err != nil {
+		return nil, err
+	}
 	if err := netconfig.Apply(ctx, s.netconfigRunner, desired); err != nil {
 		// Same reasoning as applyFirewall's Commit failure: the lease
 		// stays armed on purpose.
 		return nil, status.Errorf(codes.Internal, "rpc: %v (dead-man's-switch for lease %s stays armed)", err, leaseID)
 	}
-	return &pb.ApplyResponse{LeaseId: leaseID}, nil
+	return s.finishApply(ctx, req.GetDomain(), leaseID)
 }
 
-func (s *Server) recordPending(leaseID, domain, desiredStateJSON string) {
-	s.mu.Lock()
-	s.pending[leaseID] = pendingApply{domain: domain, desiredStateJSON: desiredStateJSON}
-	s.mu.Unlock()
-}
-
-func (s *Server) takePending(leaseID string) (pendingApply, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	rec, ok := s.pending[leaseID]
-	if ok {
-		delete(s.pending, leaseID)
+// finishApply makes only a successfully completed mutation confirmable.
+// A crash or save failure leaves the pre-apply snapshot armed for recovery.
+func (s *Server) finishApply(ctx context.Context, domain, id string) (*pb.ApplyResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, status.Errorf(codes.DeadlineExceeded, "apply did not complete in time; rollback stays armed: %v", err)
 	}
-	return rec, ok
+	d, err := s.store.Domain(domain, legacyName(domain))
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "%v", err)
+	}
+	d.Pending.Applied = true
+	if err := s.store.SaveDomain(domain, d); err != nil {
+		return nil, status.Errorf(codes.Internal, "%v (rollback stays armed)", err)
+	}
+	return &pb.ApplyResponse{LeaseId: id}, nil
 }
 
-// Confirm cancels lease's dead-man's-switch — call only from a fresh
-// connection, after independently reproving reachability (FIREWALL.md).
-// This RPC does not itself prove anything about reachability; it trusts
-// the caller reached it, which is only meaningful if the caller opened a
-// new connection to do so.
+func legacyName(domain string) string {
+	if domain == domainFirewall {
+		return NftRuleset
+	}
+	return NetconfigState
+}
+
+// begin is called with the store lock held, before the first mutation.
+func (s *Server) begin(ctx context.Context, req *pb.ApplyRequest, snapshot []byte) (string, error) {
+	domain := req.GetDomain()
+	d, err := s.store.Domain(domain, legacyName(domain))
+	if err != nil {
+		return "", status.Errorf(codes.Internal, "%v", err)
+	}
+	if d.Pending != nil {
+		return "", status.Error(codes.FailedPrecondition, "domain already has an unconfirmed apply; wait for rollback")
+	}
+	id := state.NewLeaseID()
+	timeout := time.Duration(req.GetDeadManSwitchSeconds()) * time.Second
+	addr, _ := peerAddr(ctx)
+	d.Pending = &state.Pending{ID: id, Deadline: time.Now().Add(timeout), Snapshot: snapshot,
+		Target: []byte(req.GetDesiredStateJson()), Peer: addr}
+	if err := s.store.SaveDomain(domain, d); err != nil {
+		return "", status.Errorf(codes.Internal, "%v", err)
+	}
+	if err := s.leases.Arm(id, domain, timeout, s.store.Dir()); err != nil {
+		d.Pending = nil
+		_ = s.store.SaveDomain(domain, d) // no mutation has occurred
+		return "", status.Errorf(codes.Internal, "%v", err)
+	}
+	return id, nil
+}
+
+// Confirm requires a new transport peer and an unexpired, durable lease.
+// Committing the record also revokes the timer's authority to roll back.
 func (s *Server) Confirm(ctx context.Context, req *pb.ConfirmRequest) (*pb.ConfirmResponse, error) {
 	addr, err := peerAddr(ctx)
 	if err != nil {
@@ -223,46 +247,54 @@ func (s *Server) Confirm(ctx context.Context, req *pb.ConfirmRequest) (*pb.Confi
 	if req.GetLeaseId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "rpc: lease_id is required")
 	}
-	if err := s.leases.Cancel(req.GetLeaseId()); err != nil {
-		return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
+	unlock, err := s.store.Lock()
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "%v", err)
 	}
-	rec, ok := s.takePending(req.GetLeaseId())
-	if !ok {
-		// Cancel just proved this lease was armed, so the daemon (this
-		// process) restarted between Apply and Confirm and lost the
-		// in-memory record of what to persist — see the pendingApply doc.
-		// The revert unit itself is unaffected (its domain travelled via
-		// argv, not this map), so the host is not at risk; only this
-		// Confirm cannot complete, and the caller sees a plain failure
-		// rather than a wrong or silent persist.
-		return nil, status.Errorf(codes.Internal,
-			"rpc: lease %s was armed but this daemon lost track of what to persist "+
-				"(a restart between Apply and Confirm) — the dead-man's-switch will still revert on schedule",
-			req.GetLeaseId())
-	}
-	switch rec.domain {
-	case domainFirewall:
-		// last-good is only ever overwritten by a state that reached here —
-		// see the package doc on state.Store. Persisting the live ruleset
-		// (not rec.desiredStateJSON) keeps this honest: what gets restored
-		// on a future revert/boot is what was actually proven live, not
-		// merely what was asked for.
-		ruleset, err := nft.ReadRulesetJSON(ctx, s.nftRunner)
+	defer unlock()
+	for _, domain := range []string{domainFirewall, domainNetconfig} {
+		d, err := s.store.Domain(domain, legacyName(domain))
 		if err != nil {
-			return nil, status.Errorf(codes.Internal, "rpc: confirmed but could not re-read live state to persist it: %v", err)
-		}
-		if err := s.store.Save(NftRuleset, []byte(ruleset)); err != nil {
 			return nil, status.Errorf(codes.Internal, "%v", err)
 		}
-	case domainNetconfig:
-		// See internal/netconfig.Restore's doc: netconfig persists the
-		// already-applied desired state, not a live re-read.
-		if err := s.store.Save(NetconfigState, []byte(rec.desiredStateJSON)); err != nil {
+		if d.Pending == nil || d.Pending.ID != req.GetLeaseId() {
+			continue
+		}
+		if !time.Now().Before(d.Pending.Deadline) {
+			return nil, status.Error(codes.FailedPrecondition, "lease expired; rollback must complete")
+		}
+		if d.Pending.Peer == addr {
+			return nil, status.Error(codes.FailedPrecondition, "confirm requires a fresh connection")
+		}
+		if !d.Pending.Applied {
+			return nil, status.Error(codes.FailedPrecondition, "apply did not complete; rollback must complete")
+		}
+		ctx, cancel := context.WithDeadline(ctx, d.Pending.Deadline)
+		defer cancel()
+		confirmed := d.Pending.Target
+		if domain == domainFirewall {
+			raw, err := nft.ReadRulesetJSON(ctx, s.nftRunner)
+			if err != nil {
+				return nil, status.Errorf(codes.Internal, "%v", err)
+			}
+			confirmed, err = nft.OwnedRuleset([]byte(raw))
+			if err != nil {
+				return nil, status.Errorf(codes.Internal, "%v", err)
+			}
+		}
+		if !time.Now().Before(d.Pending.Deadline) || ctx.Err() != nil {
+			return nil, status.Error(codes.FailedPrecondition, "confirmation exceeded lease deadline; rollback stays armed")
+		}
+		d.Confirmed, d.Pending = confirmed, nil
+		if err := s.store.SaveDomain(domain, d); err != nil {
 			return nil, status.Errorf(codes.Internal, "%v", err)
 		}
-	default:
-		return nil, status.Errorf(codes.Internal, "rpc: lease %s has an unrecognized pending domain %q",
-			req.GetLeaseId(), rec.domain)
+		// Cleanup only: the durable record above already disarmed rollback. If
+		// systemd is unavailable, the timer will later observe no pending lease.
+		if err := s.leases.Cancel(req.GetLeaseId()); err != nil {
+			log.Printf("ghostd: confirmed lease timer cleanup: %v", err)
+		}
+		return &pb.ConfirmResponse{Ok: true}, nil
 	}
-	return &pb.ConfirmResponse{Ok: true}, nil
+	return nil, status.Error(codes.FailedPrecondition, "unknown or completed lease")
 }

@@ -4,13 +4,13 @@ package ghostd;
 
 option go_package = "smarthome/ghostd/proto";
 
-// HostState is smarthome-ghostd's whole RPC surface (FIREWALL.md): the
+// HostState is ghostd's whole RPC surface (README.md): the
 // daemon does not decide policy, it executes a state Nornir already
 // resolved. GetState answers with clean, diffable current state; Apply
 // enacts a fully-resolved declarative target behind a dead-man's-switch;
 // Confirm — called from a *fresh* connection, after independently
 // reproving reachability — cancels that switch. No Confirm before the
-// deadline reverts to the last state that ever passed Confirm.
+// deadline restores the pre-apply snapshot.
 service HostState {
   rpc GetState(GetStateRequest) returns (State);
   rpc Apply(ApplyRequest) returns (ApplyResponse);
@@ -25,11 +25,10 @@ message GetStateRequest {}
 // envelope is what lets GetState/Apply exist now without churning the
 // wire format every time a domain's internals change.
 message State {
-  // `nft -j list ruleset` output, verbatim. Empty until Phase 4.
+  // `nft -j list ruleset` output, verbatim.
   string nft_ruleset_json = 1;
   // machines.net_ifaces's own live-read shape (persisted interfaces.d file
   // bytes + `ip -j addr show` + /proc/sys/net/ipv4/ip_forward), as JSON.
-  // Empty until Phase 5.
   string netconfig_json = 2;
 }
 
@@ -37,7 +36,7 @@ message ApplyRequest {
   // The fully-resolved declarative target Nornir computed — not a diff.
   string desired_state_json = 1;
   // How long the dead-man's-switch waits for Confirm before reverting to
-  // the last confirmed state. Required; the caller does not get to apply
+  // the pre-apply snapshot. Required; the caller does not get to apply
   // with no revert path.
   int32 dead_man_switch_seconds = 2;
   // Which domain desired_state_json is for: "firewall" or "netconfig".

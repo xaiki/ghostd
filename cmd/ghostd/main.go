@@ -1,6 +1,6 @@
 // smarthome-ghostd: one rootful daemon per host, owning firewalling
 // (nftables), netconfig, and ingress port mapping, authenticated over the
-// tailnet rather than by Unix login. See FIREWALL.md at the repo root.
+// tailnet rather than by Unix login. See README.md.
 //
 // This binary has two modes:
 //
@@ -9,7 +9,7 @@
 //     tailnet-only listener.
 //   - `--revert-lease=<id>`: the dead-man's-switch's own command
 //     (internal/state.Leases arms `systemd-run … -- ghostd --revert-lease=…`)
-//     — reverts to the last-confirmed state and exits, independent of
+//     — restores the pre-apply snapshot and exits, independent of
 //     whether the main daemon process is even still alive.
 package main
 
@@ -17,6 +17,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -44,7 +45,8 @@ const (
 )
 
 func main() {
-	revertLease := flag.String("revert-lease", "", "revert to last-confirmed state and exit (the dead-man's-switch's own command; not for interactive use)")
+	renderFirewall := flag.Bool("render-firewall", false, "render desired firewall JSON from stdin without touching the host")
+	revertLease := flag.String("revert-lease", "", "restore the pre-apply snapshot and exit (the dead-man's-switch's own command; not for interactive use)")
 	revertDomain := flag.String("revert-domain", "", "which domain --revert-lease is for (\"firewall\" or \"netconfig\") — set by Leases.Arm itself, not for interactive use")
 	storeDir := flag.String("store-dir", defaultStoreDir, "where last-confirmed state is persisted")
 	port := flag.Int("port", defaultPort, "tailnet-only listen port")
@@ -53,6 +55,22 @@ func main() {
 		"the interface name Apply's reachability guard always keeps open to this daemon's own port (nft.ReachabilityGuard)")
 	watchdogSec := flag.Int("watchdog-sec", 0, "systemd WatchdogSec= value, in seconds (0 disables watchdog pinging)")
 	flag.Parse()
+	if *renderFirewall {
+		raw, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			log.Fatal(err)
+		}
+		desired, err := nft.ParseDesiredState(string(raw))
+		if err != nil {
+			log.Fatal(err)
+		}
+		script, err := nft.Render(desired, nft.ReachabilityGuard{TailscaleInterface: *tailscaleIface, Port: *port})
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Print(script)
+		return
+	}
 
 	store, err := state.NewStore(*storeDir)
 	if err != nil {
@@ -78,62 +96,64 @@ func main() {
 // travels via --revert-domain, set by Leases.Arm at the moment it knows it
 // (see that function's own doc on why this cannot be any kind of shared
 // in-memory state instead).
-func runRevert(store *state.Store, leaseID, domain string) error {
-	ctx := context.Background()
-	log.Printf("ghostd: dead-man's-switch fired for lease %s (%s) — reverting to last-confirmed state", leaseID, domain)
-	switch domain {
-	case "firewall":
-		ruleset, err := store.Load(rpc.NftRuleset)
-		if err != nil {
-			return err
-		}
-		return nft.Restore(ctx, nft.ExecRunner{}, ruleset)
-	case "netconfig":
-		blob, err := store.Load(rpc.NetconfigState)
-		if err != nil {
-			return err
-		}
-		return netconfig.Restore(ctx, netconfig.ExecRunner{}, blob)
-	default:
-		return fmt.Errorf("unrecognized --revert-domain %q", domain)
+// recoverDomain runs under the process-shared store lock. Timers consult the
+// durable lease, so late callbacks cannot undo a newer or confirmed apply.
+func recoverDomain(store *state.Store, domain, leaseID string) error {
+	key := rpc.NftRuleset
+	if domain == "netconfig" {
+		key = rpc.NetconfigState
+	} else if domain != "firewall" {
+		return fmt.Errorf("unknown domain %q", domain)
 	}
+	d, err := store.Domain(domain, key)
+	if err != nil {
+		return err
+	}
+	ctx := context.Background()
+	if d.Pending != nil && (leaseID == "" || d.Pending.ID == leaseID) {
+		if domain == "firewall" {
+			err = nft.Restore(ctx, nft.ExecRunner{}, d.Pending.Snapshot)
+		} else {
+			err = netconfig.Rollback(ctx, netconfig.ExecRunner{}, d.Pending.Snapshot)
+		}
+		if err != nil {
+			return err
+		}
+		d.Pending = nil
+		return store.SaveDomain(domain, d)
+	}
+	if leaseID != "" {
+		return nil
+	}
+	if domain == "firewall" {
+		return nft.Restore(ctx, nft.ExecRunner{}, d.Confirmed)
+	}
+	return netconfig.Restore(ctx, netconfig.ExecRunner{}, d.Confirmed)
+}
+
+func runRevert(store *state.Store, leaseID, domain string) error {
+	unlock, err := store.Lock()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return recoverDomain(store, domain, leaseID)
 }
 
 func runDaemon(store *state.Store, port int, deployerTag string, tailscaleIface string, watchdogSec int) error {
 	ctx := context.Background()
 
-	// Boot always restores the last confirmed state, synchronously,
-	// before anything else — including before the RPC listener opens.
-	// See FIREWALL.md: this is what makes a reboot safe. No dependency on
-	// reaching Nornir or the tailnet control plane to get here. Both
-	// domains are restored unconditionally, regardless of which one (if
-	// either) last had a lease in flight: boot restore is not a lease
-	// concept, it is "bring back everything this host ever proved worked".
-	ruleset, err := store.Load(rpc.NftRuleset)
+	unlock, err := store.Lock()
 	if err != nil {
-		return fmt.Errorf("boot restore: firewall: %w", err)
+		return err
 	}
-	if len(ruleset) > 0 {
-		log.Printf("ghostd: restoring last-confirmed firewall state (%d bytes)", len(ruleset))
-	} else {
-		log.Printf("ghostd: no last-confirmed firewall state on disk (fresh install) — nothing to restore")
+	for _, domain := range []string{"firewall", "netconfig"} {
+		if err := recoverDomain(store, domain, ""); err != nil {
+			unlock()
+			return fmt.Errorf("boot restore %s: %w", domain, err)
+		}
 	}
-	if err := nft.Restore(ctx, nft.ExecRunner{}, ruleset); err != nil {
-		return fmt.Errorf("boot restore: firewall: %w", err)
-	}
-
-	netconfigBlob, err := store.Load(rpc.NetconfigState)
-	if err != nil {
-		return fmt.Errorf("boot restore: netconfig: %w", err)
-	}
-	if len(netconfigBlob) > 0 {
-		log.Printf("ghostd: restoring last-confirmed netconfig state (%d bytes)", len(netconfigBlob))
-	} else {
-		log.Printf("ghostd: no last-confirmed netconfig state on disk (fresh install) — nothing to restore")
-	}
-	if err := netconfig.Restore(ctx, netconfig.ExecRunner{}, netconfigBlob); err != nil {
-		return fmt.Errorf("boot restore: netconfig: %w", err)
-	}
+	unlock()
 
 	tsLocal := &tsclient.Client{}
 	listenAddr, err := tailnetListenAddress(ctx, tsLocal, port)

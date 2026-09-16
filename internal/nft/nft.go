@@ -7,6 +7,7 @@ package nft
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os/exec"
 )
@@ -62,10 +63,8 @@ func ValidateSyntax(ctx context.Context, runner Runner, script string) error {
 	return nil
 }
 
-// Commit loads a validated script into the kernel — one atomic transaction
-// (see Render's own doc on why a same-named `table inet` block replaces
-// the old one without a gap). Callers must have already run ValidateSyntax;
-// this does not re-validate.
+// Commit loads the rendered add/delete/recreate script in one transaction.
+// Callers must already have run ValidateSyntax.
 func Commit(ctx context.Context, runner Runner, script string) error {
 	if _, err := runner.RunStdin(ctx, "nft", script, "-f", "-"); err != nil {
 		return fmt.Errorf("nft: commit failed: %w", err)
@@ -73,23 +72,60 @@ func Commit(ctx context.Context, runner Runner, script string) error {
 	return nil
 }
 
-// Restore is the boot-time and dead-man's-switch-revert path: replay the
-// last-confirmed ruleset — nft's own JSON dump (ReadRulesetJSON's output,
-// exactly as Confirm persisted it), fed back through nft's JSON *input*
-// mode (`-j -f -`), not re-rendered from a DesiredState. This is
-// deliberate: what gets restored is provably what was live and reachable
-// when it was confirmed, not a fresh re-render that could differ if
-// Render's own logic changes between the confirm and the restore.
-//
-// A nil/empty rulesetJSON (nothing ever confirmed yet — a fresh install)
-// is always a no-op — there is nothing to restore to, and refusing to boot
-// because of that would be exactly the kind of failure this design exists
-// to avoid.
+// OwnedRuleset keeps only ghostd's table. Never persist/replay other writers'
+// tables (tailscaled, podman, or the operator's migration safety net).
+func OwnedRuleset(raw []byte) ([]byte, error) {
+	var dump struct {
+		Nftables []map[string]json.RawMessage `json:"nftables"`
+	}
+	if err := json.Unmarshal(raw, &dump); err != nil {
+		return nil, err
+	}
+	entries := []map[string]json.RawMessage{}
+	for _, entry := range dump.Nftables {
+		for kind, body := range entry {
+			var obj struct {
+				Family string `json:"family"`
+				Table  string `json:"table"`
+				Name   string `json:"name"`
+			}
+			if err := json.Unmarshal(body, &obj); err != nil {
+				return nil, err
+			}
+			if obj.Family == "inet" && (obj.Table == tableName || (kind == "table" && obj.Name == tableName)) {
+				entries = append(entries, entry)
+			}
+		}
+	}
+	return json.Marshal(map[string]any{"nftables": entries})
+}
+
+// Restore atomically replaces our table, including restoring its absence on a
+// first-apply rollback. A nil blob means no boot baseline, not an empty table.
 func Restore(ctx context.Context, runner Runner, rulesetJSON []byte) error {
 	if len(rulesetJSON) == 0 {
 		return nil
 	}
-	if _, err := runner.RunStdin(ctx, "nft", string(rulesetJSON), "-j", "-f", "-"); err != nil {
+	owned, err := OwnedRuleset(rulesetJSON)
+	if err != nil {
+		return fmt.Errorf("nft: invalid snapshot: %w", err)
+	}
+	var dump struct {
+		Nftables []map[string]json.RawMessage `json:"nftables"`
+	}
+	if err := json.Unmarshal(owned, &dump); err != nil {
+		return err
+	}
+	table := map[string]any{"table": map[string]string{"family": "inet", "name": tableName}}
+	commands := []any{map[string]any{"add": table}, map[string]any{"delete": table}}
+	for _, entry := range dump.Nftables {
+		commands = append(commands, map[string]any{"add": entry})
+	}
+	script, err := json.Marshal(map[string]any{"nftables": commands})
+	if err != nil {
+		return err
+	}
+	if _, err := runner.RunStdin(ctx, "nft", string(script), "-j", "-f", "-"); err != nil {
 		return fmt.Errorf("nft: restore failed: %w", err)
 	}
 	return nil
