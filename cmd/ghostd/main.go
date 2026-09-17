@@ -45,6 +45,7 @@ const (
 )
 
 func main() {
+	observeOnly := flag.Bool("observe-only", false, "observe live configuration; reject writes and skip boot restore (fresh hosts only)")
 	renderFirewall := flag.Bool("render-firewall", false, "render desired firewall JSON from stdin without touching the host")
 	revertLease := flag.String("revert-lease", "", "restore the pre-apply snapshot and exit (the dead-man's-switch's own command; not for interactive use)")
 	revertDomain := flag.String("revert-domain", "", "which domain --revert-lease is for (\"firewall\" or \"netconfig\") — set by Leases.Arm itself, not for interactive use")
@@ -55,6 +56,9 @@ func main() {
 		"the interface name Apply's reachability guard always keeps open to this daemon's own port (nft.ReachabilityGuard)")
 	watchdogSec := flag.Int("watchdog-sec", 0, "systemd WatchdogSec= value, in seconds (0 disables watchdog pinging)")
 	flag.Parse()
+	if *observeOnly && *revertLease != "" {
+		log.Fatal("--observe-only cannot be combined with --revert-lease")
+	}
 	if *renderFirewall {
 		raw, err := io.ReadAll(os.Stdin)
 		if err != nil {
@@ -84,7 +88,7 @@ func main() {
 		return
 	}
 
-	if err := runDaemon(store, *port, *deployerTag, *tailscaleIface, *watchdogSec); err != nil {
+	if err := runDaemonMode(store, *port, *deployerTag, *tailscaleIface, *watchdogSec, *observeOnly); err != nil {
 		log.Fatalf("ghostd: %v", err)
 	}
 }
@@ -141,6 +145,10 @@ func runRevert(store *state.Store, leaseID, domain string) error {
 }
 
 func runDaemon(store *state.Store, port int, deployerTag string, tailscaleIface string, watchdogSec int) error {
+	return runDaemonMode(store, port, deployerTag, tailscaleIface, watchdogSec, false)
+}
+
+func runDaemonMode(store *state.Store, port int, deployerTag string, tailscaleIface string, watchdogSec int, observeOnly bool) error {
 	ctx := context.Background()
 
 	unlock, err := store.Lock()
@@ -148,7 +156,7 @@ func runDaemon(store *state.Store, port int, deployerTag string, tailscaleIface 
 		return err
 	}
 	for _, domain := range []string{"firewall", "netconfig"} {
-		if err := recoverDomain(store, domain, ""); err != nil {
+		if err := prepareDomain(store, domain, observeOnly); err != nil {
 			unlock()
 			return fmt.Errorf("boot restore %s: %w", domain, err)
 		}
@@ -175,6 +183,7 @@ func runDaemon(store *state.Store, port int, deployerTag string, tailscaleIface 
 	guard := nft.ReachabilityGuard{TailscaleInterface: tailscaleIface, Port: port}
 	server := rpc.NewServer(authenticator, store, leases, nft.ExecRunner{}, netconfig.ExecRunner{}, guard)
 
+	server.ObserveOnly = observeOnly
 	grpcServer := grpc.NewServer()
 	pb.RegisterHostStateServer(grpcServer, server)
 
@@ -213,4 +222,24 @@ func tailnetListenAddress(ctx context.Context, client *tsclient.Client, port int
 	}
 	ip := status.Self.TailscaleIPs[0]
 	return net.JoinHostPort(ip.String(), fmt.Sprintf("%d", port)), nil
+}
+
+// Observation never restores a baseline or interferes with armed rollback jobs.
+// Reject conversion of an already-managed host rather than quietly stop enforcing it.
+func prepareDomain(store *state.Store, domain string, observeOnly bool) error {
+	if !observeOnly {
+		return recoverDomain(store, domain, "")
+	}
+	key := rpc.NftRuleset
+	if domain == "netconfig" {
+		key = rpc.NetconfigState
+	}
+	d, err := store.Domain(domain, key)
+	if err != nil {
+		return err
+	}
+	if d.Pending != nil || len(d.Confirmed) > 0 {
+		return fmt.Errorf("observation mode requires a fresh %s domain; managed state exists", domain)
+	}
+	return nil
 }

@@ -321,9 +321,11 @@ func applyAction(ctx context.Context, runner Runner, action []string) error {
 // Nornir still does the diffing (machines.net_ifaces.plan_network, reused
 // unchanged).
 type LiveState struct {
-	Files     map[string]string   `json:"files"`
-	Addrs     map[string][]string `json:"addrs"`
-	IPForward string              `json:"ip_forward"`
+	Observation       map[string]json.RawMessage `json:"observation,omitempty"`
+	ObservationErrors map[string]string          `json:"observation_errors,omitempty"`
+	Files             map[string]string          `json:"files"`
+	Addrs             map[string][]string        `json:"addrs"`
+	IPForward         string                     `json:"ip_forward"`
 }
 
 func readInterfacesFiles() (map[string]string, error) {
@@ -410,7 +412,35 @@ func ReadLive(ctx context.Context, runner Runner) (LiveState, error) {
 	if b, err := os.ReadFile("/proc/sys/net/ipv4/ip_forward"); err == nil {
 		ipForward = strings.TrimSpace(string(b))
 	}
-	return LiveState{Files: files, Addrs: addrs, IPForward: ipForward}, nil
+	observation := map[string]json.RawMessage{}
+	errors := map[string]string{}
+	commands := map[string][]string{
+		"links":     {"-d", "-j", "link", "show"},
+		"addresses": {"-j", "addr", "show"},
+		"routes4":   {"-j", "-4", "route", "show", "table", "all"},
+		"routes6":   {"-j", "-6", "route", "show", "table", "all"},
+		"rules4":    {"-j", "-4", "rule", "show"},
+		"rules6":    {"-j", "-6", "rule", "show"},
+	}
+	for name, args := range commands {
+		raw, err := runner.Output(ctx, "ip", args...)
+		if err != nil {
+			errors[name] = err.Error()
+			continue
+		}
+		if !json.Valid(raw) {
+			errors[name] = "invalid JSON"
+			continue
+		}
+		observation[name] = json.RawMessage(raw)
+	}
+	if raw, err := os.ReadFile("/etc/network/interfaces"); err == nil {
+		files["/etc/network/interfaces"] = string(raw)
+	} else if !os.IsNotExist(err) {
+		errors["interfaces"] = err.Error()
+	}
+	return LiveState{Files: files, Addrs: addrs, IPForward: ipForward,
+		Observation: observation, ObservationErrors: errors}, nil
 }
 
 // ReadLiveJSON is ReadLive, marshalled — what GetState actually returns in

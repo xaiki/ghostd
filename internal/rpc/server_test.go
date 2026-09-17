@@ -615,3 +615,25 @@ func TestCapabilityCallerAppliesAndConfirms(t *testing.T) {
 		t.Fatalf("Confirm: %v, %v", confirmed, err)
 	}
 }
+
+func TestObservationRejectsWritesBeforeAnySideEffects(t *testing.T) {
+	s := &Server{ObserveOnly: true}
+	if _, err := s.Apply(context.Background(), &pb.ApplyRequest{}); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("Apply: %v", err)
+	}
+	if _, err := s.Confirm(context.Background(), &pb.ConfirmRequest{}); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("Confirm: %v", err)
+	}
+}
+
+func TestObservationStillServesAuthenticatedReads(t *testing.T) {
+	server, nftRunner, _, leases := newTestServer(t, nil)
+	server.ObserveOnly = true
+	if _, err := server.GetState(withPeer(context.Background()), &pb.GetStateRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	if nftRunner.stdinCalls != 0 {
+		t.Fatal("read wrote firewall state")
+	}
+	_ = leases
+}

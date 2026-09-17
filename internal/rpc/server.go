@@ -35,6 +35,8 @@ const (
 )
 
 type Server struct {
+	// ObserveOnly rejects every mutation RPC, independently of authorization.
+	ObserveOnly bool
 	pb.UnimplementedHostStateServer
 
 	authenticator   *auth.Authenticator
@@ -91,6 +93,9 @@ func (s *Server) GetState(ctx context.Context, _ *pb.GetStateRequest) (*pb.State
 // syntactically valid and (for firewall) reachability-safe, so a rejected
 // Apply leaves the kernel/filesystem and the lease table untouched.
 func (s *Server) Apply(ctx context.Context, req *pb.ApplyRequest) (*pb.ApplyResponse, error) {
+	if s.ObserveOnly {
+		return nil, status.Error(codes.FailedPrecondition, "ghostd is observation-only")
+	}
 	addr, err := peerAddr(ctx)
 	if err != nil {
 		return nil, err
@@ -237,6 +242,9 @@ func (s *Server) begin(ctx context.Context, req *pb.ApplyRequest, snapshot []byt
 // Confirm requires a new transport peer and an unexpired, durable lease.
 // Committing the record also revokes the timer's authority to roll back.
 func (s *Server) Confirm(ctx context.Context, req *pb.ConfirmRequest) (*pb.ConfirmResponse, error) {
+	if s.ObserveOnly {
+		return nil, status.Error(codes.FailedPrecondition, "ghostd is observation-only")
+	}
 	addr, err := peerAddr(ctx)
 	if err != nil {
 		return nil, err

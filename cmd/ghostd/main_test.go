@@ -72,3 +72,29 @@ func TestIntegrationRevertUsesSnapshotAndLateTimerCannotUndoConfirm(t *testing.T
 		t.Fatal("boot did not restore confirmed absence")
 	}
 }
+
+func TestObservationBootDoesNotRestoreOrAbandonManagedState(t *testing.T) {
+	store, err := state.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, domain := range []string{"firewall", "netconfig"} {
+		if err := prepareDomain(store, domain, true); err != nil {
+			t.Fatal(err)
+		}
+		original := state.DomainState{Confirmed: []byte(`{"proof":"must not execute"}`)}
+		if err := store.SaveDomain(domain, original); err != nil {
+			t.Fatal(err)
+		}
+		if err := prepareDomain(store, domain, true); err == nil {
+			t.Fatal("managed state accepted in observation mode")
+		}
+		original = state.DomainState{Pending: &state.Pending{ID: "pending", Deadline: time.Now().Add(time.Minute)}}
+		if err := store.SaveDomain(domain, original); err != nil {
+			t.Fatal(err)
+		}
+		if err := prepareDomain(store, domain, true); err == nil {
+			t.Fatal("pending rollback accepted in observation mode")
+		}
+	}
+}
