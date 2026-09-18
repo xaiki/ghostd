@@ -1,6 +1,11 @@
 package nft
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"strings"
+)
 
 // DesiredState is the JSON shape Nornir sends in ApplyRequest.desired_state_json
 // — a direct, unchanged port of the firewall.base.zones/firewall.ingress
@@ -13,6 +18,7 @@ import "encoding/json"
 type DesiredState struct {
 	Zones   map[string]Zone `json:"zones"`
 	Ingress *Ingress        `json:"ingress,omitempty"`
+	Output  *OutputPolicy   `json:"output,omitempty"`
 }
 
 type Zone struct {
@@ -46,8 +52,29 @@ type Ingress struct {
 
 func ParseDesiredState(raw string) (DesiredState, error) {
 	var ds DesiredState
-	if err := json.Unmarshal([]byte(raw), &ds); err != nil {
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&ds); err != nil {
 		return DesiredState{}, err
 	}
+	if err := decoder.Decode(new(any)); err != io.EOF {
+		return DesiredState{}, fmt.Errorf("nft: trailing JSON data")
+	}
 	return ds, nil
+}
+
+// OutputPolicy is opt-in; absent preserves the historical unfiltered output path.
+type OutputPolicy struct {
+	Policy             string       `json:"policy"`
+	EstablishedRelated bool         `json:"established_related"`
+	Loopback           bool         `json:"loopback"`
+	Rules              []OutputRule `json:"rules"`
+}
+
+type OutputRule struct {
+	Proto       string `json:"proto"`
+	Port        int    `json:"port"`
+	Family      string `json:"family,omitempty"` // empty means both; ip or ip6 narrows it
+	Interface   string `json:"interface,omitempty"`
+	Destination string `json:"destination,omitempty"` // address or CIDR
 }

@@ -53,10 +53,12 @@ type fakeNftRunner struct {
 	validateArgs []string
 	commitArgs   []string
 	stdinCalls   int
+	events       []string
 }
 
 func (f *fakeNftRunner) Output(ctx context.Context, name string, args ...string) ([]byte, error) {
 	f.outputCalls++
+	f.events = append(f.events, "read")
 	time.Sleep(f.outputDelay)
 	return f.output, f.err
 }
@@ -66,10 +68,16 @@ func (f *fakeNftRunner) RunStdin(ctx context.Context, name string, script string
 	// nft.ValidateSyntax calls with -c -f -; nft.Commit calls with -f -.
 	isValidate := len(args) > 0 && args[0] == "-c"
 	if isValidate {
+		f.events = append(f.events, "validate")
 		f.validateArgs = args
 		return nil, f.validateErr
 	}
 	f.commitArgs = args
+	if len(args) > 0 && args[0] == "-j" {
+		f.events = append(f.events, "restore")
+	} else {
+		f.events = append(f.events, "commit")
+	}
 	return nil, f.commitErr
 }
 
@@ -616,6 +624,83 @@ func TestCapabilityCallerAppliesAndConfirms(t *testing.T) {
 	}
 }
 
+func TestApplyRecoversExpiredLeaseBeforeNewSnapshot(t *testing.T) {
+	for _, domain := range []string{"firewall", "netconfig"} {
+		t.Run(domain, func(t *testing.T) {
+			s, fw, _, _ := newTestServer(t, []string{"tag:stack-deployer"})
+			desired := validDesiredStateJSON
+			if domain == "netconfig" {
+				desired = validNetconfigDesiredStateJSON
+			}
+			req := &pb.ApplyRequest{Domain: domain, DesiredStateJson: desired, DeadManSwitchSeconds: 300}
+			first, err := s.Apply(withPeer(context.Background()), req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			d, _ := s.store.Domain(domain, legacyName(domain))
+			d.Pending.Deadline = time.Now().Add(-time.Second)
+			if err := s.store.SaveDomain(domain, d); err != nil {
+				t.Fatal(err)
+			}
+			fw.events = nil
+			second, err := s.Apply(freshPeer(context.Background()), req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if first.LeaseId == second.LeaseId {
+				t.Fatal("reused expired lease")
+			}
+			if domain == "firewall" && strings.Join(fw.events, ",") != "validate,restore,read,commit" {
+				t.Fatalf("must restore before snapshot/new mutation: %v", fw.events)
+			}
+			d, _ = s.store.Domain(domain, legacyName(domain))
+			if d.Pending == nil || d.Pending.ID != second.LeaseId || !d.Pending.Applied {
+				t.Fatal("new apply not armed")
+			}
+		})
+	}
+}
+
+func TestExpiredRollbackFailureRetainsPendingSnapshot(t *testing.T) {
+	s, fw, _, _ := newTestServer(t, []string{"tag:stack-deployer"})
+	req := &pb.ApplyRequest{Domain: "firewall", DesiredStateJson: validDesiredStateJSON, DeadManSwitchSeconds: 300}
+	first, err := s.Apply(withPeer(context.Background()), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, _ := s.store.Domain("firewall", NftRuleset)
+	d.Pending.Deadline = time.Now().Add(-time.Second)
+	if err := s.store.SaveDomain("firewall", d); err != nil {
+		t.Fatal(err)
+	}
+	fw.commitErr = errors.New("restore rejected")
+	_, err = s.Apply(freshPeer(context.Background()), req)
+	if err == nil || !strings.Contains(err.Error(), "rollback failed") {
+		t.Fatalf("expected rollback error: %v", err)
+	}
+	d, _ = s.store.Domain("firewall", NftRuleset)
+	if d.Pending == nil || d.Pending.ID != first.LeaseId {
+		t.Fatal("lost pending recovery")
+	}
+}
+
+func TestUnexpiredApplyReportsDeadlineWithoutMutation(t *testing.T) {
+	s, fw, _, _ := newTestServer(t, []string{"tag:stack-deployer"})
+	req := &pb.ApplyRequest{Domain: "firewall", DesiredStateJson: validDesiredStateJSON, DeadManSwitchSeconds: 300}
+	first, err := s.Apply(withPeer(context.Background()), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reads := fw.outputCalls
+	_, err = s.Apply(freshPeer(context.Background()), req)
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), first.LeaseId) || !strings.Contains(err.Error(), "remaining") {
+		t.Fatalf("expected useful pending lease diagnostic: %v", err)
+	}
+	if fw.outputCalls != reads {
+		t.Fatal("read new snapshot before pending lease resolved")
+	}
+}
+
 func TestObservationRejectsWritesBeforeAnySideEffects(t *testing.T) {
 	s := &Server{ObserveOnly: true}
 	if _, err := s.Apply(context.Background(), &pb.ApplyRequest{}); status.Code(err) != codes.FailedPrecondition {
@@ -636,4 +721,20 @@ func TestObservationStillServesAuthenticatedReads(t *testing.T) {
 		t.Fatal("read wrote firewall state")
 	}
 	_ = leases
+}
+
+func TestOutputVersionedDomainUsesFirewallLease(t *testing.T) {
+	s, _, _, _ := newTestServer(t, []string{"tag:stack-deployer"})
+	raw := strings.TrimSuffix(validDesiredStateJSON, "}") + `,"output":{"policy":"DROP","established_related":true,"loopback":true,"rules":[{"proto":"tcp","port":443}]}}`
+	response, err := s.Apply(withPeer(context.Background()), &pb.ApplyRequest{Domain: "firewall-output-v1", DesiredStateJson: raw, DeadManSwitchSeconds: 300})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := s.store.Domain("firewall", NftRuleset)
+	if err != nil || d.Pending == nil || d.Pending.ID != response.LeaseId {
+		t.Fatalf("firewall lease missing: %v", err)
+	}
+	if _, err := s.Confirm(freshPeer(context.Background()), &pb.ConfirmRequest{LeaseId: response.LeaseId}); err != nil {
+		t.Fatal(err)
+	}
 }

@@ -17,7 +17,10 @@ service HostState {
   rpc Confirm(ConfirmRequest) returns (ConfirmResponse);
 }
 
-message GetStateRequest {}
+message GetStateRequest {
+  // Optional fixed read-only adoption evidence; ordinary state reads stay lightweight.
+  bool include_adoption_evidence = 1;
+}
 
 // State is deliberately a thin envelope around raw, structured JSON per
 // domain rather than a typed nftables/netconfig schema in proto itself:
@@ -30,6 +33,7 @@ message State {
   // machines.net_ifaces's own live-read shape (persisted interfaces.d file
   // bytes + `ip -j addr show` + /proc/sys/net/ipv4/ip_forward), as JSON.
   string netconfig_json = 2;
+  string adoption_evidence_json = 3;
 }
 
 message ApplyRequest {

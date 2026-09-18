@@ -6,7 +6,9 @@ package rpc
 
 import (
 	"context"
+	"encoding/json"
 	"log"
+	"smarthome/ghostd/internal/observation"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -68,7 +70,7 @@ func peerAddr(ctx context.Context) (string, error) {
 // domains are always read together: State is one thin envelope over
 // whichever domains this daemon has learned to speak, not something a
 // caller selects a slice of (see the proto's own comment).
-func (s *Server) GetState(ctx context.Context, _ *pb.GetStateRequest) (*pb.State, error) {
+func (s *Server) GetState(ctx context.Context, req *pb.GetStateRequest) (*pb.State, error) {
 	addr, err := peerAddr(ctx)
 	if err != nil {
 		return nil, err
@@ -84,7 +86,16 @@ func (s *Server) GetState(ctx context.Context, _ *pb.GetStateRequest) (*pb.State
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "%v", err)
 	}
-	return &pb.State{NftRulesetJson: ruleset, NetconfigJson: netconfigJSON}, nil
+	response := &pb.State{NftRulesetJson: ruleset, NetconfigJson: netconfigJSON}
+	if req.GetIncludeAdoptionEvidence() {
+		evidence := observation.Capture(ctx, s.netconfigRunner)
+		raw, err := json.Marshal(evidence)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "evidence: %v", err)
+		}
+		response.AdoptionEvidenceJson = string(raw)
+	}
+	return response, nil
 }
 
 // Apply dispatches on req.domain to the matching domain's own
@@ -119,6 +130,11 @@ func (s *Server) Apply(ctx context.Context, req *pb.ApplyRequest) (*pb.ApplyResp
 	}
 	defer unlock()
 	switch req.GetDomain() {
+	case "firewall-output-v1":
+		// Normalize only after accepting the versioned request. Leases and rollback
+		// remain in the existing firewall domain and include the entire table.
+		normalized := &pb.ApplyRequest{Domain: domainFirewall, DesiredStateJson: req.GetDesiredStateJson(), DeadManSwitchSeconds: req.GetDeadManSwitchSeconds()}
+		return s.applyFirewall(ctx, normalized)
 	case domainFirewall:
 		return s.applyFirewall(ctx, req)
 	case domainNetconfig:
@@ -140,6 +156,9 @@ func (s *Server) applyFirewall(ctx context.Context, req *pb.ApplyRequest) (*pb.A
 	}
 	if err := nft.ValidateSyntax(ctx, s.nftRunner, script); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "rpc: %v", err)
+	}
+	if err := s.recoverExpired(ctx, domainFirewall); err != nil {
+		return nil, err
 	}
 
 	raw, err := nft.ReadRulesetJSON(ctx, s.nftRunner)
@@ -171,6 +190,9 @@ func (s *Server) applyNetconfig(ctx context.Context, req *pb.ApplyRequest) (*pb.
 	}
 	if err := netconfig.Validate(desired); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "rpc: %v", err)
+	}
+	if err := s.recoverExpired(ctx, domainNetconfig); err != nil {
+		return nil, err
 	}
 
 	snapshot, err := netconfig.Snapshot(ctx, s.netconfigRunner, desired)
@@ -211,6 +233,41 @@ func legacyName(domain string) string {
 		return NftRuleset
 	}
 	return NetconfigState
+}
+
+// recoverExpired runs with the store lock held, before taking a new snapshot.
+// A missing/failed timer must not wedge a domain forever. Never adopt or discard
+// an old unconfirmed target: restore its snapshot before accepting another apply.
+func (s *Server) recoverExpired(ctx context.Context, domain string) error {
+	d, err := s.store.Domain(domain, legacyName(domain))
+	if err != nil {
+		return status.Errorf(codes.Internal, "%v", err)
+	}
+	if d.Pending == nil {
+		return nil
+	}
+	if time.Now().Before(d.Pending.Deadline) {
+		return status.Errorf(codes.FailedPrecondition,
+			"domain %s has unconfirmed lease %s; rollback due %s (remaining %s)",
+			domain, d.Pending.ID, d.Pending.Deadline.UTC().Format(time.RFC3339), time.Until(d.Pending.Deadline).Round(time.Second))
+	}
+	log.Printf("ghostd: recovering expired %s lease %s (deadline %s)", domain, d.Pending.ID, d.Pending.Deadline)
+	if len(d.Pending.Snapshot) == 0 {
+		return status.Errorf(codes.Internal, "expired %s lease %s has no rollback snapshot; pending record retained", domain, d.Pending.ID)
+	}
+	if domain == domainFirewall {
+		err = nft.Restore(ctx, s.nftRunner, d.Pending.Snapshot)
+	} else {
+		err = netconfig.Rollback(ctx, s.netconfigRunner, d.Pending.Snapshot)
+	}
+	if err != nil {
+		return status.Errorf(codes.Internal, "expired %s lease %s rollback failed; pending snapshot retained: %v", domain, d.Pending.ID, err)
+	}
+	d.Pending = nil
+	if err := s.store.SaveDomain(domain, d); err != nil {
+		return status.Errorf(codes.Internal, "rollback completed but pending record could not be cleared: %v", err)
+	}
+	return nil
 }
 
 // begin is called with the store lock held, before the first mutation.

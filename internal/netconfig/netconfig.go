@@ -17,6 +17,7 @@ package netconfig
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"net/netip"
@@ -59,8 +60,9 @@ func (ExecRunner) Output(ctx context.Context, name string, args ...string) ([]by
 // `[kind, ...args]`, matching that Python action tuple's own shape
 // one-for-one — see machines.net_ifaces.ghostd_desired_state_json.
 type DesiredState struct {
-	Files   map[string]string `json:"files"`
-	Actions [][]string        `json:"actions"`
+	ExpectedFilesSHA256 map[string]string `json:"expected_files_sha256,omitempty"`
+	Files               map[string]string `json:"files"`
+	Actions             [][]string        `json:"actions"`
 }
 
 func ParseDesiredState(raw string) (DesiredState, error) {
@@ -75,11 +77,12 @@ func ParseDesiredState(raw string) (DesiredState, error) {
 // the kind itself) it takes — the complete, closed set of additive
 // operations this package will ever run. See the package doc.
 var knownActions = map[string]int{
-	"vlan":    3, // base, dev, vlan_id
-	"addr":    2, // dev, ip
-	"sysctl":  1, // keyval
-	"forward": 1, // the forwarding script's path
-	"up":      1, // dev
+	"default-route": 3, // dev, gateway, onlink|offlink
+	"vlan":          3, // base, dev, vlan_id
+	"addr":          2, // dev, ip
+	"sysctl":        1, // keyval
+	"forward":       1, // the forwarding script's path
+	"up":            1, // dev
 }
 
 // Validate rejects anything Apply must never be allowed to act on: a file
@@ -89,7 +92,26 @@ var knownActions = map[string]int{
 // internal/nft.Render's own validation gets before ValidateSyntax) and
 // internally by Apply itself, defensively.
 func Validate(ds DesiredState) error {
+	for path, digest := range ds.ExpectedFilesSHA256 {
+		if path != "/etc/network/interfaces" || len(digest) != 64 {
+			return fmt.Errorf("invalid network file precondition")
+		}
+		for _, ch := range digest {
+			if !strings.ContainsRune("0123456789abcdef", ch) {
+				return fmt.Errorf("invalid network file digest")
+			}
+		}
+		if _, ok := ds.Files[path]; !ok {
+			return fmt.Errorf("precondition without desired file")
+		}
+	}
 	for path, content := range ds.Files {
+		if path == "/etc/network/interfaces" {
+			if ds.ExpectedFilesSHA256[path] == "" {
+				return fmt.Errorf("main ifupdown file requires explicit adoption precondition")
+			}
+			continue
+		}
 		if forwardingFiles[path] {
 			if content != "" && content != "net.ipv4.ip_forward=0\n" && content != "net.ipv4.ip_forward=1\n" {
 				return fmt.Errorf("netconfig: invalid forwarding file %s", path)
@@ -112,6 +134,11 @@ func Validate(ds DesiredState) error {
 		}
 		if got := len(action) - 1; got != want {
 			return fmt.Errorf("netconfig: action %q wants %d argument(s), got %d", action[0], want, got)
+		}
+		if action[0] == "default-route" {
+			if err := validateDefaultRoute(action); err != nil {
+				return err
+			}
 		}
 		if action[0] == "sysctl" && action[1] != "net.ipv4.ip_forward=0" && action[1] != "net.ipv4.ip_forward=1" {
 			return fmt.Errorf("netconfig: only IPv4 forwarding sysctl is supported")
@@ -186,10 +213,27 @@ func writeFile(path, content string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("netconfig: create %s: %w", filepath.Dir(path), err)
 	}
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		return fmt.Errorf("netconfig: write %s: %w", path, err)
+	// A crash must not leave the boot-time fallback truncated. Stage on the
+	// same filesystem, sync the complete file, then atomically replace it.
+	f, err := os.CreateTemp(filepath.Dir(path), ".stack-network-*")
+	if err != nil {
+		return err
 	}
-	return nil
+	defer os.Remove(f.Name())
+	defer f.Close()
+	if err := f.Chmod(0o644); err != nil {
+		return err
+	}
+	if _, err := f.WriteString(content); err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(f.Name(), path)
 }
 
 // Apply writes every declared file, then executes every action, in order.
@@ -204,6 +248,20 @@ func writeFile(path, content string) error {
 func Apply(ctx context.Context, runner Runner, ds DesiredState) error {
 	if err := Validate(ds); err != nil {
 		return err
+	}
+	if err := checkFilePreconditions(ds); err != nil {
+		return err
+	}
+	if err := checkIfupdown(ds); err != nil {
+		return err
+	}
+	// Refuse conflicting routes before any persistent configuration changes.
+	for _, action := range ds.Actions {
+		if action[0] == "default-route" {
+			if _, _, err := routeState(ctx, runner, action); err != nil {
+				return err
+			}
+		}
 	}
 	for _, path := range sortedKeys(ds.Files) {
 		if err := ctx.Err(); err != nil {
@@ -265,6 +323,8 @@ func checkVLAN(ctx context.Context, runner Runner, base, dev, vlanID string) err
 
 func applyAction(ctx context.Context, runner Runner, action []string) error {
 	switch action[0] {
+	case "default-route":
+		return ensureDefaultRoute(ctx, runner, action)
 	case "vlan":
 		base, dev, vlanID := action[1], action[2], action[3]
 		if _, err := runner.Output(ctx, "ip", "link", "add", "link", base, "name", dev,
@@ -488,4 +548,20 @@ func Restore(ctx context.Context, runner Runner, blob []byte) error {
 		return fmt.Errorf("netconfig: restore: %w", err)
 	}
 	return Apply(ctx, runner, ds)
+}
+
+func checkFilePreconditions(ds DesiredState) error {
+	for path, digest := range ds.ExpectedFilesSHA256 {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("cannot read adoption precondition: %w", err)
+		}
+		if string(raw) == ds.Files[path] {
+			continue
+		}
+		if fmt.Sprintf("%x", sha256.Sum256(raw)) != digest {
+			return fmt.Errorf("%s changed since observation; refusing adoption", path)
+		}
+	}
+	return nil
 }

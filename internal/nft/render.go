@@ -57,6 +57,7 @@ func Render(ds DesiredState, guard ReachabilityGuard) (string, error) {
 
 	writeInputChain(&b, ds, guard, names)
 	writeForwardChain(&b, ds, names)
+	writeOutputChain(&b, ds.Output)
 	writePreroutingChain(&b, ds)
 	writePostroutingChain(&b, ds, names)
 	for _, name := range names {
@@ -78,6 +79,9 @@ func validInterface(name string) bool {
 func validPort(port int) bool { return port >= 1 && port <= 65535 }
 
 func validate(ds DesiredState) error {
+	if err := validateOutput(ds.Output); err != nil {
+		return err
+	}
 	if len(ds.Zones) == 0 {
 		return fmt.Errorf("nft: no zones declared")
 	}

@@ -79,6 +79,8 @@ func (l *Leases) Arm(leaseID string, domain string, timeout time.Duration, store
 		"--description=smarthome-ghostd dead-man's-switch revert",
 		fmt.Sprintf("--on-active=%ds", int(timeout.Seconds())),
 		"--timer-property=AccuracySec=100ms",
+		"--property=Restart=on-failure",
+		"--property=RestartSec=5s",
 		"--",
 		l.binaryPath, "--revert-lease=" + leaseID, "--revert-domain=" + domain,
 	}

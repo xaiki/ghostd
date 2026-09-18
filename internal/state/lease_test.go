@@ -42,6 +42,9 @@ func TestArmCallsSystemdRunWithTheBinaryInRevertMode(t *testing.T) {
 	if !strings.Contains(joined, "--on-active=300s") {
 		t.Fatalf("expected a 300s deadline in %v", call)
 	}
+	if !strings.Contains(joined, "--property=Restart=on-failure") || !strings.Contains(joined, "--property=RestartSec=5s") {
+		t.Fatal("rollback service must retry transient failures")
+	}
 	if !strings.Contains(joined, "/opt/ghostd/ghostd") || !strings.Contains(joined, "--revert-lease="+leaseID) {
 		t.Fatalf("expected the revert command in %v", call)
 	}

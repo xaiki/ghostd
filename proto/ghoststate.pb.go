@@ -22,9 +22,11 @@ const (
 )
 
 type GetStateRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Optional fixed read-only adoption evidence; ordinary state reads stay lightweight.
+	IncludeAdoptionEvidence bool `protobuf:"varint,1,opt,name=include_adoption_evidence,json=includeAdoptionEvidence,proto3" json:"include_adoption_evidence,omitempty"`
+	unknownFields           protoimpl.UnknownFields
+	sizeCache               protoimpl.SizeCache
 }
 
 func (x *GetStateRequest) Reset() {
@@ -57,6 +59,13 @@ func (*GetStateRequest) Descriptor() ([]byte, []int) {
 	return file_ghoststate_proto_rawDescGZIP(), []int{0}
 }
 
+func (x *GetStateRequest) GetIncludeAdoptionEvidence() bool {
+	if x != nil {
+		return x.IncludeAdoptionEvidence
+	}
+	return false
+}
+
 // State is deliberately a thin envelope around raw, structured JSON per
 // domain rather than a typed nftables/netconfig schema in proto itself:
 // each domain's real shape is still being designed (Phase 4/5), and the
@@ -68,9 +77,10 @@ type State struct {
 	NftRulesetJson string `protobuf:"bytes,1,opt,name=nft_ruleset_json,json=nftRulesetJson,proto3" json:"nft_ruleset_json,omitempty"`
 	// machines.net_ifaces's own live-read shape (persisted interfaces.d file
 	// bytes + `ip -j addr show` + /proc/sys/net/ipv4/ip_forward), as JSON.
-	NetconfigJson string `protobuf:"bytes,2,opt,name=netconfig_json,json=netconfigJson,proto3" json:"netconfig_json,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	NetconfigJson        string `protobuf:"bytes,2,opt,name=netconfig_json,json=netconfigJson,proto3" json:"netconfig_json,omitempty"`
+	AdoptionEvidenceJson string `protobuf:"bytes,3,opt,name=adoption_evidence_json,json=adoptionEvidenceJson,proto3" json:"adoption_evidence_json,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *State) Reset() {
@@ -113,6 +123,13 @@ func (x *State) GetNftRulesetJson() string {
 func (x *State) GetNetconfigJson() string {
 	if x != nil {
 		return x.NetconfigJson
+	}
+	return ""
+}
+
+func (x *State) GetAdoptionEvidenceJson() string {
+	if x != nil {
+		return x.AdoptionEvidenceJson
 	}
 	return ""
 }
@@ -321,11 +338,13 @@ var File_ghoststate_proto protoreflect.FileDescriptor
 
 const file_ghoststate_proto_rawDesc = "" +
 	"\n" +
-	"\x10ghoststate.proto\x12\x06ghostd\"\x11\n" +
-	"\x0fGetStateRequest\"X\n" +
+	"\x10ghoststate.proto\x12\x06ghostd\"M\n" +
+	"\x0fGetStateRequest\x12:\n" +
+	"\x19include_adoption_evidence\x18\x01 \x01(\bR\x17includeAdoptionEvidence\"\x8e\x01\n" +
 	"\x05State\x12(\n" +
 	"\x10nft_ruleset_json\x18\x01 \x01(\tR\x0enftRulesetJson\x12%\n" +
-	"\x0enetconfig_json\x18\x02 \x01(\tR\rnetconfigJson\"\x8b\x01\n" +
+	"\x0enetconfig_json\x18\x02 \x01(\tR\rnetconfigJson\x124\n" +
+	"\x16adoption_evidence_json\x18\x03 \x01(\tR\x14adoptionEvidenceJson\"\x8b\x01\n" +
 	"\fApplyRequest\x12,\n" +
 	"\x12desired_state_json\x18\x01 \x01(\tR\x10desiredStateJson\x125\n" +
 	"\x17dead_man_switch_seconds\x18\x02 \x01(\x05R\x14deadManSwitchSeconds\x12\x16\n" +
