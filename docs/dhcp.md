@@ -164,6 +164,12 @@ grpcurl -plaintext -import-path proto -proto ghoststate.proto \
   -d '{"action":"rollback"}' 100.64.0.10:7443 ghostd.HostState/DHCPHandover
 ```
 
+If the daemon restarts mid-takeover, boot recovery runs before the DHCP
+configuration is applied: an interrupted or expired takeover is rolled back, and a
+pending one whose target cannot bind is rolled back too rather than leaving the LAN
+with no allocator. A rollback that fails is retried and stays visible; it never
+keeps the RPC surface down.
+
 Rollback closes the ghostd listeners, exports the **current** ledger — including
 new grants, offers and quarantine — writes it with the original lease-file
 ownership, and only then unmasks and restarts dnsmasq. A failed rollback stays
@@ -275,6 +281,14 @@ device, claimed name, expiry, origin and association evidence. Historical bindin
 answers come from persisted events; node sightings inside a snapshot are current
 and carry `seen` rather than a claim about the past.
 
+Kernel neighbour sightings are history too: a first sighting, a changed MAC or a
+sighting after the previous one expired appends an `observation` event (and an
+`observation-end` closing the earlier one). A query with `at_unix` returns only the
+sightings whose own validity window covered that instant, flagged `historical`;
+current sightings carry `seen`. Configuration changes to zones, aliases or scopes
+append a `dns-config` event, so the SOA serial advances with them as well as with
+leases.
+
 Events have increasing IDs for pagination, and no automatic pruning is performed.
 Monitor the ledger's disk use and back up `addressbook.db` using a consistent
 filesystem snapshot, or while ghostd is stopped. The database belongs to the
@@ -293,6 +307,13 @@ jq -n --argjson changes "$(cat changes.json)" '{json:($changes|tojson)}' \
 grpcurl -plaintext -import-path proto -proto ghoststate.proto -d @ \
   100.64.0.10:7443 ghostd.HostState/RepairIdentity < repair-request.json
 ```
+
+Add `"persist": true` to an edit to record a durable client association: allocation
+then gives that client the device, name and tailnet node again after its lease
+expires or its address changes, a later change keeps the replaced mapping in the
+association's history, and `"forget": true` removes it. Inventory reservations
+still win over an association. Repair validates against every declared
+`tailnet_node_ids` entry and refuses a name held by another live device.
 
 Selecting several bindings supports merge and split operations. The transaction
 rejects stale ownership and inventory conflicts, and past events are never
