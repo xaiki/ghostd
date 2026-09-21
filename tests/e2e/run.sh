@@ -33,17 +33,23 @@ wait_systemd() {
 	done
 }
 wait_systemd
-for u in lab-fixtures.service fakets.service ghostd.service; do
+for u in lab-fixtures.service fakets.service ghostd.service avahi-printer.service; do
 	podman cp "tests/e2e/units/$u" "$name:/etc/systemd/system/$u"
 done
 # A packaged unit lives in the vendor directory, which is what lets systemctl mask it.
 podman cp tests/e2e/units/dnsmasq@ghostd-lab.service "$name:/usr/lib/systemd/system/dnsmasq@ghostd-lab.service"
 podman cp tests/e2e/dnsmasq-ghostd-lab.conf "$name:/etc/dnsmasq-ghostd-lab.conf"
-podman exec "$name" sh -c 'systemctl disable --now dnsmasq.service 2>/dev/null; mkdir -p /var/lib/misc; : > /var/lib/misc/e2e.leases; systemctl daemon-reload; systemctl enable --now lab-fixtures.service fakets.service ghostd.service'
+podman exec "$name" mkdir -p /etc/avahi/services /var/lib/ghostd/last-good
+podman cp tests/e2e/avahi/avahi-printer.conf "$name:/etc/avahi/avahi-printer.conf"
+podman cp tests/e2e/avahi/ipp.service "$name:/etc/avahi/services/ipp.service"
+podman cp tests/e2e/avahi/cast.service "$name:/etc/avahi/services/cast.service"
+podman cp tests/e2e/dns-acl.json "$name:/var/lib/ghostd/last-good/dns-acl.json"
+podman exec "$name" sh -c 'systemctl disable --now dnsmasq.service avahi-daemon.service avahi-daemon.socket 2>/dev/null; systemctl mask avahi-daemon.service avahi-daemon.socket 2>/dev/null; mkdir -p /var/lib/misc; : > /var/lib/misc/e2e.leases; systemctl daemon-reload; systemctl enable --now lab-fixtures.service fakets.service ghostd.service avahi-printer.service'
 
 run() { podman exec "$name" /opt/ghostd/probe "$1"; }
 fail() { podman exec "$name" journalctl -u ghostd.service -n 60 --no-pager >&2 || true; exit 1; }
 run pre || fail
+run dns || fail
 echo; echo "=== rebooting the container (systemd restart, /run cleared)"
 podman restart -t 5 "$name" >/dev/null
 wait_systemd

@@ -307,3 +307,24 @@ func TestRejectInvalidRedirects(t *testing.T) {
 		}
 	}
 }
+
+func TestMDNSServiceAlsoAdmitsUnicastReplies(t *testing.T) {
+	desired, err := ParseDesiredState(`{"zones":{"trusted":{"interfaces":["tailscale0"]},"lan":{"interfaces":["eth0"],"services":["mdns"]}}}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := Render(desired, ReachabilityGuard{TailscaleInterface: "tailscale0", Port: 7443})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"udp dport 5353 accept", "udp sport 5353 udp dport 1024-65535 accept"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q in\n%s", want, out)
+		}
+	}
+	// Zones without the service admit neither.
+	plain, _ := ParseDesiredState(`{"zones":{"trusted":{"interfaces":["tailscale0"]},"lan":{"interfaces":["eth0"],"services":["dns"]}}}`)
+	if out, _ = Render(plain, ReachabilityGuard{TailscaleInterface: "tailscale0", Port: 7443}); strings.Contains(out, "5353") {
+		t.Fatal("mDNS admitted without the service")
+	}
+}

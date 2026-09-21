@@ -22,3 +22,19 @@ for name in client1 client2; do
 	nsenter --net="/run/netns/$name" -- ip link set lo up
 	nsenter --net="/run/netns/$name" -- ip link set "${name}p" up
 done
+
+# Extra tailnet-side addresses: one resolver identity per container.
+for a in 100.64.0.21 100.64.0.22; do ip addr replace "$a/32" dev tailscale0; done
+
+# A LAN printer with a static address, advertised by avahi (a third-party mDNS
+# responder) inside its own namespace.
+if ! ip netns list | grep -qw printer; then
+	ip netns add printer
+	ip link add printer type veth peer name printerp address 02:00:00:00:00:60
+	ip link set printer master lab0
+	ip link set printer up
+	ip link set printerp netns printer
+	nsenter --net=/run/netns/printer -- ip link set lo up
+	nsenter --net=/run/netns/printer -- ip addr add 10.77.0.60/24 dev printerp
+	nsenter --net=/run/netns/printer -- ip link set printerp up
+fi

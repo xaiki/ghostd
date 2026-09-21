@@ -1,0 +1,11 @@
+[Unit]
+Description=ghostd e2e lab: avahi advertising a LAN printer from its own namespace
+After=lab-fixtures.service
+Wants=lab-fixtures.service
+
+[Service]
+ExecStart=/usr/bin/nsenter --net=/run/netns/printer -- /usr/sbin/avahi-daemon --no-drop-root --no-chroot --no-rlimits --no-proc-title -f /etc/avahi/avahi-printer.conf
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

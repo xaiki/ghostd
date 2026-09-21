@@ -11,15 +11,28 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coredns/caddy"
 	"github.com/coredns/coredns/core/dnsserver"
 	"github.com/coredns/coredns/plugin"
 	"github.com/miekg/dns"
+	"github.com/xaiki/ghostd/internal/mdns"
 )
 
 const RuntimeDir = "/run/ghostd"
+
+// lookupFunc and browseFunc are the LAN lookups the plugin uses; tests replace them.
+var (
+	lookupFunc = lookupLocal
+	browseFunc = browseLocal
+)
+
+// mdnsQuerier is the LAN client behind .local answers. When it cannot send
+// (no multicast interface), lookups fall back to the host's NSS via getent.
+var mdnsQuerier atomic.Pointer[mdns.Querier]
 
 func init() {
 	plugin.Register("ghostlocal", func(c *caddy.Controller) error {
@@ -29,46 +42,86 @@ func init() {
 			}
 		}
 		dnsserver.GetConfig(c).AddPlugin(func(next plugin.Handler) plugin.Handler {
-			return &localHandler{next: next, lookup: lookupHost, slots: make(chan struct{}, 16)}
+			return &localHandler{next: next, lookup: lookupFunc, browse: browseFunc, slots: make(chan struct{}, 16)}
 		})
 		return nil
 	})
 }
 
-// Start binds TCP and UDP before publishing the environment consumed by Quadlet.
-// The address is the host tailnet IP, never a wildcard/public listener.
-func Start(address, directory string) (func(), error) {
-	return start(address, 53, "100.100.100.100", directory)
+// Option customises Start.
+type Option func(*options)
+type options struct {
+	acl     ACL
+	querier *mdns.Querier
 }
 
-func start(address string, port int, upstream, directory string) (func(), error) {
+// WithACL gives each identity its own resolver listener and access policy.
+func WithACL(a ACL) Option { return func(o *options) { o.acl = a } }
+
+// WithQuerier sets the native mDNS client used for .local names and DNS-SD.
+func WithQuerier(q *mdns.Querier) Option { return func(o *options) { o.querier = q } }
+
+// Start binds TCP and UDP before publishing the environment consumed by Quadlet.
+// The address is the host tailnet IP, never a wildcard/public listener.
+func Start(address, directory string, opts ...Option) (func(), error) {
+	return start(address, 53, "100.100.100.100", directory, opts...)
+}
+
+func start(address string, port int, upstream, directory string, opts ...Option) (func(), error) {
 	ip := net.ParseIP(address)
 	if ip == nil {
 		return nil, fmt.Errorf("invalid DNS bind address %q", address)
 	}
-	corefile := pluginCorefile(port, ip.String(), upstream)
-	instance, err := caddy.Start(caddy.CaddyfileInput{Contents: []byte(corefile), ServerTypeName: "dns"})
-	if err != nil {
+	var o options
+	for _, f := range opts {
+		f(&o)
+	}
+	if err := o.acl.Validate(); err != nil {
 		return nil, err
 	}
-	stop := func() { instance.ShutdownCallbacks(); _ = instance.Stop() }
+	for _, id := range o.acl.Identities {
+		if net.ParseIP(id.Listen).Equal(ip) {
+			return nil, fmt.Errorf("identity %s listens on the base resolver address", id.Name)
+		}
+	}
+	setPolicies(o.acl)
+	if o.querier == nil {
+		o.querier = &mdns.Querier{}
+	}
+	mdnsQuerier.Store(o.querier)
+	corefile := pluginCorefile(port, ip.String(), upstream, o.acl.Identities...)
+	instance, err := caddy.Start(caddy.CaddyfileInput{Contents: []byte(corefile), ServerTypeName: "dns"})
+	if err != nil {
+		clearPolicies()
+		return nil, err
+	}
+	stop := func() { instance.ShutdownCallbacks(); _ = instance.Stop(); clearPolicies(); mdnsQuerier.Store(nil) }
 	if err := os.MkdirAll(directory, 0755); err != nil {
 		stop()
 		return nil, err
 	}
-	for name, content := range map[string]string{
+	files := map[string]string{
 		"dns.env":     "GHOSTD_DNS_ADDRESS=" + ip.String() + "\n",
 		"resolv.conf": "# Managed by ghostd; for clients without Podman service discovery.\nnameserver " + ip.String() + "\n",
-	} {
+	}
+	for _, id := range o.acl.Identities {
+		files["dns-"+id.Name+".env"] = "GHOSTD_DNS_ADDRESS=" + id.Listen + "\n"
+		files["resolv-"+id.Name+".conf"] = "# Managed by ghostd; resolver for identity " + id.Name + " only.\nnameserver " + id.Listen + "\n"
+	}
+	for name, content := range files {
 		if err := publish(directory, name, content); err != nil {
 			stop()
 			return nil, err
 		}
 	}
+	var once sync.Once
 	return func() {
-		_ = os.Remove(filepath.Join(directory, "dns.env"))
-		_ = os.Remove(filepath.Join(directory, "resolv.conf"))
-		stop()
+		once.Do(func() {
+			for name := range files {
+				_ = os.Remove(filepath.Join(directory, name))
+			}
+			stop()
+		})
 	}, nil
 }
 
@@ -95,6 +148,8 @@ func publish(directory, name, content string) error {
 type localHandler struct {
 	next   plugin.Handler
 	lookup func(context.Context, string) ([]net.IP, error)
+	// browse answers DNS-SD questions (PTR/SRV/TXT) from the LAN; nil disables them.
+	browse func(ctx context.Context, name string, qtype uint16) (answers, extra []dns.RR, err error)
 	slots  chan struct{}
 }
 
@@ -109,6 +164,9 @@ func (h *localHandler) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dn
 	}
 	if q.Qclass != dns.ClassINET {
 		return dns.RcodeRefused, nil
+	}
+	if _, isService := serviceClass(q.Name); isService && h.browse != nil && (q.Qtype == dns.TypePTR || q.Qtype == dns.TypeSRV || q.Qtype == dns.TypeTXT) {
+		return h.serveBrowse(ctx, w, r, q)
 	}
 	if q.Qtype != dns.TypeA && q.Qtype != dns.TypeAAAA {
 		return dns.RcodeNotImplemented, nil
@@ -140,6 +198,86 @@ func (h *localHandler) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dn
 		}
 	}
 	return dns.RcodeSuccess, w.WriteMsg(reply)
+}
+
+// serveBrowse answers a DNS-SD question from the LAN. Under an ACL identity the
+// hosts a browse names become resolvable for that identity alone.
+func (h *localHandler) serveBrowse(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, q dns.Question) (int, error) {
+	select {
+	case h.slots <- struct{}{}:
+		defer func() { <-h.slots }()
+	default:
+		return dns.RcodeServerFailure, nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	answers, extra, err := h.browse(ctx, q.Name, q.Qtype)
+	if err != nil {
+		return dns.RcodeServerFailure, err
+	}
+	reply := new(dns.Msg)
+	reply.SetReply(r)
+	reply.RecursionAvailable = true
+	reply.Answer, reply.Extra = answers, extra
+	if len(answers) == 0 {
+		reply.Rcode = dns.RcodeNameError
+	}
+	if p := identityOf(ctx); p != nil {
+		for _, rr := range append(append([]dns.RR{}, answers...), extra...) {
+			if srv, ok := rr.(*dns.SRV); ok {
+				p.GrantHost(srv.Target)
+			}
+		}
+	}
+	return dns.RcodeSuccess, w.WriteMsg(reply)
+}
+
+// browseLocal asks the LAN for a DNS-SD record set through the native client.
+func browseLocal(ctx context.Context, name string, qtype uint16) ([]dns.RR, []dns.RR, error) {
+	q := mdnsQuerier.Load()
+	if q == nil {
+		return nil, nil, fmt.Errorf("mDNS client not running")
+	}
+	rrs, err := q.Query(ctx, name, qtype)
+	if err != nil && len(rrs) == 0 {
+		return nil, nil, err
+	}
+	answers := mdns.Answers(rrs, name, qtype)
+	return answers, mdns.Related(rrs, answers), nil
+}
+
+// lookupLocal resolves a .local host natively. Only when no LAN interface can
+// send a query does it fall back to the host's NSS, so a host that still runs
+// avahi keeps working while the native client is unavailable.
+func lookupLocal(ctx context.Context, name string) ([]net.IP, error) {
+	if q := mdnsQuerier.Load(); q != nil {
+		var ips []net.IP
+		seen := map[string]bool{}
+		for _, qt := range []uint16{dns.TypeA, dns.TypeAAAA} {
+			rrs, err := q.Query(ctx, name, qt)
+			if err != nil && len(rrs) == 0 {
+				if ips == nil && qt == dns.TypeA {
+					return lookupHost(ctx, name)
+				}
+				continue
+			}
+			for _, rr := range mdns.Answers(rrs, name, qt) {
+				var ip net.IP
+				switch v := rr.(type) {
+				case *dns.A:
+					ip = v.A
+				case *dns.AAAA:
+					ip = v.AAAA
+				}
+				if ip != nil && !seen[ip.String()] {
+					seen[ip.String()] = true
+					ips = append(ips, ip)
+				}
+			}
+		}
+		return ips, nil
+	}
+	return lookupHost(ctx, name)
 }
 
 func lookupHost(ctx context.Context, name string) ([]net.IP, error) {

@@ -1,0 +1,6 @@
+<?xml version="1.0" standalone='no'?>
+<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
+<service-group>
+  <name>Lobby Speaker</name>
+  <service><type>_googlecast._tcp</type><port>8009</port><txt-record>md=Speaker</txt-record></service>
+</service-group>

@@ -209,7 +209,7 @@ func bindingFor(address string) map[string]any {
 	return nil
 }
 
-const firewallDoc = `{"zones":{"trusted":{"interfaces":["tailscale0"]},"lan":{"interfaces":["lab0"],"services":["dns","dhcp"],"ports":[{"port":%d,"proto":"tcp"}]}}}`
+const firewallDoc = `{"zones":{"trusted":{"interfaces":["tailscale0"]},"lan":{"interfaces":["lab0"],"services":["dns","dhcp","mdns"],"ports":[{"port":%d,"proto":"tcp"}]}}}`
 
 func target(enabled bool) string {
 	return fmt.Sprintf(`{"scopes":[{"id":"lan","interface":"lab0","subnet":"10.77.0.0/24","server":"10.77.0.1","router":"10.77.0.1","start":"10.77.0.10","end":"10.77.0.30","zone":"lab.home.arpa","lease_seconds":600,"enabled":%t}],"devices":[]}`, enabled)
@@ -325,6 +325,61 @@ func pre() {
 	check(err == nil && strings.Contains(hist.GetJson(), `"confirmed"`), "confirmed takeover is archived in history")
 }
 
+func ask(server, name string, typ uint16) *dns.Msg {
+	q := new(dns.Msg)
+	q.SetQuestion(name, typ)
+	r, _, err := (&dns.Client{Net: "udp", Timeout: 5 * time.Second}).Exchange(q, server+":53")
+	if err != nil {
+		return nil
+	}
+	return r
+}
+
+// dnsPhase covers .local without avahi on the host (a third-party responder in
+// its own namespace stands in for a LAN printer) and the per-container ACL.
+func dnsPhase() {
+	waitReady()
+	step("mDNS: .local resolves through ghostd's native client, with no avahi on the host")
+	avahi, _ := sh("systemctl", "is-active", "avahi-daemon.service")
+	check(avahi != "active", "the host's own avahi is not running (%s)", avahi)
+	var r *dns.Msg
+	eventually("printer.local to resolve", 20*time.Second, func() bool {
+		r = ask("100.64.0.1", "printer.local.", dns.TypeA)
+		return r != nil && len(r.Answer) == 1
+	})
+	if r != nil && len(r.Answer) == 1 {
+		check(r.Answer[0].(*dns.A).A.String() == "10.77.0.60", "printer.local -> %s", r.Answer[0].(*dns.A).A)
+	}
+
+	step("ACL: identities see only their own service classes, on their own listeners")
+	const printing, music = "100.64.0.21", "100.64.0.22"
+	r = ask(printing, "printer.local.", dns.TypeA)
+	check(r != nil && r.Rcode == dns.RcodeRefused, "printer.local is refused for printing until a permitted browse offers it")
+	r = ask(music, "printer.local.", dns.TypeA)
+	check(r != nil && r.Rcode == dns.RcodeRefused, "and for music")
+	r = ask(printing, "_ipp._tcp.local.", dns.TypePTR)
+	check(r != nil && r.Rcode == dns.RcodeSuccess && len(r.Answer) >= 1, "printing can browse _ipp._tcp")
+	r = ask(printing, "_googlecast._tcp.local.", dns.TypePTR)
+	check(r != nil && r.Rcode == dns.RcodeRefused, "printing cannot browse _googlecast._tcp")
+	r = ask(music, "_ipp._tcp.local.", dns.TypePTR)
+	check(r != nil && r.Rcode == dns.RcodeRefused, "music cannot browse _ipp._tcp")
+	if r = ask(printing, "_ipp._tcp.local.", dns.TypePTR); r != nil && len(r.Answer) > 0 {
+		target := r.Answer[0].(*dns.PTR).Ptr
+		s := ask(printing, target, dns.TypeSRV)
+		check(s != nil && len(s.Answer) == 1, "instance %s has an SRV record", target)
+	}
+	a := ask(printing, "printer.local.", dns.TypeA)
+	check(a != nil && len(a.Answer) == 1, "printer.local resolvable for printing once its browse named it")
+	a = ask(music, "printer.local.", dns.TypeA)
+	check(a != nil && a.Rcode == dns.RcodeRefused, "printing's grant does not leak to music")
+	r = ask(music, "_googlecast._tcp.local.", dns.TypePTR)
+	check(r != nil && r.Rcode == dns.RcodeSuccess && len(r.Answer) >= 1, "music can browse _googlecast._tcp")
+	r = ask(printing, "example.com.", dns.TypeA)
+	check(r != nil && r.Rcode == dns.RcodeRefused, "an unlisted ordinary name is refused before any cache or upstream")
+	r = ask("100.64.0.1", "_googlecast._tcp.local.", dns.TypePTR)
+	check(r != nil && r.Rcode == dns.RcodeSuccess && len(r.Answer) >= 1, "the base listener stays unrestricted")
+}
+
 func post() {
 	step("after reboot: daemon restores confirmed state before serving")
 	waitReady()
@@ -425,6 +480,8 @@ func main() {
 		post()
 	case "expiry":
 		expiry()
+	case "dns":
+		dnsPhase()
 	default:
 		os.Exit(2)
 	}

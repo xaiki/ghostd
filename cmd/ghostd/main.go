@@ -22,12 +22,14 @@ import (
 	"log"
 	"net"
 	"os"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc"
 
 	"github.com/xaiki/ghostd/internal/addressbook"
 	"github.com/xaiki/ghostd/internal/auth"
+	"github.com/xaiki/ghostd/internal/mdns"
 	"github.com/xaiki/ghostd/internal/netconfig"
 	"github.com/xaiki/ghostd/internal/nft"
 	"github.com/xaiki/ghostd/internal/resolver"
@@ -64,7 +66,15 @@ func main() {
 	reportTo := flag.String("report-to", "", "report this host interfaces once to a tailnet DHCP authority and exit")
 	convertDNSmasq := flag.String("convert-dnsmasq", "", "preview: convert this dnsmasq config (following includes) to a dhcp-v1 handover plan and exit; touches nothing")
 	legacyUnit := flag.String("legacy-unit", "dnsmasq.service", "the dnsmasq unit --convert-dnsmasq records in the plan")
+	mdnsInterfaces := flag.String("mdns-interfaces", "", "comma-separated LAN interfaces the native mDNS client queries (default: every up multicast interface)")
 	flag.Parse()
+	if *mdnsInterfaces != "" {
+		for _, name := range strings.Split(*mdnsInterfaces, ",") {
+			if name = strings.TrimSpace(name); name != "" {
+				mdnsIfaces = append(mdnsIfaces, name)
+			}
+		}
+	}
 	if *convertDNSmasq != "" {
 		plan, err := addressbook.ConvertDNSmasq(*convertDNSmasq, addressbook.ConvertOptions{Files: addressbook.OSFiles, Unit: *legacyUnit, Addrs: addressbook.InterfaceAddrs})
 		if err != nil {
@@ -179,6 +189,9 @@ func runRevert(store *state.Store, leaseID, domain string) error {
 	return recoverDomain(store, domain, leaseID)
 }
 
+// mdnsIfaces is set from --mdns-interfaces before the daemon starts.
+var mdnsIfaces []string
+
 func runDaemon(store *state.Store, port int, deployerTag string, tailscaleIface string, watchdogSec int) error {
 	return runDaemonMode(store, port, deployerTag, tailscaleIface, watchdogSec, false)
 }
@@ -242,9 +255,20 @@ func runDaemonMode(store *state.Store, port int, deployerTag string, tailscaleIf
 	if err != nil {
 		return err
 	}
-	stopDNS, err := resolver.Start(dnsAddress, resolver.RuntimeDir)
+	aclRaw, err := store.Load(resolver.ACLFile)
+	if err != nil {
+		return err
+	}
+	acl, err := resolver.ParseACL(aclRaw)
+	if err != nil {
+		return fmt.Errorf("%s: %w", resolver.ACLFile, err)
+	}
+	stopDNS, err := resolver.Start(dnsAddress, resolver.RuntimeDir, resolver.WithACL(acl), resolver.WithQuerier(&mdns.Querier{Interfaces: mdnsIfaces}))
 	if err != nil {
 		return fmt.Errorf("start container DNS: %w", err)
+	}
+	if len(acl.Identities) > 0 {
+		log.Printf("ghostd: DNS ACL: %d identities, each on its own listener", len(acl.Identities))
 	}
 	defer stopDNS()
 	log.Printf("ghostd: container DNS listening on %s:53 (tailnet-only)", dnsAddress)

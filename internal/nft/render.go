@@ -24,6 +24,15 @@ const tableName = "stack_ghostd"
 // builtinServices maps a firewalld-style service name to (port, proto)
 // pairs — a small, explicit set. An unrecognized name is a render error,
 // never a silently-dropped rule: see Render's own doc.
+// serviceReplyPorts are source ports a service's peers answer from. mDNS
+// responders reply to a legacy-unicast query from UDP 5353 straight to the
+// asker's ephemeral port, which conntrack does not associate with the multicast
+// question; without this, ghostd's own native .local client is silent behind
+// its own default-drop policy. Only unprivileged destination ports are opened.
+var serviceReplyPorts = map[string][]PortRule{
+	"mdns": {{Port: 5353, Proto: "udp"}},
+}
+
 var builtinServices = map[string][]PortRule{
 	"mdns":          {{Port: 5353, Proto: "udp"}},
 	"dns":           {{Port: 53, Proto: "tcp"}, {Port: 53, Proto: "udp"}},
@@ -303,6 +312,9 @@ func writeZoneChain(b *strings.Builder, name string, zone Zone) error {
 		}
 	}
 	for _, svc := range sortedStrings(zone.Services) {
+		for _, rule := range serviceReplyPorts[svc] {
+			fmt.Fprintf(b, "    %s sport %d %s dport 1024-65535 accept\n", rule.Proto, rule.Port, rule.Proto)
+		}
 		for _, rule := range builtinServices[svc] {
 			fmt.Fprintf(b, "    %s dport %d accept\n", rule.Proto, rule.Port)
 		}

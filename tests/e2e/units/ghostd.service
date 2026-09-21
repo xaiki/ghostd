@@ -6,7 +6,7 @@ Wants=fakets.service lab-fixtures.service
 [Service]
 Type=notify
 RuntimeDirectory=ghostd
-ExecStart=/opt/ghostd/ghostd --watchdog-sec=30
+ExecStart=/opt/ghostd/ghostd --watchdog-sec=30 --mdns-interfaces=lab0
 Restart=always
 RestartSec=2
 WatchdogSec=30

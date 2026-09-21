@@ -1,0 +1,4 @@
+{"identities":[
+  {"name":"printing","listen":"100.64.0.21","allow_services":["_ipp._tcp"],"allow_names":["printers.home.arpa"]},
+  {"name":"music","listen":"100.64.0.22","allow_services":["_googlecast._tcp"]}
+]}
