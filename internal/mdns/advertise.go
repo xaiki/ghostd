@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/netip"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -41,6 +42,11 @@ type Record struct {
 	Port     uint16   `json:"port"`
 	TXT      []string `json:"txt,omitempty"`
 	Subtypes []string `json:"subtypes,omitempty"` // _universal
+	// Host is the .local host this instance's SRV points at, and whose address
+	// ghostd answers for it: empty means Config.Host. A name learned from a
+	// container is kept as the container advertised it (nat.go), which is why it
+	// is per record rather than per config.
+	Host string `json:"host,omitempty"`
 }
 
 var (
@@ -100,6 +106,9 @@ func (c Config) Validate() error {
 		if r.Instance == "" || len(r.Instance) > 63 || strings.ContainsAny(r.Instance, "\x00\r\n.") {
 			return fmt.Errorf("mdns: instance name %q must be 1..63 bytes without dots", r.Instance)
 		}
+		if r.Host != "" && !hostRE.MatchString(r.Host) {
+			return fmt.Errorf("mdns: host %q must be one lower-case DNS label", r.Host)
+		}
 		if r.Port == 0 && r.Service != "_adisk._tcp" && r.Service != "_device-info._tcp" {
 			return fmt.Errorf("mdns: %s/%s needs a port (only _adisk and _device-info are conventionally port 0)", r.Service, r.Instance)
 		}
@@ -127,8 +136,8 @@ func (c Config) Validate() error {
 	return nil
 }
 
-// InterfaceAddrs lists an interface's non-link-local addresses.
-func InterfaceAddrs(name string) ([]netip.Addr, error) {
+// InterfaceAddrs lists an interface's routable address prefixes.
+func InterfaceAddrs(name string) ([]netip.Prefix, error) {
 	i, err := net.InterfaceByName(name)
 	if err != nil {
 		return nil, err
@@ -137,13 +146,13 @@ func InterfaceAddrs(name string) ([]netip.Addr, error) {
 	if err != nil {
 		return nil, err
 	}
-	var out []netip.Addr
+	var out []netip.Prefix
 	for _, a := range addrs {
 		p, err := netip.ParsePrefix(a.String())
 		if err != nil || p.Addr().IsLinkLocalUnicast() || p.Addr().IsLoopback() {
 			continue
 		}
-		out = append(out, p.Addr())
+		out = append(out, p)
 	}
 	return out, nil
 }
@@ -157,7 +166,7 @@ const (
 // record logic is testable without a network.
 type answerer struct {
 	cfg   Config
-	addrs func(iface string) ([]netip.Addr, error)
+	addrs func(iface string) ([]netip.Prefix, error)
 }
 
 // norm makes a name comparable: miekg presents a space in a label as \032 and
@@ -187,18 +196,53 @@ func norm(name string) string {
 func fq(parts ...string) string { return strings.Join(parts, ".") + "." }
 
 func (a answerer) hostName() string { return fq(a.cfg.Host, "local") }
+
+// hostFor is the .local host one record points at: its own, or the config's.
+func (a answerer) hostFor(r Record) string {
+	if r.Host != "" {
+		return fq(r.Host, "local")
+	}
+	return a.hostName()
+}
+
+// hostNames is every distinct host the record set names, so the address records
+// ghostd publishes follow the SRV targets rather than a name nothing points at.
+func (a answerer) hostNames() []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, r := range a.cfg.Records {
+		if h := a.hostFor(r); !seen[h] {
+			seen[h] = true
+			out = append(out, h)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// hostForName resolves an already-normalized queried name to the host it names.
+func (a answerer) hostForName(name string) (string, bool) {
+	for _, host := range a.hostNames() {
+		if norm(host) == name {
+			return host, true
+		}
+	}
+	return "", false
+}
+
 func (a answerer) instanceName(r Record) string {
 	return fq(r.Instance, r.Service, "local")
 }
 
-func (a answerer) hostRecords(iface string) []dns.RR {
+func (a answerer) hostRecords(iface, host string) []dns.RR {
 	ips, err := a.addrs(iface)
 	if err != nil {
 		return nil
 	}
 	var out []dns.RR
-	for _, ip := range ips {
-		h := dns.RR_Header{Name: a.hostName(), Class: dns.ClassINET | 0x8000, Ttl: ttlHost}
+	for _, p := range ips {
+		ip := p.Addr()
+		h := dns.RR_Header{Name: host, Class: dns.ClassINET | 0x8000, Ttl: ttlHost}
 		if ip.Is4() {
 			h.Rrtype = dns.TypeA
 			out = append(out, &dns.A{Hdr: h, A: net.IP(ip.AsSlice())})
@@ -212,7 +256,7 @@ func (a answerer) hostRecords(iface string) []dns.RR {
 
 func (a answerer) instanceRecords(r Record) (srv, txt dns.RR) {
 	name := a.instanceName(r)
-	srv = &dns.SRV{Hdr: dns.RR_Header{Name: name, Rrtype: dns.TypeSRV, Class: dns.ClassINET | 0x8000, Ttl: ttlHost}, Port: r.Port, Target: a.hostName()}
+	srv = &dns.SRV{Hdr: dns.RR_Header{Name: name, Rrtype: dns.TypeSRV, Class: dns.ClassINET | 0x8000, Ttl: ttlHost}, Port: r.Port, Target: a.hostFor(r)}
 	strs := r.TXT
 	if len(strs) == 0 {
 		strs = []string{""} // RFC 6763: an empty TXT record is a single zero-length string
@@ -239,9 +283,11 @@ func (a answerer) all(iface string, ttl uint32) []dns.RR {
 		types[r.Service] = true
 	}
 	for svc := range types {
-		out = append(out, &dns.PTR{Hdr: dns.RR_Header{Name: "_services._dns-sd._udp.local.", Rrtype: dns.TypePTR, Class: dns.ClassINET, Ttl: ttlService}, Ptr: fq(svc, "local")})
+		out = append(out, &dns.PTR{Hdr: dns.RR_Header{Name: enumerateName, Rrtype: dns.TypePTR, Class: dns.ClassINET, Ttl: ttlService}, Ptr: fq(svc, "local")})
 	}
-	out = append(out, a.hostRecords(iface)...)
+	for _, host := range a.hostNames() {
+		out = append(out, a.hostRecords(iface, host)...)
+	}
 	if ttl != ttlService {
 		for _, rr := range out {
 			rr.Header().Ttl = ttl
@@ -280,7 +326,7 @@ func (a answerer) Answer(q *dns.Msg, iface string) *dns.Msg {
 	for _, question := range q.Question {
 		name := norm(question.Name)
 		want := func(t uint16) bool { return question.Qtype == t || question.Qtype == dns.TypeANY }
-		if name == "_services._dns-sd._udp.local." && want(dns.TypePTR) {
+		if name == enumerateName && want(dns.TypePTR) {
 			for _, rr := range a.all(iface, ttlService) {
 				if p, ok := rr.(*dns.PTR); ok && norm(p.Hdr.Name) == name {
 					add(&resp.Answer, rr)
@@ -288,13 +334,15 @@ func (a answerer) Answer(q *dns.Msg, iface string) *dns.Msg {
 			}
 			continue
 		}
-		if name == norm(a.hostName()) && (want(dns.TypeA) || want(dns.TypeAAAA)) {
-			for _, rr := range a.hostRecords(iface) {
-				if want(rr.Header().Rrtype) {
-					add(&resp.Answer, rr)
+		if want(dns.TypeA) || want(dns.TypeAAAA) {
+			if host, ok := a.hostForName(name); ok {
+				for _, rr := range a.hostRecords(iface, host) {
+					if want(rr.Header().Rrtype) {
+						add(&resp.Answer, rr)
+					}
 				}
+				continue
 			}
-			continue
 		}
 		for _, r := range a.cfg.Records {
 			srv, txt := a.instanceRecords(r)
@@ -311,7 +359,7 @@ func (a answerer) Answer(q *dns.Msg, iface string) *dns.Msg {
 					add(&resp.Answer, p)
 					add(&resp.Extra, srv)
 					add(&resp.Extra, txt)
-					for _, h := range a.hostRecords(iface) {
+					for _, h := range a.hostRecords(iface, a.hostFor(r)) {
 						add(&resp.Extra, h)
 					}
 				}
@@ -319,7 +367,7 @@ func (a answerer) Answer(q *dns.Msg, iface string) *dns.Msg {
 			if norm(a.instanceName(r)) == name {
 				if want(dns.TypeSRV) {
 					add(&resp.Answer, srv)
-					for _, h := range a.hostRecords(iface) {
+					for _, h := range a.hostRecords(iface, a.hostFor(r)) {
 						add(&resp.Extra, h)
 					}
 				}
@@ -341,7 +389,10 @@ func (a answerer) conflicts(resp *dns.Msg) string {
 	if !resp.Response {
 		return ""
 	}
-	mine := map[string]bool{norm(a.hostName()): true}
+	mine := map[string]bool{}
+	for _, host := range a.hostNames() {
+		mine[norm(host)] = true
+	}
 	for _, r := range a.cfg.Records {
 		mine[norm(a.instanceName(r))] = true
 	}

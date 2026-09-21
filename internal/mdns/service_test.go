@@ -104,9 +104,11 @@ func TestNATSweeperWithdrawsExpiredInstances(t *testing.T) {
 	defer func() { natSweep = saved }()
 	fake := &fakeNAT{}
 	rule := ReflectRule{LAN: "lab0", Network: "ctr0", Advertise: &NATConfig{Services: []string{"_ipp._tcp"}, Ports: "20000-20099"}}
-	n, _ := newNATRule(rule, 1)
+	n, _ := newNATRule(rule, 1, ctrSubnet, nil)
 	r := &running{
-		a:      answerer{addrs: func(string) ([]netip.Addr, error) { return []netip.Addr{netip.MustParseAddr("10.77.0.1")}, nil }},
+		a: answerer{addrs: func(string) ([]netip.Prefix, error) {
+			return []netip.Prefix{netip.MustParsePrefix("10.77.0.1/24")}, nil
+		}},
 		ifaces: map[int]net.Interface{1: {Index: 1, Name: "lab0"}, 10: {Index: 10, Name: "ctr0"}}, advertise: map[int]bool{}, done: make(chan struct{}),
 		nats: []*natRule{n}, natRunner: fake, rules: []*reflectRule{{cfg: rule, f: newFilter(nil), lan: 1, net: 10}},
 	}

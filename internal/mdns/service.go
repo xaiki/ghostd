@@ -25,7 +25,7 @@ type Service struct {
 	mu    sync.Mutex
 	cfg   Config
 	run   *running
-	Addrs func(iface string) ([]netip.Addr, error)
+	Addrs func(iface string) ([]netip.Prefix, error)
 }
 
 func NewService() *Service { return &Service{Addrs: InterfaceAddrs} }
@@ -107,7 +107,11 @@ func (s *Service) Close() {
 }
 
 func (s *Service) start(cfg Config) (*running, error) {
-	r := &running{a: answerer{cfg: cfg, addrs: s.Addrs}, ifaces: map[int]net.Interface{}, advertise: map[int]bool{}, done: make(chan struct{})}
+	addrsFor := s.Addrs
+	if addrsFor == nil {
+		addrsFor = InterfaceAddrs
+	}
+	r := &running{a: answerer{cfg: cfg, addrs: addrsFor}, ifaces: map[int]net.Interface{}, advertise: map[int]bool{}, done: make(chan struct{})}
 	lookup := func(name string) (*net.Interface, error) {
 		i, err := net.InterfaceByName(name)
 		if err != nil {
@@ -118,6 +122,11 @@ func (s *Service) start(cfg Config) (*running, error) {
 		}
 		r.ifaces[i.Index] = *i
 		return i, nil
+	}
+	// A name ghostd advertises itself is not one a container may take over.
+	reserved := map[string]bool{}
+	if cfg.Host != "" {
+		reserved[cfg.Host] = true
 	}
 	if len(cfg.Records) > 0 {
 		for _, name := range cfg.Interfaces {
@@ -139,7 +148,10 @@ func (s *Service) start(cfg Config) (*running, error) {
 		}
 		r.rules = append(r.rules, &reflectRule{cfg: rule, f: newFilter(rule.AllowServices), lan: lan.Index, net: ctr.Index})
 		if rule.Advertise != nil {
-			n, err := newNATRule(rule, lan.Index)
+			n, err := newNATRule(rule, lan.Index, func() []netip.Prefix {
+				subnet, _ := addrsFor(rule.Network)
+				return subnet
+			}, reserved)
 			if err != nil {
 				return nil, err
 			}
@@ -192,7 +204,7 @@ func (s *Service) start(cfg Config) (*running, error) {
 	}
 	// Probe: ask for every name we are about to claim, three times. Anyone who
 	// answers already owns it, and we must not advertise over them.
-	names := []string{r.a.hostName()}
+	names := r.a.hostNames()
 	for _, rec := range cfg.Records {
 		names = append(names, r.a.instanceName(rec))
 	}
@@ -282,8 +294,8 @@ func (r *running) ownAddress(ip net.IP) bool {
 	addr = addr.Unmap()
 	for _, i := range r.ifaces {
 		if list, err := r.a.addrs(i.Name); err == nil {
-			for _, a := range list {
-				if a == addr {
+			for _, p := range list {
+				if p.Addr() == addr {
 					return true
 				}
 			}

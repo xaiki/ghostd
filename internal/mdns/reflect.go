@@ -19,14 +19,15 @@ import (
 // container network's interface,
 //
 //   - container -> LAN: only *queries* about the service classes the network
-//     allows (and about hosts those services named), never anything else;
+//     allows (and about hosts those services named), plus the service-type
+//     enumeration, whose answers are filtered like any other record;
 //   - LAN -> container: only *records* for those classes, plus the SRV, TXT and
 //     address records of the instances they name.
 //
-// Everything else stays where it is. The container's own advertisements are not
-// reflected outward: its addresses are private to the bridge, so a service that
-// must be found from the LAN is declared in mdns-v1 (with the host's address and
-// published port) instead.
+// Everything else stays where it is. A container's own advertisement is not
+// relayed outward either — its address is private to the bridge — but with
+// `advertise` it is re-advertised from the LAN under ghostd's own address, with
+// a DNAT into the container: see nat.go.
 
 // ReflectRule connects one container network to a LAN.
 type ReflectRule struct {
@@ -56,6 +57,24 @@ func classOf(name string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// enumerateName is the DNS-SD service-type enumeration name. It names no class of
+// its own, so it cannot be permitted by class: the query goes out for what a
+// browser needs, and the ACL is applied to the classes that come back.
+const enumerateName = "_services._dns-sd._udp.local."
+
+func enumeration(q dns.Question) bool {
+	return q.Qtype == dns.TypePTR && norm(q.Name) == enumerateName
+}
+
+// enumerable is an enumeration answer naming a class the network may see.
+func (f *filter) enumerable(rr dns.RR) bool {
+	if rr.Header().Rrtype != dns.TypePTR || norm(rr.Header().Name) != enumerateName {
+		return false
+	}
+	p, ok := rr.(*dns.PTR)
+	return ok && f.allowedName(p.Ptr)
 }
 
 // filter decides what one container network may see.
@@ -106,7 +125,7 @@ func (f *filter) Queries(m *dns.Msg) *dns.Msg {
 	out.Id = m.Id
 	for _, q := range m.Question {
 		switch {
-		case f.allowedName(q.Name):
+		case f.allowedName(q.Name), enumeration(q):
 			out.Question = append(out.Question, q)
 		case (q.Qtype == dns.TypeA || q.Qtype == dns.TypeAAAA || q.Qtype == dns.TypeANY) && f.granted(q.Name):
 			out.Question = append(out.Question, q)
@@ -116,7 +135,7 @@ func (f *filter) Queries(m *dns.Msg) *dns.Msg {
 		return nil
 	}
 	for _, k := range m.Answer { // known answers only for what may be asked
-		if f.allowedName(k.Header().Name) {
+		if f.allowedName(k.Header().Name) || f.enumerable(k) {
 			out.Answer = append(out.Answer, k)
 		}
 	}
@@ -138,7 +157,7 @@ func (f *filter) Responses(m *dns.Msg) *dns.Msg {
 		h := rr.Header()
 		switch h.Rrtype {
 		case dns.TypePTR:
-			return f.allowedName(h.Name) // "_services._dns-sd._udp" has no class here and is refused
+			return f.allowedName(h.Name) || f.enumerable(rr) // enumeration names no class; only the allowed classes it lists are kept
 		case dns.TypeSRV, dns.TypeTXT:
 			return f.allowedName(h.Name)
 		case dns.TypeA, dns.TypeAAAA:

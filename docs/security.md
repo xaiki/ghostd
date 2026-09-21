@@ -174,6 +174,12 @@ to:
 - **`mdns-v1`** advertises only what the operator declares, on named interfaces, and
   refuses to advertise over a name another host already owns. Deployer access lets
   a caller advertise any record set on the LAN: treat it like the other domains.
+  **`reflect` with `advertise`** additionally re-advertises what a *container*
+  announces on its own network, at ghostd's LAN address and a pooled DNAT port: the
+  name and instance come from the container, so a container can put a service (or a
+  name) in front of the LAN, though only an address it announced on that network is
+  ever a translation target and the rule is scoped to traffic addressed to ghostd.
+  Keep container networks as trusted as the LAN they advertise onto.
 - **The TFTP server** is read-only and confined to its root, but it is
   unauthenticated by nature; serve only files that may be world-readable on the
   LAN.

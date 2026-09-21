@@ -27,7 +27,10 @@ import (
 // DNAT (in its own nft table) from that port to the container's address and port.
 // A LAN client browsing _ipp._tcp finds "Printer" at ghostd:20017 and its
 // connection lands in the container, with no host networking and nothing
-// published by hand.
+// published by hand. The container's own host name comes with it, so the LAN
+// resolves what the container's records already name; only an address the
+// container announced on that network is translated, and the DNAT rewrites only
+// traffic addressed to ghostd itself.
 //
 // State is learned, not configured: it follows what the container announces
 // (including goodbyes) and expires with the records' own lifetimes.
@@ -113,7 +116,7 @@ func renderNAT(maps []natMapping) string {
 	})
 	fmt.Fprintf(&b, "table inet %s {\n  chain prerouting {\n    type nat hook prerouting priority dstnat; policy accept;\n", natTable)
 	for _, m := range maps {
-		fmt.Fprintf(&b, "    iifname %q %s dport %d dnat ip to %s:%d\n", m.lan, m.proto, m.port, m.target, m.tport)
+		fmt.Fprintf(&b, "    iifname %q fib daddr type local %s dport %d dnat ip to %s:%d\n", m.lan, m.proto, m.port, m.target, m.tport)
 	}
 	b.WriteString("  }\n}\n")
 	return b.String()
@@ -144,24 +147,36 @@ type natRule struct {
 	used     map[int]string // LAN port -> instance key
 	lanIndex int
 	label    string
+	// subnet is the container network's own addressing, read when a mapping is
+	// made: a container's addresses elsewhere (its loopback, another network)
+	// name somewhere a LAN client must not be sent. Read lazily, so a bridge that
+	// only gains its address later still maps.
+	subnet func() []netip.Prefix
+	// reserved are the host names ghostd advertises itself: a container may not
+	// take one over on the LAN.
+	reserved map[string]bool
 	now      func() time.Time
 	// removed holds instances that left (goodbye or expiry) since the last
 	// announcement, so the LAN is told with TTL-0 records rather than left to cache.
 	removed []*natInstance
 }
 
+// natHost is one container host's announced addresses, as of one announcement.
 type natHost struct {
-	ip  netip.Addr
+	ips []netip.Addr
 	exp time.Time
 }
 
-func newNATRule(cfg ReflectRule, lanIndex int) (*natRule, error) {
+func newNATRule(cfg ReflectRule, lanIndex int, subnet func() []netip.Prefix, reserved map[string]bool) (*natRule, error) {
 	lo, hi, err := cfg.Advertise.portRange()
 	if err != nil {
 		return nil, err
 	}
+	if subnet == nil {
+		subnet = func() []netip.Prefix { return nil }
+	}
 	return &natRule{cfg: cfg, f: newFilter(cfg.Advertise.Services), lo: lo, hi: hi, insts: map[string]*natInstance{}, hosts: map[string]natHost{},
-		used: map[int]string{}, lanIndex: lanIndex, label: natLabel(cfg.Network), now: time.Now}, nil
+		used: map[int]string{}, lanIndex: lanIndex, label: natLabel(cfg.Network), subnet: subnet, reserved: reserved, now: time.Now}, nil
 }
 
 // natLabel is the .local host name the LAN sees for a network's services.
@@ -209,6 +224,24 @@ func (n *natRule) allocate(i *natInstance) bool {
 	return false
 }
 
+// mapTarget is the address a container's service is mapped to: one of the
+// addresses it announced, on the rule's own network. Its other addresses — its
+// loopback, an address of another network — are ignored rather than translated:
+// a NAT sends a LAN client to the host that asked, not to a third party.
+func mapTarget(subnet []netip.Prefix, ips []netip.Addr) (netip.Addr, bool) {
+	for _, ip := range ips {
+		if !ip.Is4() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsMulticast() || ip.IsUnspecified() {
+			continue
+		}
+		for _, p := range subnet {
+			if p.Contains(ip) {
+				return ip, true
+			}
+		}
+	}
+	return netip.Addr{}, false
+}
+
 // learn folds one container response into the rule's state and reports whether
 // the set of mappings or records changed.
 func (n *natRule) learn(m *dns.Msg) (changed bool) {
@@ -216,6 +249,11 @@ func (n *natRule) learn(m *dns.Msg) (changed bool) {
 	defer n.mu.Unlock()
 	now := n.now()
 	all := append(append([]dns.RR{}, m.Answer...), m.Extra...)
+	// A host may be announced with more than one address in one message (its
+	// bridge address and, say, its loopback): they are collected per host and
+	// replace what was known, so a container that moves keeps only what it
+	// announces now.
+	announced := map[string]natHost{}
 	ensure := func(name string) *natInstance {
 		class, ok := classOf(name)
 		if !ok || !n.f.allow[class] {
@@ -234,11 +272,17 @@ func (n *natRule) learn(m *dns.Msg) (changed bool) {
 		switch v := rr.(type) {
 		case *dns.A:
 			if ip, ok := netip.AddrFromSlice(v.A.To4()); ok {
+				host := norm(h.Name)
 				if h.Ttl == 0 {
-					delete(n.hosts, norm(h.Name))
-				} else {
-					n.hosts[norm(h.Name)] = natHost{ip, now.Add(time.Duration(h.Ttl) * time.Second)}
+					delete(n.hosts, host)
+					continue
 				}
+				a := announced[host]
+				a.ips = append(a.ips, ip)
+				if exp := now.Add(time.Duration(h.Ttl) * time.Second); exp.After(a.exp) {
+					a.exp = exp
+				}
+				announced[host] = a
 			}
 		case *dns.PTR:
 			class, ok := classOf(h.Name)
@@ -284,18 +328,26 @@ func (n *natRule) learn(m *dns.Msg) (changed bool) {
 			}
 		}
 	}
+	for host, a := range announced {
+		n.hosts[host] = a
+	}
 	// An instance is publishable once its host's address is known and a LAN port is set.
+	subnet := n.subnet()
 	for _, i := range n.insts {
 		host, ok := n.hosts[i.host]
 		if !ok || !now.Before(host.exp) || i.port == 0 {
 			continue
 		}
-		if i.ip != host.ip || i.hostPort == 0 {
+		ip, ok := mapTarget(subnet, host.ips)
+		if !ok {
+			continue // nothing announced is on this network: keep the last address we verified
+		}
+		if i.ip != ip || i.hostPort == 0 {
 			if i.hostPort != 0 {
 				delete(n.used, i.hostPort)
 				i.hostPort = 0
 			}
-			i.ip = host.ip
+			i.ip = ip
 			if !n.allocate(i) {
 				continue
 			}
@@ -366,14 +418,27 @@ func (n *natRule) mappings() []natMapping {
 	return out
 }
 
-// answerer builds the LAN-facing view: every instance on this rule's host name,
-// at ghostd's LAN address and the mapped port. Only IPv4 is mapped, so only IPv4
+// hostLabel is the .local host the LAN sees an instance under: the name the
+// container itself advertised, so a LAN client resolves what the container's own
+// records — and anything they point at — already name. A name ghostd advertises
+// itself is never taken over, and anything that is not one plain label keeps the
+// network's name instead.
+func (n *natRule) hostLabel(i *natInstance) string {
+	label, ok := strings.CutSuffix(i.host, ".local.")
+	if !ok || !hostRE.MatchString(label) || n.reserved[label] {
+		return n.label
+	}
+	return label
+}
+
+// answerer builds the LAN-facing view: every instance in its own host name, at
+// ghostd's LAN address and the mapped port. Only IPv4 is mapped, so only IPv4
 // addresses are published.
-func (n *natRule) answerer(addrs func(string) ([]netip.Addr, error)) answerer {
+func (n *natRule) answerer(addrs func(string) ([]netip.Prefix, error)) answerer {
 	return n.answererFor(n.published(), addrs)
 }
 
-func (n *natRule) answererFor(insts []*natInstance, addrs func(string) ([]netip.Addr, error)) answerer {
+func (n *natRule) answererFor(insts []*natInstance, addrs func(string) ([]netip.Prefix, error)) answerer {
 	cfg := Config{Host: n.label}
 	for _, i := range insts {
 		var subs []string
@@ -381,14 +446,14 @@ func (n *natRule) answererFor(insts []*natInstance, addrs func(string) ([]netip.
 			subs = append(subs, s)
 		}
 		sort.Strings(subs)
-		cfg.Records = append(cfg.Records, Record{Service: i.service, Instance: i.instance, Port: uint16(i.hostPort), TXT: i.txt, Subtypes: subs})
+		cfg.Records = append(cfg.Records, Record{Service: i.service, Instance: i.instance, Host: n.hostLabel(i), Port: uint16(i.hostPort), TXT: i.txt, Subtypes: subs})
 	}
-	return answerer{cfg: cfg, addrs: func(iface string) ([]netip.Addr, error) {
+	return answerer{cfg: cfg, addrs: func(iface string) ([]netip.Prefix, error) {
 		all, err := addrs(iface)
-		var v4 []netip.Addr
-		for _, a := range all {
-			if a.Is4() {
-				v4 = append(v4, a)
+		var v4 []netip.Prefix
+		for _, p := range all {
+			if p.Addr().Is4() {
+				v4 = append(v4, p)
 			}
 		}
 		return v4, err

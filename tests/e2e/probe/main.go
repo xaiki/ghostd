@@ -449,7 +449,11 @@ func zcIn(ns, addr string, args ...string) string {
 // ghostd's address and a mapped port, and a connection there lands in the container.
 func natPhase() {
 	step("mDNS NAT: a container's own advertisement is re-advertised on the LAN and reachable through DNAT")
-	adv := exec.Command("nsenter", "--net=/run/netns/cnt0", "--", "env", "ZC_IFACE=10.90.0.10", "python3", "/opt/ghostd/zcadv.py", "Container Printer", "cprinter", "10.90.0.10", "6310", "600")
+	// The advertiser is stock: no interface named, nothing arranged for ghostd, and
+	// it announces a loopback address as well as its own. It must be found from its
+	// own broadcast alone, and mapped to the address on its own network only.
+	adv := exec.Command("nsenter", "--net=/run/netns/cnt0", "--", "python3", "/opt/ghostd/zcadv.py", "Container Printer", "cprinter", "10.90.0.10", "6310", "600")
+	adv.Stdout, adv.Stderr = os.Stdout, os.Stderr
 	must(adv.Start(), "start the container advertiser")
 	defer func() { adv.Process.Signal(syscall.SIGTERM); adv.Wait() }()
 	var info string
@@ -460,11 +464,21 @@ func natPhase() {
 	port := 0
 	fmt.Sscanf(info[strings.Index(info, "port=")+5:], "%d", &port)
 	check(port >= 20000 && port <= 20099, "the LAN sees a mapped port, not the container's 6310: %s", info)
-	check(strings.Contains(info, "addrs=10.77.0.1") && !strings.Contains(info, "10.90.0.10") && strings.Contains(info, "server=ctr0.local."), "at ghostd's LAN address, under the network's host name, never the bridge-private address: %s", info)
+	check(strings.Contains(info, "addrs=10.77.0.1") && !strings.Contains(info, "10.90.0.10") && !strings.Contains(info, "127.0.0.1") && strings.Contains(info, "server=cprinter.local."), "at ghostd's LAN address, under the name the container advertised, never the container's own addresses: %s", info)
 	check(strings.Contains(info, "txt=rp=ipp/print"), "with its TXT record intact")
 	check(strings.Contains(zc("browse", "_ipp._tcp.local."), "Container Printer"), "browse on the LAN lists it")
 	tab, _ := sh("nft", "list", "table", "inet", "ghostd_mdns_nat")
-	check(strings.Contains(tab, fmt.Sprintf("dport %d dnat ip to 10.90.0.10:6310", port)), "a DNAT was installed in ghostd's own table")
+	check(strings.Contains(tab, fmt.Sprintf("fib daddr type local tcp dport %d dnat ip to 10.90.0.10:6310", port)), "the DNAT is installed in ghostd's own table and scoped to traffic addressed to ghostd")
+	// The name the container advertised is the name the LAN resolves, and what it
+	// resolves to is ghostd: the container's identity is not rewritten.
+	var resolved *dns.Msg
+	eventually("the container's own name to resolve on the LAN", 20*time.Second, func() bool {
+		resolved = ask("100.64.0.1", "cprinter.local.", dns.TypeA)
+		return resolved != nil && len(resolved.Answer) == 1
+	})
+	if resolved != nil && len(resolved.Answer) == 1 {
+		check(resolved.Answer[0].(*dns.A).A.String() == "10.77.0.1", "cprinter.local -> %s", resolved.Answer[0].(*dns.A).A)
+	}
 	banner, err := sh("nsenter", "--net=/run/netns/printer", "--", "python3", "-c", fmt.Sprintf("import socket;s=socket.create_connection(('10.77.0.1',%d),5);print(s.recv(100).decode().strip())", port))
 	check(err == nil && strings.Contains(banner, "HELLO-FROM-CONTAINER Container Printer"), "a LAN client's connection to ghostd:%d lands in the container (%q, %v)", port, banner, err)
 	_, err = sh("nsenter", "--net=/run/netns/printer", "--", "python3", "-c", "import socket;socket.create_connection(('10.90.0.10',6310),2)")

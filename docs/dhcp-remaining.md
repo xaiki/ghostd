@@ -76,8 +76,10 @@ detection.
   and of every bolt transaction; it is verified by killing the process (SIGKILL), not by
   cutting power or dropping the disk cache.
 - **NAT and reflector limits.** Per container network by design. The NAT maps IPv4
-  only, does not conflict-probe the names it re-advertises, and learns from what a
-  container announces. IPv6 reflection is implemented but lab-tested on IPv4 only.
+  only, does not conflict-probe the names it re-advertises — instance *or* host
+  names, though a name ghostd advertises itself is never taken over — and learns
+  from what a container announces, mapping only an address announced on that
+  network. IPv6 reflection is implemented but lab-tested on IPv4 only.
 - **DNS ACL identity is a network-path property.** Enforcing that only one container
   can reach its resolver address is host firewall work.
 - **General dnsmasq replacement remains a subset.** Ranges that match on tags,

@@ -180,14 +180,21 @@ and the DNS-SD instances to advertise:
 ```
 
 ghostd answers multicast and legacy-unicast queries, announces on start and sends
-goodbyes (TTL 0) on withdrawal. It binds UDP 5353 **exclusively**: with another
-mDNS daemon on the host the apply fails with the bind error rather than sharing the
-port. Before advertising it probes each name, and a name another host already
-advertises refuses the apply and leaves the previous set running. The record set is
-yours to supply; ghostd ships none (a Time Machine set must be captured from a
-known-good advertisement). An unconfirmed change reverts, and after a reboot the
-confirmed set is re-advertised by a watcher that also retries a start that failed
-because an interface was not up yet.
+goodbyes (TTL 0) on withdrawal. Every record's SRV points at its host — `host`
+above, or the record's own `"host"` when it names one — and the address records
+answered for it are the advertising interface's. It binds UDP 5353 **exclusively**:
+with another mDNS daemon on the host the apply fails with the bind error rather
+than sharing the port. Before advertising it probes each name, and a name another
+host already advertises refuses the apply and leaves the previous set running. The
+record set is yours to supply; ghostd ships none (a Time Machine set must be
+captured from a known-good advertisement). An unconfirmed change reverts, and after
+a reboot the confirmed set is re-advertised by a watcher that also retries a start
+that failed because an interface was not up yet.
+
+`GetState` reads the currently-applied target back as `mdns_config_json` (the
+same JSON shape shown above) — empty when the `mdns` feature is not built in
+or nothing is configured. This is what lets a caller diff its desired set
+against what is actually live instead of blindly re-applying every run.
 
 ### Per-container reflector
 
@@ -205,11 +212,13 @@ container network with no host networking:
 The permission is the network: each rule has its own filter. Toward the container
 go LAN records for the allowed classes and for the instances they name (PTR, SRV,
 TXT, and the address records of the hosts their SRVs point at, remembered for two
-minutes); nothing else — no other class, no service enumeration, no unrelated
-host. Toward the LAN go only the container's *queries* for allowed classes and the
-hosts those services named. One rule per network (a network is one permission
-set); `records` and `host` are needed only if you also advertise. The container
-bridge's firewall zone needs the `mdns` service.
+minutes); nothing else — no other class, no unrelated host. Toward the LAN go only
+the container's *queries* for allowed classes and the hosts those services named.
+A browser that enumerates the service types first is served too: the enumeration
+question names no class of its own, so it is relayed and its answers are filtered
+like any other record — the classes it may see. One rule per network (a network is
+one permission set); `records` and `host` are needed only if you also advertise.
+The container bridge's firewall zone needs the `mdns` service.
 
 #### mDNS NAT: containers advertising to the LAN
 
@@ -223,21 +232,34 @@ reflecting it as-is would send LAN clients somewhere they cannot reach. Add
 ```
 
 It learns the container's instances (PTR, SRV, TXT and its host's address, goodbyes
-included), re-advertises each on the LAN under **ghostd's own LAN address**, the
-network's host name (`podman-print.local`) and a **port from the pool** (stable per
-container address and port), and installs a DNAT from that port to the container's
-address and port in its own nft table (`ghostd_mdns_nat`, replaced atomically,
-removed on stop). A LAN client browsing `_ipp._tcp` finds the container's service
-and its connection lands in the container: no host networking, nothing published by
-hand, and the bridge address is never disclosed. It also answers LAN queries from
-what it learned and relays them to the network so the container refreshes. Records
-lapse with their own TTLs. Only IPv4 is mapped, so only IPv4 is published.
+included) and re-advertises each on the LAN under **ghostd's own LAN address** and
+a **port from the pool** (stable per container address and port), keeping the host
+name the container itself advertised, and installs a DNAT from that port to the
+container's address and port in its own nft table (`ghostd_mdns_nat`, replaced
+atomically, removed on stop). A LAN client browsing `_ipp._tcp` finds the
+container's service, resolves the container's own name to ghostd, and its
+connection lands in the container: no host networking, nothing published by hand,
+and the bridge address is never disclosed. It also answers LAN queries from what it
+learned and relays them to the network so the container refreshes. Records lapse
+with their own TTLs. Only IPv4 is mapped, so only IPv4 is published.
+
+Nothing is asked of the container: it announces as it always would, on its own
+network, and ghostd learns from that broadcast. Only an address the container
+announced **on its own network** is translated — an address it also announces
+elsewhere (its loopback, another network) is ignored, so a LAN port can never be
+pointed off the container network — and the DNAT is scoped to traffic addressed to
+ghostd itself (`fib daddr type local`), so a pool port does not intercept traffic
+meant for another host on the LAN.
 
 The firewall must let the translated flows through its default-drop forward
 policy: set `"allow_dnat_forward": true` in the firewall target (it admits only
 connections a DNAT rule actually rewrote, `ct status dnat`), enable IPv4
 forwarding in netconfig, and give the container network's zone the `mdns` service.
-Instance names are not conflict-probed on the LAN: keep them distinct.
+Instance *and host* names learned this way are not conflict-probed on the LAN:
+keep them distinct, and note that a name ghostd advertises itself (`host` above)
+is never taken over by a container — such an instance keeps the network's name
+instead. `records` entries accept their own `"host"` for the same reason a
+container's do: the SRV points at it and the address records follow it.
 
 ## Environment
 
@@ -301,6 +323,18 @@ Three container harnesses need Podman and never touch a real network:
 | `GHOSTD_E2E_MODE=standby tests/e2e/run.sh` | Two real daemons: a leader serving DHCP and a standby mirroring it; the leader is stopped, the standby promoted, and the clients renew the same addresses |
 | `GHOSTD_TAGS=headscale GHOSTD_E2E_MODE=headscale tests/e2e/run.sh` | The headscale provider against a daemon that grants a deploy capability and no tag: the capability is ignored, a listed `--deployer-user` login is authorized |
 | `tests/e2e/run.sh` | The **real ghostd binary under real systemd** with a fake tailscaled: firewall/netconfig apply, confirm, timer revert and crash recovery; a dnsmasq takeover through the RPC with the daemon killed mid-window; PXE/TFTP; native mDNS and the DNS ACL with avahi and python-zeroconf as third parties; peer suggestions; switch evidence; mDNS advertisement; and a container reboot |
+
+Two things about that lab are deliberate, and both are about not hiding a
+requirement the real world would have. A container namespace gets exactly what a
+container runtime gives it — its address and a default route — and nothing for
+mDNS: multicast leaves a bridge through the ordinary route, so a `224.0.0.0/4`
+route in the fixture would hide whether an application needs one (it does not).
+And the container-side advertiser declares its own addresses, because
+python-zeroconf publishes A records only for what the application declares: a
+`ServiceInfo` without addresses announces PTR/SRV/TXT and no address at all, and
+an announcement with no address has nothing for a NAT to translate. That is the
+application's business, not a ghostd requirement — and the fixture announces a
+loopback address too, which ghostd must refuse to translate.
 
 ## Regenerating the proto bindings
 

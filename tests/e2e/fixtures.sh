@@ -42,7 +42,10 @@ fi
 
 # Two container networks, each a multicast domain of its own with one "container"
 # (a namespace with a static address) attached: the per-container mDNS reflector's
-# targets. ctr0 will be allowed printers only, ctr1 speakers only.
+# targets. ctr0 will be allowed printers only, ctr1 speakers only. A container is
+# given exactly what a container runtime gives it — its address and a default
+# route — and nothing for mDNS: an application that speaks mDNS has to reach
+# ghostd with no help, so a multicast route here would hide a real requirement.
 for n in 0 1; do
 	br="ctr$n"; ns="cnt$n"
 	ip link add "$br" type bridge 2>/dev/null || true
@@ -57,7 +60,6 @@ for n in 0 1; do
 		nsenter --net="/run/netns/$ns" -- ip link set lo up
 		nsenter --net="/run/netns/$ns" -- ip addr add "10.9$n.0.10/24" dev "${ns}p"
 		nsenter --net="/run/netns/$ns" -- ip link set "${ns}p" up
-		nsenter --net="/run/netns/$ns" -- ip route add 224.0.0.0/4 dev "${ns}p"
 		nsenter --net="/run/netns/$ns" -- ip route add default via "10.9$n.0.1"
 	fi
 done

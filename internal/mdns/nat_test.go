@@ -33,9 +33,12 @@ func containerAnnouncement(host string, ip string, instance string, port uint16,
 	return m
 }
 
+// ctrSubnet is the container network the announcements below live on.
+func ctrSubnet() []netip.Prefix { return []netip.Prefix{netip.MustParsePrefix("10.90.0.0/24")} }
+
 func natRuleFor(t *testing.T) *natRule {
 	t.Helper()
-	n, err := newNATRule(ReflectRule{LAN: "lab0", Network: "ctr0", Advertise: &NATConfig{Services: []string{"_ipp._tcp"}, Ports: "20000-20099"}}, 1)
+	n, err := newNATRule(ReflectRule{LAN: "lab0", Network: "ctr0", Advertise: &NATConfig{Services: []string{"_ipp._tcp"}, Ports: "20000-20099"}}, 1, ctrSubnet, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +111,7 @@ func TestNATIgnoresWhatIsNotAllowedOrIncomplete(t *testing.T) {
 }
 
 func TestNATPortPoolExhaustionAndRange(t *testing.T) {
-	n, _ := newNATRule(ReflectRule{LAN: "lab0", Network: "ctr0", Advertise: &NATConfig{Services: []string{"_ipp._tcp"}, Ports: "20000-20001"}}, 1)
+	n, _ := newNATRule(ReflectRule{LAN: "lab0", Network: "ctr0", Advertise: &NATConfig{Services: []string{"_ipp._tcp"}, Ports: "20000-20001"}}, 1, ctrSubnet, nil)
 	for i, ip := range []string{"10.90.0.10", "10.90.0.11", "10.90.0.12"} {
 		n.learn(containerAnnouncement("h"+string(rune('a'+i)), ip, "P"+string(rune('a'+i)), 631, 120))
 	}
@@ -131,8 +134,13 @@ func TestRenderNATIsOneAtomicTable(t *testing.T) {
 		{lan: "eth0", proto: "tcp", port: 20001, target: netip.MustParseAddr("10.90.0.10"), tport: 631},
 	})
 	i1, i2 := strings.Index(got, "dport 20001"), strings.Index(got, "dport 20002")
-	if i1 < 0 || i2 < i1 || !strings.Contains(got, `iifname "eth0" tcp dport 20001 dnat ip to 10.90.0.10:631`) {
+	if i1 < 0 || i2 < i1 || !strings.Contains(got, `iifname "eth0" fib daddr type local tcp dport 20001 dnat ip to 10.90.0.10:631`) {
 		t.Fatal(got)
+	}
+	// The redirect is scoped to traffic addressed to ghostd: a pool port is not a
+	// reason to rewrite a flow meant for somebody else on the same LAN.
+	if strings.Contains(got, `iifname "eth0" tcp dport`) || !strings.Contains(got, "fib daddr type local") {
+		t.Fatal("a pool port would intercept traffic not addressed to ghostd:", got)
 	}
 }
 
@@ -159,13 +167,13 @@ func (f *fakeNAT) last() string {
 func TestContainerServiceIsReadvertisedOnTheLANAndMapped(t *testing.T) {
 	fake := &fakeNAT{}
 	rule := ReflectRule{LAN: "lab0", Network: "ctr0", Advertise: &NATConfig{Services: []string{"_ipp._tcp"}, Ports: "20000-20099"}}
-	n, _ := newNATRule(rule, 1)
+	n, _ := newNATRule(rule, 1, ctrSubnet, nil)
 	r := &running{
-		a: answerer{cfg: Config{}, addrs: func(iface string) ([]netip.Addr, error) {
+		a: answerer{cfg: Config{}, addrs: func(iface string) ([]netip.Prefix, error) {
 			if iface == "lab0" {
-				return []netip.Addr{netip.MustParseAddr("10.77.0.1"), netip.MustParseAddr("fd77::1")}, nil
+				return []netip.Prefix{netip.MustParsePrefix("10.77.0.1/24"), netip.MustParsePrefix("fd77::1/64")}, nil
 			}
-			return []netip.Addr{netip.MustParseAddr("10.90.0.1")}, nil
+			return []netip.Prefix{netip.MustParsePrefix("10.90.0.1/24")}, nil
 		}},
 		ifaces: map[int]net.Interface{1: {Index: 1, Name: "lab0"}, 10: {Index: 10, Name: "ctr0"}}, advertise: map[int]bool{}, done: make(chan struct{}),
 		nats: []*natRule{n}, natRunner: fake,
@@ -185,7 +193,7 @@ func TestContainerServiceIsReadvertisedOnTheLANAndMapped(t *testing.T) {
 		t.Fatal(pub)
 	}
 	port := pub[0].hostPort
-	if got := fake.last(); !strings.Contains(got, `iifname "lab0" tcp dport `) || !strings.Contains(got, "dnat ip to 10.90.0.10:631") {
+	if got := fake.last(); !strings.Contains(got, `iifname "lab0" fib daddr type local tcp dport `) || !strings.Contains(got, "dnat ip to 10.90.0.10:631") {
 		t.Fatal("no DNAT installed:", got)
 	}
 	if len(emitted) == 0 {
@@ -204,8 +212,8 @@ func TestContainerServiceIsReadvertisedOnTheLANAndMapped(t *testing.T) {
 			t.Fatal("IPv6 is not mapped, so it must not be published:", v)
 		}
 	}
-	if srv == nil || int(srv.Port) != port || srv.Target != "ctr0.local." {
-		t.Fatalf("SRV must point at ghostd's port and the network's host name: %+v", srv)
+	if srv == nil || int(srv.Port) != port || srv.Target != "printer.local." {
+		t.Fatalf("SRV must point at ghostd's port and the name the container advertised: %+v", srv)
 	}
 	if len(addrs) != 1 || addrs[0] != "10.77.0.1" {
 		t.Fatalf("the LAN must be told ghostd's address, never the container's: %v", addrs)
@@ -236,6 +244,15 @@ func TestContainerServiceIsReadvertisedOnTheLANAndMapped(t *testing.T) {
 	if len(replies) != 0 || len(forwarded) != 0 {
 		t.Fatal("a class outside the rule was answered or relayed")
 	}
+	// The LAN resolves the name the container advertised: the address it is
+	// answered with is ghostd's, so a client holding the container's own name (its
+	// TXT records, a previously browsed URL) still lands in the container.
+	replies = nil
+	q.SetQuestion("printer.local.", dns.TypeA)
+	r.handle(pack(q), &net.UDPAddr{IP: net.ParseIP("10.77.0.60"), Port: 5353}, 1, false)
+	if len(replies) != 1 || len(replies[0].Answer) != 1 || replies[0].Answer[0].(*dns.A).A.String() != "10.77.0.1" {
+		t.Fatal("the container's own host name is not answered with ghostd's address:", replies)
+	}
 	// The container says goodbye: withdrawn on the LAN and unmapped.
 	emitted = nil
 	r.handle(pack(containerAnnouncement("printer", "10.90.0.10", "Office", 631, 0)), &net.UDPAddr{IP: net.ParseIP("10.90.0.10"), Port: 5353}, 10, false)
@@ -258,6 +275,66 @@ func TestContainerServiceIsReadvertisedOnTheLANAndMapped(t *testing.T) {
 	r.stopNAT()
 	if got := fake.last(); strings.Contains(got, "chain") {
 		t.Fatal("the table survived a stop:", got)
+	}
+}
+
+// A container may announce more than one address for its host (its bridge
+// address and, say, its loopback). Only the one on its own network is
+// translated: a LAN client must never be sent to the host's loopback, to the
+// tailnet or to another LAN host because a container said so.
+func TestNATMapsOnlyTheContainersOwnNetworkAddress(t *testing.T) {
+	n := natRuleFor(t)
+	two := containerAnnouncement("printer", "10.90.0.10", "Office", 631, 120)
+	two.Extra = append(two.Extra, &dns.A{Hdr: dns.RR_Header{Name: "printer.local.", Rrtype: dns.TypeA, Class: dns.ClassINET | 0x8000, Ttl: 120}, A: net.ParseIP("127.0.0.1")})
+	n.learn(two)
+	if pub := n.published(); len(pub) != 1 || pub[0].ip.String() != "10.90.0.10" {
+		t.Fatalf("mapped %+v instead of the address on the container's own network", pub)
+	}
+	// An address off the network, announced alone, is not a mapping at all.
+	for _, off := range []string{"127.0.0.1", "100.64.0.9", "10.77.0.60"} {
+		loop := natRuleFor(t)
+		only := containerAnnouncement("printer", off, "Office", 631, 120)
+		loop.learn(only)
+		if pub := loop.published(); len(pub) != 0 || len(loop.mappings()) != 0 {
+			t.Fatalf("%s became a LAN-reachable DNAT target: %+v", off, pub)
+		}
+	}
+}
+
+// The LAN sees the instance under the name the container advertised, unless
+// ghostd advertises that name itself or it is not one plain .local label.
+func TestNATKeepsTheContainersOwnName(t *testing.T) {
+	rule := ReflectRule{LAN: "lab0", Network: "ctr0", Advertise: &NATConfig{Services: []string{"_ipp._tcp"}, Ports: "20000-20099"}}
+	n, err := newNATRule(rule, 1, ctrSubnet, map[string]bool{"nas": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	label := func(instance string) string {
+		t.Helper()
+		for _, i := range n.published() {
+			if i.instance == instance {
+				return n.hostLabel(i)
+			}
+		}
+		t.Fatalf("instance %s is not published: %+v", instance, n.published())
+		return ""
+	}
+	n.learn(containerAnnouncement("printer", "10.90.0.10", "Office", 631, 120))
+	if got := label("Office"); got != "printer" {
+		t.Fatal("the container's own name must be the one the LAN sees:", got)
+	}
+	// A name ghostd advertises itself is never taken over by a container.
+	n.learn(containerAnnouncement("nas", "10.90.0.11", "Backups", 631, 120))
+	if got := label("Backups"); got != "ctr0" {
+		t.Fatal("a container took over a name ghostd advertises itself:", got)
+	}
+	// A host that is not one plain .local label keeps the network's name.
+	odd := containerAnnouncement("printer", "10.90.0.12", "Other", 631, 120)
+	odd.Extra[0] = &dns.SRV{Hdr: dns.RR_Header{Name: "Other._ipp._tcp.local.", Rrtype: dns.TypeSRV, Class: dns.ClassINET | 0x8000, Ttl: 120}, Port: 631, Target: "printer.example.com."}
+	odd.Extra[2] = &dns.A{Hdr: dns.RR_Header{Name: "printer.example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET | 0x8000, Ttl: 120}, A: net.ParseIP("10.90.0.12")}
+	n.learn(odd)
+	if got := label("Other"); got != "ctr0" {
+		t.Fatal("a host outside .local kept a name ghostd cannot serve:", got)
 	}
 }
 

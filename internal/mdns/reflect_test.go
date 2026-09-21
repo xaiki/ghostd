@@ -23,6 +23,7 @@ func lanAnnouncement() *dns.Msg {
 		&dns.PTR{Hdr: hdr("_ipp._tcp.local.", dns.TypePTR), Ptr: `Lobby\032Printer._ipp._tcp.local.`},
 		&dns.PTR{Hdr: hdr("_googlecast._tcp.local.", dns.TypePTR), Ptr: "Speaker._googlecast._tcp.local."},
 		&dns.PTR{Hdr: hdr("_services._dns-sd._udp.local.", dns.TypePTR), Ptr: "_ipp._tcp.local."},
+		&dns.PTR{Hdr: hdr("_services._dns-sd._udp.local.", dns.TypePTR), Ptr: "_googlecast._tcp.local."},
 	}
 	m.Extra = []dns.RR{
 		&dns.SRV{Hdr: hdr(`Lobby\032Printer._ipp._tcp.local.`, dns.TypeSRV), Port: 631, Target: "printer.local."},
@@ -50,12 +51,17 @@ func TestReflectedResponsesCarryOnlyAllowedClassesAndTheirHosts(t *testing.T) {
 		t.Fatal("nothing reflected")
 	}
 	all := names(got.Answer) + " | " + names(got.Extra)
-	for _, want := range []string{`ptr _ipp._tcp.local.`, "srv lobby printer._ipp._tcp.local.", "txt lobby printer._ipp._tcp.local.", "a printer.local."} {
+	for _, want := range []string{`ptr _ipp._tcp.local.`, "srv lobby printer._ipp._tcp.local.", "txt lobby printer._ipp._tcp.local.", "a printer.local.", "ptr _services._dns-sd._udp.local."} {
 		if !strings.Contains(strings.ToLower(all), want) {
 			t.Fatalf("missing %q in %s", want, all)
 		}
 	}
-	for _, leak := range []string{"googlecast", "speaker", "laptop", "_services._dns-sd"} {
+	// The enumeration answer stands, but only for the classes it may see: the one
+	// naming _googlecast is filtered out with the rest of that class's records.
+	if len(got.Answer) != 2 || got.Answer[1].(*dns.PTR).Ptr != "_ipp._tcp.local." {
+		t.Fatalf("enumeration was not trimmed to the allowed classes: %s | %s", names(got.Answer), names(got.Extra))
+	}
+	for _, leak := range []string{"googlecast", "speaker", "laptop"} {
 		if strings.Contains(strings.ToLower(all), leak) {
 			t.Fatalf("leaked %q into a network that may only see _ipp._tcp: %s", leak, all)
 		}
@@ -93,7 +99,18 @@ func TestReflectedQueriesAreLimitedToWhatTheNetworkMayAsk(t *testing.T) {
 	if ask("_ipp._tcp.local.", dns.TypePTR) == nil || ask("Lobby._ipp._tcp.local.", dns.TypeSRV) == nil || ask("_universal._sub._ipp._tcp.local.", dns.TypePTR) == nil {
 		t.Fatal("allowed browse blocked")
 	}
-	for _, name := range []string{"_googlecast._tcp.local.", "_services._dns-sd._udp.local.", "_smb._tcp.local.", "laptop.local.", "example.com."} {
+	// A browser that enumerates the types first sees the classes it may see: the
+	// question names no class of its own, so its answers are what gets filtered.
+	if ask("_services._dns-sd._udp.local.", dns.TypePTR) == nil {
+		t.Fatal("the service-type enumeration must reach the LAN")
+	}
+	meta := ask("_services._dns-sd._udp.local.", dns.TypePTR,
+		&dns.PTR{Hdr: hdr("_services._dns-sd._udp.local.", dns.TypePTR), Ptr: "_ipp._tcp.local."},
+		&dns.PTR{Hdr: hdr("_services._dns-sd._udp.local.", dns.TypePTR), Ptr: "_googlecast._tcp.local."})
+	if meta == nil || len(meta.Answer) != 1 || !strings.Contains(meta.Answer[0].String(), "_ipp._tcp") {
+		t.Fatal("known enumeration answers must be trimmed to the allowed classes:", meta)
+	}
+	for _, name := range []string{"_googlecast._tcp.local.", "_smb._tcp.local.", "laptop.local.", "example.com."} {
 		if ask(name, dns.TypePTR) != nil || ask(name, dns.TypeA) != nil {
 			t.Fatalf("a query for %s left the container network", name)
 		}

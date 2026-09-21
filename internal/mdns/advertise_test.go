@@ -17,8 +17,8 @@ func testAnswerer() answerer {
 		{Service: "_adisk._tcp", Instance: "NAS", TXT: []string{"dk0=adVN=Backups,adVF=0x82", "sys=adVF=0x100"}},
 		{Service: "_ipp._tcp", Instance: "Office Printer", Port: 631, TXT: []string{"rp=ipp/print"}, Subtypes: []string{"_universal"}},
 	}}
-	return answerer{cfg: cfg, addrs: func(string) ([]netip.Addr, error) {
-		return []netip.Addr{netip.MustParseAddr("192.0.2.10"), netip.MustParseAddr("fd00::10")}, nil
+	return answerer{cfg: cfg, addrs: func(string) ([]netip.Prefix, error) {
+		return []netip.Prefix{netip.MustParsePrefix("192.0.2.10/24"), netip.MustParsePrefix("fd00::10/64")}, nil
 	}}
 }
 
@@ -139,6 +139,47 @@ func TestProbingDetectsAnotherHostOwningAName(t *testing.T) {
 	q.SetQuestion("nas.local.", dns.TypeA)
 	if a.conflicts(q) != "" {
 		t.Fatal("a query is not a claim")
+	}
+}
+
+// A record may name its own .local host: the SRV points at it and the address
+// records follow it, so a set learned from a container keeps the container's
+// names rather than one name per config.
+func TestRecordsCarryTheirOwnHostName(t *testing.T) {
+	a := testAnswerer()
+	a.cfg.Records[0].Host = "share"
+	all := a.all("lab0", ttlService)
+	hosts := map[string]bool{}
+	for _, rr := range all {
+		switch v := rr.(type) {
+		case *dns.SRV:
+			hosts[v.Target] = true
+		case *dns.A, *dns.AAAA:
+			hosts[rr.Header().Name] = true
+		}
+	}
+	if !hosts["share.local."] || !hosts["nas.local."] {
+		t.Fatal("both the record's own host and the config's must be served:", hosts)
+	}
+	if r := ask(a, "share.local.", dns.TypeA); r == nil || r.Answer[0].(*dns.A).A.String() != "192.0.2.10" {
+		t.Fatal("a record's own host is not answered:", r)
+	}
+	if r := ask(a, "NAS._smb._tcp.local.", dns.TypeSRV); r == nil || r.Answer[0].(*dns.SRV).Target != "share.local." {
+		t.Fatal("SRV must point at the record's own host:", r)
+	}
+	// A browse carries the address records of the instance's own host.
+	if r := ask(a, "_smb._tcp.local.", dns.TypePTR); r == nil || len(r.Extra) != 4 || r.Extra[2].Header().Name != "share.local." {
+		t.Fatal("browse extras must follow the instance's host:", r)
+	}
+	// A record's own host is a name ghostd claims, so a conflict on it is flagged.
+	claim := new(dns.Msg)
+	claim.Response = true
+	claim.Answer = []dns.RR{&dns.A{Hdr: dns.RR_Header{Name: "share.local.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 120}}}
+	if c := a.conflicts(claim); c == "" {
+		t.Fatal("a record's own host must be probed for conflicts too")
+	}
+	if _, err := ParseConfig([]byte(`{"interfaces":["eth0"],"host":"nas","records":[{"service":"_smb._tcp","instance":"N","port":445,"host":"Nas.local"}]}`)); err == nil {
+		t.Fatal("a bad per-record host accepted")
 	}
 }
 
