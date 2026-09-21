@@ -3,6 +3,7 @@ package addressbook
 import (
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"net/netip"
@@ -306,6 +307,28 @@ func (s *Store) ImportDocument(c Config, doc ImportDocument) error {
 			if err != nil {
 				return err
 			}
+			// Our own quarantine marker, written by ExportDNSmasq, coming back on a
+			// later takeover: the ledger's quarantine is authoritative, and a hold the
+			// ledger no longer has is restored as a quarantine, never as a lease
+			// anybody owns.
+			if isQuarantineMarker(scope, l, mac) {
+				if old.End > now && old.State == "declined" {
+					continue
+				}
+				b := Binding{Scope: l.Scope, Address: l.Address, Client: client, MAC: mac.String(), State: "declined", Origin: "dnsmasq-import", Start: now, End: end, Device: deviceID(l.Scope, client), Evidence: "quarantine restored from exported lease file"}
+				if scope.Is6() {
+					b.DUID = strings.TrimPrefix(strings.Split(client, "/iaid:")[0], "duid:")
+					b.IAID = l.IAID
+				}
+				b.Name = b.Device
+				if old.End > now && (old.State == "active" || old.State == "offered") {
+					return fmt.Errorf("import conflicts with live binding %s/%s", l.Scope, l.Address)
+				}
+				if err := s.save(tx, b, "import"); err != nil {
+					return err
+				}
+				continue
+			}
 			if old.End > now && (old.State == "active" || old.State == "offered" || old.State == "declined") {
 				if old.Client == client && old.State == "active" && old.End >= end {
 					continue
@@ -337,4 +360,14 @@ func (s *Store) ImportDocument(c Config, doc ImportDocument) error {
 		}
 		return nil
 	})
+}
+
+// isQuarantineMarker recognises the synthetic identity ExportDNSmasq gives a
+// declined address, so a later import can tell its own hold from a real client.
+func isQuarantineMarker(scope Scope, l ImportedLease, mac net.HardwareAddr) bool {
+	if scope.Is6() {
+		sum := sha256.Sum256([]byte(scope.ID + "/" + l.Address))
+		return strings.EqualFold(strings.ReplaceAll(l.DUID, ":", ""), "0004"+hex.EncodeToString(sum[:16]))
+	}
+	return mac.String() == "02:ff:ff:ff:ff:fe"
 }

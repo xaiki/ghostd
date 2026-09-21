@@ -26,4 +26,5 @@ x unshare -n env GHOSTD_NFT_INTEGRATION=1 /t/main.test -test.run TestIntegration
 x env GHOSTD_SYSTEMD_INTEGRATION=1 /t/state.test -test.run TestIntegration -test.v
 x unshare -n env GHOSTD_NETCONFIG_INTEGRATION=1 /t/netconfig.test -test.run TestIntegration -test.v
 x unshare -n sh -c "ip link set lo up && exec env GHOSTD_DHCP_INTEGRATION=1 /t/addressbook.test -test.run TestLinuxListenerAndPortOwnership -test.v"
+x /t/addressbook.test -test.run "TestProcessOwnsUDPPort|TestWriteLeases" -test.v
 echo "integration suites passed"

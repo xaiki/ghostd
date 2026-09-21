@@ -2,6 +2,7 @@ package addressbook
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -371,5 +372,62 @@ func TestConfirmWaitsForClientEvidenceAndHistoryIsArchived(t *testing.T) {
 	hist, e := s.HandoverHistory()
 	if e != nil || len(hist) != 2 || hist[0].Phase != "confirmed" || hist[1].Phase != "rolled-back" || hist[0].Snapshot != "" || hist[0].Finished == 0 {
 		t.Fatal("finished takeovers not archived:", hist, e)
+	}
+}
+
+// A second takeover imports the lease file the first rollback exported. Its
+// quarantine markers and offers must not collide with the ledger's own holds.
+func TestReimportOfOwnExportKeepsQuarantineAndOffers(t *testing.T) {
+	s := openTest(t)
+	m := NewManager(s)
+	defer m.Close()
+	c := testConfig()
+	l := &memoryLegacy{running: true}
+	h := Handover{Manager: m, Legacy: l, SaveConfig: func(Config) error { return nil }}
+	if e := h.Begin(disabled(c), LegacySpec{}, time.Minute); e != nil {
+		t.Fatal(e)
+	}
+	// One offer outstanding, one address declined (quarantined), one active lease.
+	if _, e := s.Allocate(c, "lan", "mac:00:11:22:33:44:55", "00:11:22:33:44:55", "", "10.0.0.6", false); e != nil {
+		t.Fatal(e)
+	}
+	if _, e := s.Allocate(c, "lan", "mac:00:11:22:33:44:66", "00:11:22:33:44:66", "", "10.0.0.7", true); e != nil {
+		t.Fatal(e)
+	}
+	if e := s.Release("lan", "mac:00:11:22:33:44:66", "10.0.0.7", true); e != nil {
+		t.Fatal(e)
+	}
+	if _, e := s.Allocate(c, "lan", "mac:00:11:22:33:44:77", "00:11:22:33:44:77", "", "10.0.0.8", true); e != nil {
+		t.Fatal(e)
+	}
+	if e := h.Rollback(); e != nil {
+		t.Fatal(e)
+	}
+	if !strings.Contains(l.leases, "02:ff:ff:ff:ff:fe 10.0.0.7") {
+		t.Fatal("quarantine marker not exported:", l.leases)
+	}
+	// The legacy allocator runs, then a second takeover starts from what it holds.
+	if e := h.Begin(disabled(c), LegacySpec{}, time.Minute); e != nil {
+		t.Fatal("second takeover collided with the ledger's own export:", e)
+	}
+	snap, _ := s.Snapshot("lan", "10.0.0.7", 0)
+	if snap.Bindings[0].State != "declined" {
+		t.Fatal("quarantine was turned into something else:", snap.Bindings[0])
+	}
+	// A hold the ledger no longer has is restored as a quarantine, not as a lease.
+	s2 := openTest(t)
+	m2 := NewManager(s2)
+	defer m2.Close()
+	l2 := &memoryLegacy{running: true, leases: fmt.Sprintf("%d 02:ff:ff:ff:ff:fe 10.0.0.7 * ff:31\n", time.Now().Add(5*time.Minute).Unix())}
+	h2 := Handover{Manager: m2, Legacy: l2, SaveConfig: func(Config) error { return nil }}
+	if e := h2.Begin(disabled(c), LegacySpec{}, time.Minute); e != nil {
+		t.Fatal(e)
+	}
+	got, _ := s2.Snapshot("lan", "10.0.0.7", 0)
+	if len(got.Bindings) != 1 || got.Bindings[0].State != "declined" {
+		t.Fatal(got.Bindings)
+	}
+	if _, e := s2.Allocate(c, "lan", "mac:02:ff:ff:ff:ff:fe", "02:ff:ff:ff:ff:fe", "", "10.0.0.7", true); e == nil {
+		t.Fatal("the quarantine identity could take the address")
 	}
 }

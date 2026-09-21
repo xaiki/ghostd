@@ -217,6 +217,41 @@ func TestDNSmasqTakeoverLab(t *testing.T) {
 	}
 	client("client2", 4)
 	client("client2", 6)
+
+	// Leave an unrequested OFFER outstanding and a DECLINEd address in
+	// quarantine, then roll back: both must stay occupied for the real dnsmasq.
+	probe := func(mode, mac string) string {
+		t.Helper()
+		// dhclient's fallback socket holds UDP 68 in the namespace; stop client2's.
+		for _, family := range []int{4, 6} {
+			if raw, e := os.ReadFile(filepath.Join(dir, fmt.Sprintf("client2-%d.pid", family))); e == nil {
+				exec.Command("kill", strings.TrimSpace(string(raw))).Run()
+			}
+		}
+		time.Sleep(300 * time.Millisecond)
+		out := command("ip", "netns", "exec", "client2", "env", "GHOSTD_PROBE="+mode, "GHOSTD_PROBE_MAC="+mac, "GHOSTD_PROBE_IFACE=client2p", "/lab/test", "-test.run", "^TestDHCPProbeClient$", "-test.v")
+		var ip string
+		for _, line := range strings.Split(out, "\n") {
+			if strings.HasPrefix(line, "PROBE ip=") {
+				ip = strings.TrimPrefix(line, "PROBE ip=")
+			}
+		}
+		if ip == "" {
+			t.Fatalf("probe %s produced no address: %s", mode, out)
+		}
+		return ip
+	}
+	const declinerMAC, offereeMAC, strangerMAC = "00:aa:00:00:00:02", "00:aa:00:00:00:01", "00:aa:00:00:00:03"
+	offered := probe("discover", offereeMAC)
+	declined := probe("decline", declinerMAC)
+	states := map[string]string{}
+	mid, _ := store.Snapshot("lan4", "", 0)
+	for _, b := range mid.Bindings {
+		states[b.Address] = b.State
+	}
+	if states[offered] != "offered" || states[declined] != "declined" {
+		t.Fatalf("expected offered %s and declined %s, got %v", offered, declined, states)
+	}
 	if e = handover.Rollback(); e != nil {
 		t.Fatal(e)
 	}
@@ -225,8 +260,21 @@ func TestDNSmasqTakeoverLab(t *testing.T) {
 		t.Fatal(e)
 	}
 	doc, e := ParseDNSmasq(cfg, exported)
-	if e != nil || len(doc.Leases) != 4 || doc.ServerDUID != snapshot.ServerDUID {
+	if e != nil || len(doc.Leases) != 6 || doc.ServerDUID != snapshot.ServerDUID {
 		t.Fatalf("rollback lost leases: %v %s", e, exported)
+	}
+	for _, l := range doc.Leases {
+		if l.Address == declined && l.MAC == declinerMAC {
+			t.Fatalf("declined address was exported under the decliner's own identity: %+v", l)
+		}
+	}
+	// Real dnsmasq now serves: neither the decliner nor a stranger may be offered
+	// an address that is still occupied.
+	for _, mac := range []string{declinerMAC, strangerMAC} {
+		got := probe("discover", mac)
+		if got == declined || got == offered {
+			t.Fatalf("dnsmasq offered occupied address %s to %s (offered=%s declined=%s)", got, mac, offered, declined)
+		}
 	}
 	client("client1", 4)
 	client("client1", 6)

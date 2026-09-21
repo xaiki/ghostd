@@ -56,9 +56,12 @@ func (l SystemDNSmasq) Start() error {
 	if _, e := l.command("start", l.Spec.Unit); e != nil {
 		return e
 	}
-	// Type=simple can acknowledge start before dnsmasq has bound its sockets.
-	// Check sustained activity instead of declaring rollback complete immediately.
-	for i := 0; i < 3; i++ {
+	// Type=simple can acknowledge start before dnsmasq has bound its sockets, and
+	// "active" only proves a process exists. Rollback is complete only when the
+	// service's own process holds the DHCP server socket (UDP 67 or 547).
+	deadline := time.Now().Add(servingTimeout)
+	var last error
+	for {
 		time.Sleep(200 * time.Millisecond)
 		state, e := l.command("show", l.Spec.Unit, "--property=ActiveState", "--value")
 		if e != nil {
@@ -67,17 +70,40 @@ func (l SystemDNSmasq) Start() error {
 		if state != "active" {
 			return fmt.Errorf("dnsmasq startup failed: %s", state)
 		}
+		pidText, e := l.command("show", l.Spec.Unit, "--property=MainPID", "--value")
+		if e != nil {
+			return e
+		}
+		pid, _ := strconv.Atoi(pidText)
+		owns, e := processOwnsUDPPort(pid, 67, 547)
+		if owns {
+			return nil
+		}
+		last = e
+		if time.Now().After(deadline) {
+			if last == nil {
+				last = fmt.Errorf("its process holds no DHCP server socket")
+			}
+			return fmt.Errorf("dnsmasq is active but not serving DHCP: %w", last)
+		}
 	}
-	return nil
 }
+
+// servingTimeout bounds how long a restarted legacy allocator gets to bind.
+var servingTimeout = 10 * time.Second
+
 func (l SystemDNSmasq) ReadLeases() (string, error) {
 	raw, e := os.ReadFile(l.Spec.LeasePath)
 	return string(raw), e
 }
 func (l SystemDNSmasq) WriteLeases(text string) error {
-	info, e := os.Stat(l.Spec.LeasePath)
+	// Lstat: replacing a symlink by rename would silently redirect the file.
+	info, e := os.Lstat(l.Spec.LeasePath)
 	if e != nil {
 		return e
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("lease path %s is not a regular file", l.Spec.LeasePath)
 	}
 	f, e := os.CreateTemp(filepath.Dir(l.Spec.LeasePath), ".ghostd-leases-")
 	if e != nil {
