@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -366,6 +367,83 @@ func TestDNSmasqTakeoverLab(t *testing.T) {
 	observed, e := store.Snapshot("lan6", slaac, 0)
 	if e != nil || len(observed.Observations) != 1 || len(observed.Bindings) != 0 {
 		t.Fatalf("SLAAC observation mistaken for grant: %+v %v", observed, e)
+	}
+
+	// Real, timer-driven DHCPv6 Renew and Rebind. Shorten the lease so T1 is 30s
+	// and T2 is 48s, run ISC dhclient -6 in the foreground as a real client, let it
+	// renew by itself, then drop its Renews until it falls back to Rebind.
+	if os.Getenv("GHOSTD_LAB_SKIP_V6TIMERS") != "1" {
+		cfg.Scopes[1].LeaseSeconds, cfg.Scopes[1].PreferredSeconds = 60, 30
+		if e = manager.Apply(cfg, func() error { return nil }); e != nil {
+			t.Fatal(e)
+		}
+		for _, f := range []string{"client1-6.pid", "client1-4.pid"} {
+			if raw, e := os.ReadFile(filepath.Join(dir, f)); e == nil {
+				exec.Command("kill", strings.TrimSpace(string(raw))).Run()
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+		logPath := filepath.Join(dir, "dhclient6-timers.log")
+		logFile, _ := os.Create(logPath)
+		cli := exec.Command("nsenter", "--net=/run/netns/client1", "--", "dhclient", "-6", "-d", "-v", "-lf", filepath.Join(dir, "timers6.leases"), "-pf", filepath.Join(dir, "timers6.pid"), "client1p")
+		cli.Stdout, cli.Stderr = logFile, logFile
+		if e = cli.Start(); e != nil {
+			t.Fatal(e)
+		}
+		t.Cleanup(func() { cli.Process.Kill(); cli.Wait() })
+		count := func(needle string) int {
+			raw, _ := os.ReadFile(logPath)
+			return strings.Count(string(raw), needle)
+		}
+		waitFor := func(what string, timeout time.Duration, cond func() bool) {
+			t.Helper()
+			for end := time.Now().Add(timeout); time.Now().Before(end); time.Sleep(500 * time.Millisecond) {
+				if cond() {
+					return
+				}
+			}
+			raw, _ := os.ReadFile(logPath)
+			t.Fatalf("timed out waiting for %s:\n%s", what, raw)
+		}
+		waitFor("initial v6 bind", 30*time.Second, func() bool { return count("Bound to lease") >= 1 })
+		// The address ISC reports in its own log identifies this client's binding.
+		var address string
+		iaaddr := regexp.MustCompile(`IAADDR (\S+)`)
+		binding := func() Binding {
+			raw, _ := os.ReadFile(logPath)
+			if m := iaaddr.FindAllStringSubmatch(string(raw), -1); len(m) > 0 {
+				address = m[len(m)-1][1]
+			}
+			snap, _ := store.Snapshot("lan6", address, 0)
+			if len(snap.Bindings) == 1 {
+				return snap.Bindings[0]
+			}
+			return Binding{}
+		}
+		before := binding()
+		waitFor("timer-driven Renew answered", 50*time.Second, func() bool { return count("XMT: Renew") >= 1 && count("RCV: Reply") >= 2 })
+		afterRenew := binding()
+		if afterRenew.End <= before.End {
+			t.Fatalf("Renew did not extend the lease: %d -> %d", before.End, afterRenew.End)
+		}
+		// Drop Renews (UDP 547 into the server) so the client can only Rebind at T2.
+		command("nft", "add", "table", "inet", "labdrop")
+		command("nft", "add", "chain", "inet", "labdrop", "in", "{ type filter hook input priority 0 ; }")
+		command("nft", "add", "rule", "inet", "labdrop", "in", "udp", "dport", "547", "drop")
+		t.Cleanup(func() { exec.Command("nft", "delete", "table", "inet", "labdrop").Run() })
+		waitFor("client to give up on Renew", 60*time.Second, func() bool { return count("XMT: Renew") >= 3 })
+		command("nft", "delete", "table", "inet", "labdrop")
+		waitFor("Rebind answered", 60*time.Second, func() bool { return count("XMT: Rebind") >= 1 && count("RCV: Reply") >= 3 })
+		afterRebind := binding()
+		if afterRebind.End <= afterRenew.End {
+			t.Fatalf("Rebind did not extend the lease: %d -> %d", afterRenew.End, afterRebind.End)
+		}
+		q := new(dns.Msg)
+		q.SetQuestion(afterRebind.Name+".lab.home.arpa.", dns.TypeAAAA)
+		reply, _, e := (&dns.Client{Net: "udp", Timeout: 2 * time.Second}).Exchange(q, "10.77.0.1:53")
+		if e != nil || len(reply.Answer) == 0 {
+			t.Fatalf("DNS answer for the rebound lease: %v %v", reply, e)
+		}
 	}
 
 }
