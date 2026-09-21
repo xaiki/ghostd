@@ -5,7 +5,7 @@ package ghostd;
 option go_package = "github.com/xaiki/ghostd/proto";
 
 // HostState is ghostd's whole RPC surface (README.md): the
-// daemon does not decide policy, it executes a state Nornir already
+// daemon does not decide policy, it executes a state the caller already
 // resolved. GetState answers with clean, diffable current state; Apply
 // enacts a fully-resolved declarative target behind a dead-man's-switch;
 // Confirm — called from a *fresh* connection, after independently
@@ -46,15 +46,16 @@ message GetStateRequest {
 message State {
   // `nft -j list ruleset` output, verbatim.
   string nft_ruleset_json = 1;
-  // machines.net_ifaces's own live-read shape (persisted interfaces.d file
-  // bytes + `ip -j addr show` + /proc/sys/net/ipv4/ip_forward), as JSON.
+  // The caller's own live-read shape for interface configuration (persisted
+  // interfaces.d file bytes + `ip -j addr show` + /proc/sys/net/ipv4/ip_forward),
+  // as JSON.
   string netconfig_json = 2;
   string adoption_evidence_json = 3;
   string dhcp_config_json = 4;
 }
 
 message ApplyRequest {
-  // The fully-resolved declarative target Nornir computed — not a diff.
+  // The fully-resolved declarative target the caller computed — not a diff.
   string desired_state_json = 1;
   // How long the dead-man's-switch waits for Confirm before reverting to
   // the pre-apply snapshot. Required; the caller does not get to apply

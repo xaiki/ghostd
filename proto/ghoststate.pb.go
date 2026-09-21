@@ -239,8 +239,9 @@ type State struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// `nft -j list ruleset` output, verbatim.
 	NftRulesetJson string `protobuf:"bytes,1,opt,name=nft_ruleset_json,json=nftRulesetJson,proto3" json:"nft_ruleset_json,omitempty"`
-	// machines.net_ifaces's own live-read shape (persisted interfaces.d file
-	// bytes + `ip -j addr show` + /proc/sys/net/ipv4/ip_forward), as JSON.
+	// The caller's own live-read shape for interface configuration (persisted
+	// interfaces.d file bytes + `ip -j addr show` + /proc/sys/net/ipv4/ip_forward),
+	// as JSON.
 	NetconfigJson        string `protobuf:"bytes,2,opt,name=netconfig_json,json=netconfigJson,proto3" json:"netconfig_json,omitempty"`
 	AdoptionEvidenceJson string `protobuf:"bytes,3,opt,name=adoption_evidence_json,json=adoptionEvidenceJson,proto3" json:"adoption_evidence_json,omitempty"`
 	DhcpConfigJson       string `protobuf:"bytes,4,opt,name=dhcp_config_json,json=dhcpConfigJson,proto3" json:"dhcp_config_json,omitempty"`
@@ -308,7 +309,7 @@ func (x *State) GetDhcpConfigJson() string {
 
 type ApplyRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// The fully-resolved declarative target Nornir computed — not a diff.
+	// The fully-resolved declarative target the caller computed — not a diff.
 	DesiredStateJson string `protobuf:"bytes,1,opt,name=desired_state_json,json=desiredStateJson,proto3" json:"desired_state_json,omitempty"`
 	// How long the dead-man's-switch waits for Confirm before reverting to
 	// the pre-apply snapshot. Required; the caller does not get to apply

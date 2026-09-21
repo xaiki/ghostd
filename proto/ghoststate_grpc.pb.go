@@ -34,7 +34,7 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
 // HostState is ghostd's whole RPC surface (README.md): the
-// daemon does not decide policy, it executes a state Nornir already
+// daemon does not decide policy, it executes a state the caller already
 // resolved. GetState answers with clean, diffable current state; Apply
 // enacts a fully-resolved declarative target behind a dead-man's-switch;
 // Confirm — called from a *fresh* connection, after independently
@@ -145,7 +145,7 @@ func (c *hostStateClient) DHCPHandover(ctx context.Context, in *RegistryDocument
 // for forward compatibility.
 //
 // HostState is ghostd's whole RPC surface (README.md): the
-// daemon does not decide policy, it executes a state Nornir already
+// daemon does not decide policy, it executes a state the caller already
 // resolved. GetState answers with clean, diffable current state; Apply
 // enacts a fully-resolved declarative target behind a dead-man's-switch;
 // Confirm — called from a *fresh* connection, after independently
