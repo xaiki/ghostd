@@ -1,0 +1,12 @@
+[Unit]
+Description=ghostd e2e lab: LAN bridge and client namespaces (stands in for netconfig at boot)
+Before=ghostd.service
+After=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/ghostd/fixtures.sh
+
+[Install]
+WantedBy=multi-user.target

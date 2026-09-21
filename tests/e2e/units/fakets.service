@@ -1,0 +1,11 @@
+[Unit]
+Description=ghostd e2e lab: fake tailscaled LocalAPI
+Before=ghostd.service
+
+[Service]
+RuntimeDirectory=tailscale
+ExecStart=/opt/ghostd/fakets --ip=100.64.0.1
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

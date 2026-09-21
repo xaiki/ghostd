@@ -1,0 +1,5 @@
+[Unit]
+Description=Legacy dnsmasq being replaced by ghostd (e2e lab)
+
+[Service]
+ExecStart=/usr/sbin/dnsmasq --no-daemon --conf-file=/etc/dnsmasq-ghostd-lab.conf

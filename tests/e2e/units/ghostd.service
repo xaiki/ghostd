@@ -1,0 +1,16 @@
+[Unit]
+Description=ghostd (e2e lab)
+After=fakets.service lab-fixtures.service
+Wants=fakets.service lab-fixtures.service
+
+[Service]
+Type=notify
+RuntimeDirectory=ghostd
+ExecStart=/opt/ghostd/ghostd --watchdog-sec=30
+Restart=always
+RestartSec=2
+WatchdogSec=30
+User=root
+
+[Install]
+WantedBy=multi-user.target
