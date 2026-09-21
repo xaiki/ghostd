@@ -69,17 +69,14 @@ func (s *Store) Allocate(c Config, scopeID, client, mac, claimed, requested stri
 		}
 		if !commit {
 			// Preserve the current address on rediscovery, before considering hints.
-			if err := tx.Bucket(leaseBucket).ForEach(func(_, raw []byte) error {
-				var b Binding
-				if e := json.Unmarshal(raw, &b); e != nil {
-					return e
-				}
-				if b.Scope == scopeID && b.Client == client && b.Origin != originPD && b.End > now && (b.State == "active" || b.State == "offered") && allowed(scope, client, mac, b.Address) {
+			mine, err := liveByClient(tx, scopeID, client)
+			if err != nil {
+				return err
+			}
+			for _, b := range mine {
+				if b.Origin != originPD && b.End > now && (b.State == "active" || b.State == "offered") && allowed(scope, client, mac, b.Address) {
 					candidate = b.Address
 				}
-				return nil
-			}); err != nil {
-				return err
 			}
 			if r, ok := reservation(scope, client, mac); ok {
 				candidate = r.Address

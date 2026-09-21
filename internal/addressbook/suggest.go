@@ -127,11 +127,7 @@ func (s *Store) Suggest(c Config) ([]Suggestion, error) {
 				return e
 			}
 		}
-		return tx.Bucket(leaseBucket).ForEach(func(_, v []byte) error {
-			var b Binding
-			if e := json.Unmarshal(v, &b); e != nil {
-				return e
-			}
+		return forEachLive(tx, func(b Binding) error {
 			if b.State == "active" && b.End > now {
 				bindings = append(bindings, b)
 				if b.NodeID != "" {

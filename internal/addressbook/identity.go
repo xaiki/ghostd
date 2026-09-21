@@ -34,64 +34,53 @@ func (s *Store) Report(c Config, node Node) ([]Binding, error) {
 	joined := []Binding{}
 	err := s.db.Update(func(tx *bolt.Tx) error {
 		var matches []Binding
-		if err := tx.Bucket(leaseBucket).ForEach(func(_, raw []byte) error {
-			var b Binding
-			if err := json.Unmarshal(raw, &b); err != nil {
-				return err
-			}
-			if b.State != "active" || b.End <= now {
-				return nil
-			}
-			for _, iface := range node.Interfaces {
-				mac, _ := net.ParseMAC(iface.MAC)
-				if b.MAC != mac.String() {
-					var observation Observation
-					raw := tx.Bucket(observationBucket).Get(bindingKey(b.Scope, b.Address))
-					if raw == nil || json.Unmarshal(raw, &observation) != nil || observation.Until <= now || observation.MAC != mac.String() {
+		// Candidates come from what the report itself names: each reported address is
+		// looked up (its live bindings, and any neighbour sighting of it), never the
+		// whole ledger.
+		seen := map[string]bool{}
+		for _, iface := range node.Interfaces {
+			mac, _ := net.ParseMAC(iface.MAC)
+			for _, ip := range iface.Addresses {
+				bindings, err := liveByAddress(tx, ip)
+				if err != nil {
+					return err
+				}
+				for _, b := range bindings {
+					key := b.Scope + "/" + b.Address
+					if seen[key] || b.State != "active" || b.End <= now {
 						continue
 					}
-				}
-				for _, ip := range iface.Addresses {
-					if ip == b.Address {
-						matches = append(matches, b)
-						return nil
+					if b.MAC != mac.String() {
+						var observation Observation
+						raw := tx.Bucket(observationBucket).Get(bindingKey(b.Scope, b.Address))
+						if raw == nil || json.Unmarshal(raw, &observation) != nil || observation.Until <= now || observation.MAC != mac.String() {
+							continue
+						}
 					}
+					seen[key] = true
+					matches = append(matches, b)
 				}
-			}
-			return nil
-		}); err != nil {
-			return err
-		}
-		if e := tx.Bucket(observationBucket).ForEach(func(_, raw []byte) error {
-			var o Observation
-			if e := json.Unmarshal(raw, &o); e != nil {
-				return e
-			}
-			if o.Until <= now {
-				return nil
-			}
-			old, e := readBinding(tx, o.Scope, o.Address)
-			if e != nil {
-				return e
-			}
-			if old.End > now && (old.State == "active" || old.State == "offered" || old.State == "declined") {
-				return nil
-			}
-			for _, iface := range node.Interfaces {
-				mac, _ := net.ParseMAC(iface.MAC)
-				if mac.String() != o.MAC {
-					continue
-				}
-				for _, ip := range iface.Addresses {
-					if ip == o.Address {
-						matches = append(matches, Binding{Scope: o.Scope, Address: o.Address, MAC: o.MAC, Client: "neighbor:" + o.MAC, Device: deviceID(o.Scope, o.MAC), Origin: "neighbor-report", State: "active", Start: now, End: o.Until})
-						return nil
+				for _, scope := range c.Scopes {
+					addr, e := netip.ParseAddr(ip)
+					if e != nil || !netip.MustParsePrefix(scope.Subnet).Contains(addr) || seen[scope.ID+"/"+addr.String()] {
+						continue
 					}
+					raw := tx.Bucket(observationBucket).Get(bindingKey(scope.ID, addr.String()))
+					var o Observation
+					if raw == nil || json.Unmarshal(raw, &o) != nil || o.Until <= now || o.MAC != mac.String() {
+						continue
+					}
+					old, e := readBinding(tx, o.Scope, o.Address)
+					if e != nil {
+						return e
+					}
+					if old.End > now && liveState(old.State) {
+						continue
+					}
+					seen[scope.ID+"/"+addr.String()] = true
+					matches = append(matches, Binding{Scope: o.Scope, Address: o.Address, MAC: o.MAC, Client: "neighbor:" + o.MAC, Device: deviceID(o.Scope, o.MAC), Origin: "neighbor-report", State: "active", Start: now, End: o.Until})
 				}
 			}
-			return nil
-		}); e != nil {
-			return e
 		}
 		// Existing declarations and associations win over a new assertion. Reject
 		// the entire report's joins on conflict, rather than partially merging it.
@@ -129,17 +118,14 @@ func (s *Store) Report(c Config, node Node) ([]Binding, error) {
 				}
 			}
 			// Tailnet names need not be unique across sightings/re-enrollment.
-			if err := tx.Bucket(leaseBucket).ForEach(func(_, raw []byte) error {
-				var b Binding
-				if err := json.Unmarshal(raw, &b); err != nil {
-					return err
-				}
-				if b.Name == name && b.Device != device && b.NodeID != "" && b.NodeID != node.ID && b.State == "active" && b.End > now {
+			holders, err := activeByName(tx, name)
+			if err != nil {
+				return err
+			}
+			for _, b := range holders {
+				if b.Device != device && b.NodeID != "" && b.NodeID != node.ID && b.End > now {
 					name = device
 				}
-				return nil
-			}); err != nil {
-				return err
 			}
 		}
 		for _, b := range matches {

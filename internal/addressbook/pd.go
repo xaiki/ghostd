@@ -69,17 +69,14 @@ func (s *Store) AllocatePrefix(scope Scope, client, duidHex, hint string, via ne
 		}
 		// What this client already has.
 		var mine Binding
-		if e := tx.Bucket(leaseBucket).ForEach(func(_, raw []byte) error {
-			var b Binding
-			if e := json.Unmarshal(raw, &b); e != nil {
-				return e
-			}
-			if b.Scope == scope.ID && b.Origin == originPD && b.Client == client && b.End > now && (b.State == "active" || b.State == "offered") {
+		held, e := liveByClient(tx, scope.ID, client)
+		if e != nil {
+			return e
+		}
+		for _, b := range held {
+			if b.Origin == originPD && b.End > now && (b.State == "active" || b.State == "offered") {
 				mine = b
 			}
-			return nil
-		}); e != nil {
-			return e
 		}
 		var chosen netip.Prefix
 		if mine.Address != "" {
@@ -127,13 +124,13 @@ func (s *Store) AllocatePrefix(scope Scope, client, duidHex, hint string, via ne
 		// Attribute the delegated range to the device that already holds this
 		// DUID's address in the scope, so the router and its prefix are one device.
 		var same Binding
-		_ = tx.Bucket(leaseBucket).ForEach(func(_, raw []byte) error {
-			var x Binding
-			if json.Unmarshal(raw, &x) == nil && x.Scope == scope.ID && x.Origin == "dhcpv6" && x.DUID == duidHex && x.State == "active" && x.End > now {
+		// Every IAID of this DUID: the client index key starts "duid:HEX/iaid:N".
+		sameDUID, _ := liveByClientPrefix(tx, "duid:"+duidHex+"/")
+		for _, x := range sameDUID {
+			if x.Scope == scope.ID && x.Origin == "dhcpv6" && x.DUID == duidHex && x.State == "active" && x.End > now {
 				same = x
 			}
-			return nil
-		})
+		}
 		if same.Device != "" {
 			b.Device, b.Name, b.NodeID = same.Device, same.Name, same.NodeID
 			b.Evidence = "delegated prefix; same DUID as " + same.Address
@@ -165,17 +162,14 @@ func (s *Store) releasePrefix(scope Scope, client string) error {
 	now := s.now().Unix()
 	return s.db.Update(func(tx *bolt.Tx) error {
 		var held []Binding
-		if e := tx.Bucket(leaseBucket).ForEach(func(_, raw []byte) error {
-			var b Binding
-			if e := json.Unmarshal(raw, &b); e != nil {
-				return e
-			}
-			if b.Scope == scope.ID && b.Origin == originPD && b.Client == client && b.End > now && (b.State == "active" || b.State == "offered") {
+		live, e := liveByClient(tx, scope.ID, client)
+		if e != nil {
+			return e
+		}
+		for _, b := range live {
+			if b.Origin == originPD && b.End > now && (b.State == "active" || b.State == "offered") {
 				held = append(held, b)
 			}
-			return nil
-		}); e != nil {
-			return e
 		}
 		for _, b := range held {
 			b.State, b.End = "released", now
@@ -206,13 +200,13 @@ func (s *Store) handlePD(scope Scope, kind dhcpv6.MessageType, cid dhcpv6.DUID, 
 	current := func() (Binding, bool) {
 		var found Binding
 		_ = s.db.View(func(tx *bolt.Tx) error {
-			return tx.Bucket(leaseBucket).ForEach(func(_, raw []byte) error {
-				var b Binding
-				if json.Unmarshal(raw, &b) == nil && b.Scope == scope.ID && b.Origin == originPD && b.Client == client && b.State == "active" && b.End > now {
+			live, e := liveByClient(tx, scope.ID, client)
+			for _, b := range live {
+				if b.Origin == originPD && b.State == "active" && b.End > now {
 					found = b
 				}
-				return nil
-			})
+			}
+			return e
 		})
 		return found, found.Client != ""
 	}

@@ -59,17 +59,15 @@ func duidMAC(d dhcpv6.DUID) string {
 }
 func (s *Store) currentClient(scope, client string) (Binding, bool, error) {
 	var found Binding
+	now := s.now().Unix()
 	err := s.db.View(func(tx *bolt.Tx) error {
-		return tx.Bucket(leaseBucket).ForEach(func(_, raw []byte) error {
-			var b Binding
-			if e := json.Unmarshal(raw, &b); e != nil {
-				return e
-			}
-			if b.Scope == scope && b.Client == client && b.Origin != originPD && b.State == "active" && b.End > s.now().Unix() {
+		bindings, e := liveByClient(tx, scope, client)
+		for _, b := range bindings {
+			if b.Origin != originPD && b.State == "active" && b.End > now {
 				found = b
 			}
-			return nil
-		})
+		}
+		return e
 	})
 	return found, found.Client != "", err
 }

@@ -94,8 +94,14 @@ func Open(path string) (*Store, error) {
 	s := &Store{db: db, now: time.Now}
 	err = db.Update(func(tx *bolt.Tx) error {
 		backfill := tx.Bucket(expiryBucket) == nil
-		for _, name := range [][]byte{leaseBucket, eventBucket, nodeBucket, observationBucket, associationBucket, expiryBucket} {
+		reindexAll := tx.Bucket(clientIdxBucket) == nil
+		for _, name := range append([][]byte{leaseBucket, eventBucket, nodeBucket, observationBucket, associationBucket, expiryBucket}, indexBuckets...) {
 			if _, e := tx.CreateBucketIfNotExists(name); e != nil {
+				return e
+			}
+		}
+		if reindexAll {
+			if e := backfillIndexes(tx); e != nil {
 				return e
 			}
 		}
@@ -146,6 +152,7 @@ func readBinding(tx *bolt.Tx, scope, address string) (Binding, error) {
 	if raw == nil {
 		return b, nil
 	}
+	bindingDecodes.Add(1)
 	err := json.Unmarshal(raw, &b)
 	return b, err
 }
@@ -169,6 +176,9 @@ func (s *Store) save(tx *bolt.Tx, b Binding, kind string) error {
 		if err := tx.Bucket(dnsBucket).Delete(dnsKey(old)); err != nil {
 			return err
 		}
+	}
+	if err := reindex(tx, old, b); err != nil {
+		return err
 	}
 	if liveState(old.State) {
 		if err := tx.Bucket(expiryBucket).Delete(expiryKey(old)); err != nil {

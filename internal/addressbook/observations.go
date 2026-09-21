@@ -244,17 +244,14 @@ func (s *Store) Repair(c Config, changes []IdentityRepair) error {
 			}
 			// The name must also not belong to another live, undeclared device.
 			now := s.now().Unix()
-			if e := tx.Bucket(leaseBucket).ForEach(func(_, raw []byte) error {
-				var other Binding
-				if e := json.Unmarshal(raw, &other); e != nil {
-					return e
-				}
-				if other.Name == r.Name && other.Device != r.Device && other.State == "active" && other.End > now && !(other.Scope == r.Scope && other.Address == r.Address) {
+			holders, e := activeByName(tx, r.Name)
+			if e != nil {
+				return e
+			}
+			for _, other := range holders {
+				if other.Device != r.Device && other.End > now && !(other.Scope == r.Scope && other.Address == r.Address) {
 					return fmt.Errorf("name %q is already held by live device %s", r.Name, other.Device)
 				}
-				return nil
-			}); e != nil {
-				return e
 			}
 			b, e := readBinding(tx, r.Scope, r.Address)
 			if e != nil {
