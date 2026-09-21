@@ -215,7 +215,6 @@ func TestPDConfigValidation(t *testing.T) {
 		"too short":         func(c *Config) { c.Scopes[0].PD.Prefix = "fd00::/16"; c.Scopes[0].PD.Length = 31 },
 		"inside own link":   func(c *Config) { c.Scopes[0].PD.Prefix = "fd00::/62" },
 		"IPv4 pool":         func(c *Config) { c.Scopes[0].PD.Prefix = "10.0.0.0/24" },
-		"relayed scope":     func(c *Config) { c.Scopes[0].Relay = &RelayConfig{Peer: "fd00::2", Link: "fd00::3"} },
 	} {
 		c := cloneConfig(configPD())
 		mutate(&c)
@@ -349,7 +348,18 @@ func TestClientLinkLocalFromDirectAndRelayedRequests(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := clientLinkLocal(relayed, &net.UDPAddr{IP: net.ParseIP("fd77::100")}); got.String() != "fe80::77" {
-		t.Fatal("relayed: the peer-address the relay recorded, not the relay:", got)
+	if got := clientLinkLocal(relayed, &net.UDPAddr{IP: net.ParseIP("fd77::100")}); got.String() != "fd77::100" {
+		t.Fatal("relayed: the next hop is the relay agent that forwards the prefix:", got)
+	}
+}
+
+func TestRelayedScopesMayDelegate(t *testing.T) {
+	c := configPD()
+	c.Scopes[0].Relay = &RelayConfig{Peer: "fd00::2", Link: "fd00::3"}
+	c.Scopes[0].Server = "fd00::1"
+	// A relayed scope keeps its own validation rules (server addresses need not be
+	// on the direct link), and the pool must still stay clear of the link's subnet.
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
 	}
 }

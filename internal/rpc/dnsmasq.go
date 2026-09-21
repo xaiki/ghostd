@@ -30,6 +30,8 @@ func (s *Server) handoverAction(ctx context.Context, req *pb.RegistryDocument) (
 		// RequireEvidence makes confirmation wait for observed client
 		// renewal and fresh allocation in every enabled scope.
 		RequireEvidence bool `json:"require_evidence"`
+		// AllowPD accepts that a rollback abandons prefix delegations.
+		AllowPD bool `json:"allow_pd"`
 	}
 	if e := decodeDocument(req.GetJson(), &request); e != nil {
 		return nil, status.Error(codes.InvalidArgument, e.Error())
@@ -65,7 +67,7 @@ func (s *Server) handoverAction(ctx context.Context, req *pb.RegistryDocument) (
 			return e
 		}
 		return s.store.SaveExternallyManagedConfig(domainDHCP, addressbook.ConfigFile, raw)
-	}, RequireEvidence: request.RequireEvidence}
+	}, RequireEvidence: request.RequireEvidence, AllowPD: request.AllowPD}
 	switch request.Action {
 	case "status":
 		st, e := handover.Status()

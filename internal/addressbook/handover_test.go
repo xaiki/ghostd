@@ -433,3 +433,40 @@ func TestReimportOfOwnExportKeepsQuarantineAndOffers(t *testing.T) {
 		t.Fatal("the quarantine identity could take the address")
 	}
 }
+
+func TestTakeoverWithPrefixDelegationNeedsConsentAndRollbackAbandonsIt(t *testing.T) {
+	s := openTest(t)
+	m := NewManager(s)
+	defer m.Close()
+	target := configPD()
+	l := &memoryLegacy{running: true}
+	h := Handover{Manager: m, Legacy: l, SaveConfig: func(Config) error { return nil }}
+	if e := h.Begin(disabled(target), LegacySpec{}, time.Minute); e == nil || !strings.Contains(e.Error(), "allow_pd") {
+		t.Fatal("a takeover that adds prefix delegation began without consent:", e)
+	}
+	if !l.running {
+		t.Fatal("the refusal must come before dnsmasq is stopped")
+	}
+	h.AllowPD = true
+	if e := h.Begin(disabled(target), LegacySpec{}, time.Minute); e != nil {
+		t.Fatal(e)
+	}
+	b, e := s.AllocatePrefix(target.Scopes[0], "duid:0003000100010203040506/iaid:00000001", "0003000100010203040506", "", nil, true)
+	if e != nil || b.State != "active" {
+		t.Fatal(b, e)
+	}
+	if e = h.Rollback(); e != nil {
+		t.Fatal(e)
+	}
+	snap, _ := s.Snapshot("v6", b.Address, 0)
+	if snap.Bindings[0].State != "released" || !strings.Contains(snap.Bindings[0].Evidence, "abandoned") {
+		t.Fatal("delegation still live after rolling back to a server that cannot serve it:", snap.Bindings[0])
+	}
+	if strings.Contains(l.leases, "fd78") {
+		t.Fatal("a delegation was written to a dnsmasq lease file:", l.leases)
+	}
+	j, _ := s.HandoverJournal()
+	if j.AbandonedDelegations != 1 || j.Phase != "rolled-back" {
+		t.Fatal(j)
+	}
+}

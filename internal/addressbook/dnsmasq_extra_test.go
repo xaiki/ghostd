@@ -52,9 +52,12 @@ func TestConvertCarriesBootAndTFTP(t *testing.T) {
 	if err != nil || plan.Target.Scopes[0].Boot.NextServer != "192.0.2.9" {
 		t.Fatal(err, plan.Target.Scopes[0].Boot)
 	}
+	plan, err = convert(t, baseConf+"enable-tftp=eth0,eth1\ntftp-root=/srv/tftp\n", nil)
+	if err != nil || plan.Target.TFTP == nil || len(plan.Target.TFTP.Interfaces) != 2 || plan.Target.TFTP.Interfaces[0] != "eth0" {
+		t.Fatal("interface-limited TFTP:", err, plan.Target.TFTP)
+	}
 	for name, bad := range map[string]string{
 		"tftp without root": baseConf + "enable-tftp\n",
-		"interface tftp":    baseConf + "enable-tftp=eth0\ntftp-root=/srv\n",
 		"tagged boot":       baseConf + "dhcp-boot=tag:pxe,pxelinux.0\n",
 	} {
 		if _, err := convert(t, bad, nil); err == nil {

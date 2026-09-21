@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"strings"
 	"sync"
 
 	"github.com/coredns/coredns/plugin"
@@ -180,7 +181,7 @@ func (m *Manager) Apply(c Config, save func() error) error {
 			})
 			addedDNS[scope.Server] = &dnsPair{udp: &dns.Server{PacketConn: udp, Handler: handler}, tcp: &dns.Server{Listener: tcp, Handler: handler}}
 		}
-		if c.TFTP != nil && !scope.Is6() {
+		if c.TFTP != nil && !scope.Is6() && tftpServes(c.TFTP, scope) {
 			wantTFTP[scope.Server] = c.TFTP.Root
 			old := m.tftp[scope.Server]
 			if (old == nil || old.root != c.TFTP.Root) && addedTFTP[scope.Server] == nil {
@@ -377,10 +378,22 @@ func (s *Store) Handle4(c Config, scope Scope, r *dhcpv4.DHCPv4) (*dhcpv4.DHCPv4
 			return nil, err
 		}
 		_, network, _ := net.ParseCIDR(scope.Subnet)
-		reply, err := dhcpv4.NewReplyFromRequest(r, dhcpv4.WithMessageType(replyType), dhcpv4.WithClientIP(r.ClientIPAddr), dhcpv4.WithYourIP(net.ParseIP(b.Address)), dhcpv4.WithOption(dhcpv4.OptServerIdentifier(server)), dhcpv4.WithNetmask(network.Mask), dhcpv4.WithRouter(net.ParseIP(scope.Router)), dhcpv4.WithOption(dhcpv4.OptDNS(server)), dhcpv4.WithLeaseTime(uint32(scope.LeaseSeconds)), dhcpv4.WithDomainSearchList(scope.Zone))
-		if err == nil && scope.Boot != nil {
+		dnsServers := []net.IP{server}
+		if len(scope.DNSServers) > 0 {
+			dnsServers = nil
+			for _, d := range scope.DNSServers {
+				dnsServers = append(dnsServers, net.ParseIP(d).To4())
+			}
+		}
+		reply, err := dhcpv4.NewReplyFromRequest(r, dhcpv4.WithMessageType(replyType), dhcpv4.WithClientIP(r.ClientIPAddr), dhcpv4.WithYourIP(net.ParseIP(b.Address)), dhcpv4.WithOption(dhcpv4.OptServerIdentifier(server)), dhcpv4.WithNetmask(network.Mask), dhcpv4.WithRouter(net.ParseIP(scope.Router)), dhcpv4.WithOption(dhcpv4.OptDNS(dnsServers...)), dhcpv4.WithLeaseTime(uint32(scope.LeaseSeconds)), dhcpv4.WithDomainSearchList(scope.Zone))
+		if err == nil {
+			for _, o := range scope.Options {
+				reply.UpdateOption(dhcpv4.OptGeneric(dhcpv4.GenericOptionCode(o.Code), o.wire()))
+			}
+		}
+		if err == nil && scope.Boot != nil && wantsBoot(r, scope.Boot) {
 			// The network-boot hand-off, as dnsmasq's dhcp-boot gives it: siaddr, the
-			// file field, and options 66/67, whether or not the client asked.
+			// file field, and options 66/67.
 			next := server
 			if scope.Boot.NextServer != "" {
 				next = net.ParseIP(scope.Boot.NextServer)
@@ -420,4 +433,30 @@ func (m *Manager) CollectPeers(ctx context.Context) error {
 		return err
 	}
 	return m.Store.SightPeers(peers)
+}
+
+// wantsBoot says whether a client should get the network-boot fields: like
+// dnsmasq, only when it asks (a parameter request list naming option 66 or 67, a
+// PXEClient vendor class, or a plain BOOTP request), unless the scope forces it.
+func wantsBoot(r *dhcpv4.DHCPv4, b *BootConfig) bool {
+	if b.Always || r.MessageType() == dhcpv4.MessageTypeNone {
+		return true
+	}
+	if strings.HasPrefix(r.ClassIdentifier(), "PXEClient") {
+		return true
+	}
+	prl := r.ParameterRequestList()
+	return prl.Has(dhcpv4.OptionTFTPServerName) || prl.Has(dhcpv4.OptionBootfileName)
+}
+
+func tftpServes(t *TFTPConfig, scope Scope) bool {
+	if len(t.Interfaces) == 0 {
+		return true
+	}
+	for _, i := range t.Interfaces {
+		if i == scope.Interface {
+			return true
+		}
+	}
+	return false
 }

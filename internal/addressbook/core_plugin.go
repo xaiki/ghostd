@@ -101,25 +101,22 @@ func loadInstance(args []string) (pluginInstance, error) {
 	return v.(pluginInstance), nil
 }
 
-// clientLinkLocal is the address a delegation is routed to: the requester's own
-// link-local address, straight from the transport for a direct request, or the
-// peer-address a relay recorded for it.
+// clientLinkLocal is the next hop a delegation is routed to. For a direct request
+// it is the requester's own link-local address, straight from the transport. For a
+// relayed one the requester is on another link, so the next hop is the relay
+// agent itself (the transport peer): it forwards the delegated prefix onward, as
+// DHCPv6 relay deployments expect.
 func clientLinkLocal(r dhcpv6.DHCPv6, peer *net.UDPAddr) net.IP {
-	for n := 0; r.IsRelay() && n < 32; n++ {
-		relay, ok := r.(*dhcpv6.RelayMessage)
-		if !ok {
-			return nil
-		}
-		inner := relay.Options.RelayMessage()
-		if inner == nil {
-			return nil
-		}
-		if !inner.IsRelay() {
-			return relay.PeerAddr
-		}
-		r = inner
+	if peer == nil {
+		return nil
 	}
-	if peer != nil && peer.IP.IsLinkLocalUnicast() {
+	if r.IsRelay() {
+		if peer.IP.IsUnspecified() || peer.IP.IsMulticast() {
+			return nil
+		}
+		return peer.IP
+	}
+	if peer.IP.IsLinkLocalUnicast() {
 		return peer.IP
 	}
 	return nil

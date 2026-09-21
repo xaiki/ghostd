@@ -170,9 +170,15 @@ func ConvertDNSmasq(path string, o ConvertOptions) (ConvertPlan, error) {
 		return plan, e
 	}
 	var interfaces []string
-	var ranges [][]string
+	type dmRange struct {
+		tag string
+		f   []string
+	}
+	var ranges []dmRange
 	var hosts [][]string
-	var globalZone, routerOpt, bootFile, bootNext, tftpRoot string
+	var options []dmOption
+	var globalZone, bootFile, bootNext, tftpRoot string
+	var tftpIfaces []string
 	tftp := false
 	zoneFor := map[string]string{}
 	ra := false
@@ -203,24 +209,17 @@ func ConvertDNSmasq(path string, o ConvertOptions) (ConvertPlan, error) {
 		case "dhcp-leasefile":
 			plan.Legacy.LeasePath = value
 		case "dhcp-range":
-			f := strings.Split(value, ",")
-			if len(f) != 4 {
-				return plan, bad("use explicit start,end,netmask/prefix,lifetime; tags, static and interface: ranges need manual conversion")
+			tag, f, err := splitRange(value)
+			if err != nil {
+				return plan, bad(err.Error())
 			}
-			ranges = append(ranges, f)
+			ranges = append(ranges, dmRange{tag, f})
 		case "dhcp-option":
-			f := strings.Split(value, ",")
-			if len(f) != 2 {
-				return plan, bad("multi-value or tagged options are scoped in ways a scope cannot express")
+			o, err := parseDHCPOption(value)
+			if err != nil {
+				return plan, bad(err.Error())
 			}
-			switch f[0] {
-			case "option:router", "3":
-				routerOpt = f[1]
-			case "option:dns-server", "6":
-				// A scope's DNS server is its own address; the validator checks equality.
-			default:
-				return plan, bad("only router and dns-server options are carried over")
-			}
+			options = append(options, o)
 		case "dhcp-host":
 			f := strings.Split(value, ",")
 			if len(f) != 3 {
@@ -239,10 +238,12 @@ func ConvertDNSmasq(path string, o ConvertOptions) (ConvertPlan, error) {
 				bootNext = f[1]
 			}
 		case "enable-tftp":
-			if value != "" {
-				return plan, bad("TFTP limited to interfaces is not supported")
-			}
 			tftp = true
+			for _, i := range strings.Split(value, ",") {
+				if i = strings.TrimSpace(i); i != "" {
+					tftpIfaces = append(tftpIfaces, i)
+				}
+			}
 		case "tftp-root":
 			tftpRoot = value
 		case "enable-ra":
@@ -260,7 +261,8 @@ func ConvertDNSmasq(path string, o ConvertOptions) (ConvertPlan, error) {
 	}
 	used := map[string]bool{}
 	devices := map[string]bool{}
-	for _, r := range ranges {
+	for _, rg := range ranges {
+		r := rg.f
 		start, e1 := netip.ParseAddr(r[0])
 		end, e2 := netip.ParseAddr(r[1])
 		if e1 != nil || e2 != nil {
@@ -328,11 +330,14 @@ func ConvertDNSmasq(path string, o ConvertOptions) (ConvertPlan, error) {
 		}
 		if start.Is4() {
 			s.Router = server.String() // dnsmasq's own default
-			if routerOpt != "" {
-				if ra, e := netip.ParseAddr(routerOpt); e == nil && prefix.Contains(ra) {
-					s.Router = routerOpt
-				}
+			st, e := deriveSettings(options, rg.tag, prefix, server.String())
+			if e != nil {
+				return plan, fmt.Errorf("range %s..%s: %w", r[0], r[1], e)
 			}
+			if st.router != "" {
+				s.Router = st.router
+			}
+			s.DNSServers, s.Options = st.dns, st.others
 		} else {
 			s.PreferredSeconds = life
 			if ra {
@@ -364,7 +369,7 @@ func ConvertDNSmasq(path string, o ConvertOptions) (ConvertPlan, error) {
 		if tftpRoot == "" {
 			return plan, fmt.Errorf("enable-tftp without tftp-root serves the whole filesystem; set tftp-root")
 		}
-		plan.Target.TFTP = &TFTPConfig{Root: tftpRoot}
+		plan.Target.TFTP = &TFTPConfig{Root: tftpRoot, Interfaces: tftpIfaces}
 	}
 	for _, h := range hosts {
 		addr, _ := netip.ParseAddr(h[1])

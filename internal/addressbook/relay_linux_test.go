@@ -3,8 +3,10 @@
 package addressbook
 
 import (
+	"fmt"
 	"github.com/insomniacslk/dhcp/dhcpv4"
 	"github.com/insomniacslk/dhcp/dhcpv6"
+	"github.com/insomniacslk/dhcp/iana"
 	"net"
 	"os"
 	"testing"
@@ -95,4 +97,50 @@ func TestRelayClient(t *testing.T) {
 	if _, _, e = conn.ReadFromUDP(b); e == nil {
 		t.Fatal("wrong IPv6 relay link accepted")
 	}
+	// Prefix delegation through the relay: Solicit -> Advertise carries a prefix and
+	// the server DUID; Request commits it. Both arrive as Relay-Reply.
+	pdCID := &dhcpv6.DUIDLL{HWType: iana.HWTypeEthernet, LinkLayerAddr: net.HardwareAddr{0, 0x77, 1, 2, 3, 4}}
+	relayed := func(m *dhcpv6.Message) *dhcpv6.Message {
+		t.Helper()
+		fwd, e := dhcpv6.EncapsulateRelay(m, dhcpv6.MessageTypeRelayForward, net.ParseIP("fd88::1"), net.ParseIP("fe80::77"))
+		if e != nil {
+			t.Fatal(e)
+		}
+		conn.WriteToUDP(fwd.ToBytes(), &net.UDPAddr{IP: net.ParseIP("fd77::1"), Port: 547})
+		conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		n, _, e := conn.ReadFromUDP(b)
+		if e != nil {
+			t.Fatal("no relayed reply:", e)
+		}
+		out, e := dhcpv6.FromBytes(b[:n])
+		if e != nil {
+			t.Fatal(e)
+		}
+		inner, e := out.(*dhcpv6.RelayMessage).GetInnerMessage()
+		if e != nil {
+			t.Fatal(e)
+		}
+		return inner
+	}
+	solicit := &dhcpv6.Message{MessageType: dhcpv6.MessageTypeSolicit}
+	solicit.AddOption(dhcpv6.OptClientID(pdCID))
+	solicit.AddOption(&dhcpv6.OptIAPD{IaId: [4]byte{0, 0, 0, 9}})
+	adv := relayed(solicit)
+	pds := adv.Options.IAPD()
+	if len(pds) != 1 || len(pds[0].Options.Prefixes()) != 1 {
+		t.Fatal("no prefix offered through the relay:", adv)
+	}
+	reqPD := &dhcpv6.Message{MessageType: dhcpv6.MessageTypeRequest}
+	reqPD.AddOption(dhcpv6.OptClientID(pdCID))
+	reqPD.AddOption(dhcpv6.OptServerID(adv.Options.ServerID()))
+	ia := &dhcpv6.OptIAPD{IaId: [4]byte{0, 0, 0, 9}}
+	ia.Options.Add(pds[0].Options.Prefixes()[0])
+	reqPD.AddOption(ia)
+	rep := relayed(reqPD)
+	if got := rep.Options.IAPD(); len(got) != 1 || len(got[0].Options.Prefixes()) != 1 {
+		t.Fatal("prefix not delegated through the relay:", rep)
+	} else {
+		fmt.Printf("RELAYPD prefix=%s\n", got[0].Options.Prefixes()[0].Prefix)
+	}
+
 }

@@ -182,6 +182,9 @@ func ValidateDNSmasqConfig(c Config, text, leasePath string) error {
 	scopedDomains := map[netip.Prefix]string{}
 	excluded := map[string]bool{}
 	var bootFile, bootNext, tftpRoot string
+	var options []dmOption
+	rangeTag := map[string]string{}
+	var tftpIfaces []string
 	tftp := false
 	lease := false
 	ra := false
@@ -216,9 +219,9 @@ func ValidateDNSmasqConfig(c Config, text, leasePath string) error {
 			}
 			lease = true
 		case "dhcp-range":
-			f := strings.Split(value, ",")
-			if len(f) != 4 {
-				return fmt.Errorf("use explicit start,end,netmask/prefix,lifetime ranges")
+			tag, f, err := splitRange(value)
+			if err != nil {
+				return err
 			}
 			found := false
 			for _, s := range c.Scopes {
@@ -249,6 +252,7 @@ func ValidateDNSmasqConfig(c Config, text, leasePath string) error {
 					}
 
 					ranges[s.ID] = true
+					rangeTag[s.ID] = tag
 					found = true
 				}
 			}
@@ -256,22 +260,11 @@ func ValidateDNSmasqConfig(c Config, text, leasePath string) error {
 				return fmt.Errorf("dnsmasq range is not represented in target")
 			}
 		case "dhcp-option":
-			f := strings.Split(value, ",")
-			if len(f) != 2 {
-				return fmt.Errorf("unsupported multi-value DHCP option")
+			o, err := parseDHCPOption(value)
+			if err != nil {
+				return err
 			}
-			matched := false
-			for _, s := range c.Scopes {
-				if (f[0] == "option:router" || f[0] == "3") && f[1] == s.Router {
-					matched = true
-				}
-				if (f[0] == "option:dns-server" || f[0] == "6") && f[1] == s.Server {
-					matched = true
-				}
-			}
-			if !matched {
-				return fmt.Errorf("unsupported or different DHCP option %s", f[0])
-			}
+			options = append(options, o)
 		case "dhcp-host":
 			f := strings.Split(value, ",")
 			if len(f) != 3 {
@@ -305,10 +298,12 @@ func ValidateDNSmasqConfig(c Config, text, leasePath string) error {
 				}
 			}
 		case "enable-tftp":
-			if value != "" {
-				return fmt.Errorf("enable-tftp limited to interfaces is not supported")
-			}
 			tftp = true
+			for _, i := range strings.Split(value, ",") {
+				if i = strings.TrimSpace(i); i != "" {
+					tftpIfaces = append(tftpIfaces, i)
+				}
+			}
 		case "tftp-root":
 			tftpRoot = value
 		case "enable-ra":
@@ -325,15 +320,23 @@ func ValidateDNSmasqConfig(c Config, text, leasePath string) error {
 	if tftp && tftpRoot == "" {
 		return fmt.Errorf("enable-tftp without tftp-root serves the whole filesystem; set tftp-root")
 	}
-	if tftp != (c.TFTP != nil) || (c.TFTP != nil && c.TFTP.Root != tftpRoot) {
+	if tftp != (c.TFTP != nil) || (c.TFTP != nil && (c.TFTP.Root != tftpRoot || !sameStrings(c.TFTP.Interfaces, tftpIfaces))) {
 		return fmt.Errorf("target TFTP does not match the legacy enable-tftp/tftp-root")
 	}
 	for _, s := range c.Scopes {
-		if s.PD != nil {
-			return fmt.Errorf("scope %s: prefix delegation cannot be taken over from dnsmasq's lease file; add it with an ordinary apply afterwards", s.ID)
-		}
 		if s.Is6() || !s.Enabled {
 			continue
+		}
+		st, err := deriveSettings(options, rangeTag[s.ID], netip.MustParsePrefix(s.Subnet), s.Server)
+		if err != nil {
+			return fmt.Errorf("scope %s: %w", s.ID, err)
+		}
+		wantRouter := s.Server // dnsmasq's own default
+		if st.router != "" {
+			wantRouter = st.router
+		}
+		if s.Router != wantRouter || !sameStrings(s.DNSServers, st.dns) || !sameOptions(s.Options, st.others) {
+			return fmt.Errorf("scope %s: router, DNS servers or options differ from the legacy dhcp-option lines that reach its range", s.ID)
 		}
 		want := bootFile != ""
 		if want != (s.Boot != nil) {

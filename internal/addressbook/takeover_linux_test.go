@@ -323,11 +323,30 @@ func TestDNSmasqTakeoverLab(t *testing.T) {
 	command("ip", "route", "add", "10.88.0.0/24", "via", "10.77.0.100")
 	cfg.Scopes = append(cfg.Scopes,
 		Scope{ID: "relay4", Interface: "lab0", Subnet: "10.88.0.0/24", Server: "10.77.0.1", Router: "10.88.0.1", Start: "10.88.0.10", End: "10.88.0.20", Zone: "relay.home.arpa", LeaseSeconds: 600, Enabled: true, Relay: &RelayConfig{Peer: "10.77.0.100", Link: "10.88.0.1"}},
-		Scope{ID: "relay6", Interface: "lab0", Subnet: "fd88::/64", Server: "fd77::1", Start: "fd88::10", End: "fd88::20", Zone: "relay.home.arpa", LeaseSeconds: 600, PreferredSeconds: 300, Enabled: true, Relay: &RelayConfig{Peer: "fd77::100", Link: "fd88::1"}})
+		Scope{ID: "relay6", Interface: "lab0", Subnet: "fd88::/64", Server: "fd77::1", Start: "fd88::10", End: "fd88::20", Zone: "relay.home.arpa", LeaseSeconds: 600, PreferredSeconds: 300, Enabled: true, Relay: &RelayConfig{Peer: "fd77::100", Link: "fd88::1"}, PD: &PDConfig{Prefix: "fd79::/48", Length: 56, Route: true}})
 	if e = manager.Apply(cfg, func() error { return nil }); e != nil {
 		t.Fatal(e)
 	}
-	t.Log(command("ip", "netns", "exec", "client2", "env", "GHOSTD_RELAY_CLIENT=1", "/lab/test", "-test.run", "^TestRelayClient$", "-test.v"))
+	relayOut := command("ip", "netns", "exec", "client2", "env", "GHOSTD_RELAY_CLIENT=1", "/lab/test", "-test.run", "^TestRelayClient$", "-test.v")
+	t.Log(relayOut)
+	// The delegation obtained through the relay is routed via the relay agent.
+	var relayed Binding
+	for end := time.Now().Add(10 * time.Second); relayed.Address == "" && time.Now().Before(end); time.Sleep(200 * time.Millisecond) {
+		snap, _ := store.Snapshot("relay6", "", 0)
+		for _, b := range snap.Bindings {
+			if b.Origin == originPD && b.State == "active" {
+				relayed = b
+			}
+		}
+	}
+	if relayed.Address == "" || relayed.Via != "fd77::100" || !strings.HasPrefix(relayed.Address, "fd79:") {
+		t.Fatalf("relayed delegation missing or not routed via the relay: %+v\n%s", relayed, relayOut)
+	}
+	for end := time.Now().Add(10 * time.Second); !strings.Contains(command("ip", "-6", "route", "show", "proto", routeProto), relayed.Address) && time.Now().Before(end); time.Sleep(200 * time.Millisecond) {
+	}
+	if got := command("ip", "-6", "route", "show", "proto", routeProto); !strings.Contains(got, relayed.Address+" via fd77::100") {
+		t.Fatalf("relayed prefix %s is not routed via the relay agent:\n%s", relayed.Address, got)
+	}
 
 	// Turn on SLAAC explicitly and verify the kernel-generated address is seen
 	// as neighbor evidence rather than a DHCP allocation.

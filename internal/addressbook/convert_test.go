@@ -103,9 +103,10 @@ func TestConvertRejectsWhatItCannotPreserve(t *testing.T) {
 		conf, want string
 	}{
 		"unknown directive":   {baseConf + "dhcp-vendorclass=set:pxe,PXEClient\n", "needs explicit conversion"},
-		"tagged range":        {strings.Replace(baseConf, "domain=home.arpa", "domain=home.arpa\ndhcp-range=set:guest,198.51.100.10,198.51.100.20,255.255.255.0,1h", 1), "explicit start,end"},
-		"scoped option":       {baseConf + "dhcp-option=tag:guest,option:router,198.51.100.1\n", "scoped in ways"},
-		"other option":        {baseConf + "dhcp-option=option:ntp-server,192.0.2.1\n", "only router and dns-server"},
+		"matching range":      {strings.Replace(baseConf, "domain=home.arpa", "domain=home.arpa\ndhcp-range=tag:guest,198.51.100.10,198.51.100.20,255.255.255.0,1h", 1), "matches on tag:guest"},
+		"unknown option":      {baseConf + "dhcp-option=option:sip-server,192.0.2.1\n", "not one this converter"},
+		"tagged router away":  {strings.Replace(baseConf, "interface=eth0\n", "interface=eth0\ninterface=eth1\n", 1) + "dhcp-range=set:guest,198.51.100.10,198.51.100.20,255.255.255.0,1h\ndhcp-option=tag:guest,option:router,192.0.2.254\n", "outside"},
+		"bad option value":    {baseConf + "dhcp-option=option:ntp-server,not-an-ip\n", "not an IPv4"},
 		"infinite lease":      {strings.Replace(baseConf, "domain=home.arpa", "domain=home.arpa\ndhcp-range=192.0.2.200,192.0.2.210,255.255.255.0,infinite", 1), "infinite leases"},
 		"no zone":             {strings.Replace(baseConf, "domain=home.arpa\n", "", 1), "no domain="},
 		"host outside pool":   {baseConf + "dhcp-host=aa:bb:cc:dd:ee:02,203.0.113.5,elsewhere\n", "outside every converted range"},
@@ -133,4 +134,53 @@ func TestValidatorFollowsIncludesAndExclusions(t *testing.T) {
 	if e = ValidateDNSmasqConfig(plan.Target, text, plan.Legacy.LeasePath); e == nil || !strings.Contains(e.Error(), "excludes") {
 		t.Fatal("a scope on an interface the legacy config excludes from DHCP was accepted:", e)
 	}
+}
+
+func TestConvertTagsMultiValueAndGenericOptions(t *testing.T) {
+	conf := strings.Replace(baseConf, "interface=eth0\n", "interface=eth0\ninterface=eth1\n", 1) + `
+dhcp-range=set:guest,198.51.100.10,198.51.100.20,255.255.255.0,1h
+dhcp-option=tag:guest,option:router,198.51.100.254
+dhcp-option=tag:guest,option:dns-server,198.51.100.1,9.9.9.9
+dhcp-option=option:ntp-server,192.0.2.1,198.51.100.1
+dhcp-option=26,1400
+`
+	plan, err := convert(t, conf, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Target.Scopes) != 2 {
+		t.Fatal(plan.Target.Scopes)
+	}
+	lan, guest := plan.Target.Scopes[0], plan.Target.Scopes[1]
+	if lan.Router != "192.0.2.254" || len(lan.DNSServers) != 0 {
+		t.Fatal("untagged scope must not pick up the guest-tagged options:", lan)
+	}
+	if guest.Router != "198.51.100.254" || len(guest.DNSServers) != 2 || guest.DNSServers[1] != "9.9.9.9" {
+		t.Fatal("tagged options did not reach their range:", guest)
+	}
+	for _, sc := range []Scope{lan, guest} {
+		if len(sc.Options) != 2 || sc.Options[0].Code != 26 || sc.Options[1].Code != 42 || sc.Options[1].Value[1] != "198.51.100.1" {
+			t.Fatal("global generic options reach every scope:", sc.Options)
+		}
+	}
+	// The plan is accepted by the takeover validator, and a drifted target is not.
+	text, _ := FlattenDNSmasq("/etc/dnsmasq.conf", fakeFSFor(conf))
+	if e := ValidateDNSmasqConfig(plan.Target, text, plan.Legacy.LeasePath); e != nil {
+		t.Fatal(e)
+	}
+	drift := cloneConfig(plan.Target)
+	drift.Scopes[1].DNSServers = nil
+	if e := ValidateDNSmasqConfig(drift, text, plan.Legacy.LeasePath); e == nil {
+		t.Fatal("a target that dropped the tagged DNS servers was accepted")
+	}
+	drift = cloneConfig(plan.Target)
+	drift.Scopes[0].Options = drift.Scopes[0].Options[:1]
+	if e := ValidateDNSmasqConfig(drift, text, plan.Legacy.LeasePath); e == nil {
+		t.Fatal("a target that dropped an option was accepted")
+	}
+}
+
+func fakeFSFor(main string) FileReader {
+	files := map[string]string{"/etc/dnsmasq.conf": main, "/etc/dnsmasq.extra": "dhcp-range=192.0.2.100,192.0.2.150,255.255.255.0,12h\ndhcp-option=option:router,192.0.2.254\n"}
+	return fakeFS(files, map[string][]string{"/etc/dnsmasq.d": {}})
 }

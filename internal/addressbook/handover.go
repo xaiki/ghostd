@@ -46,6 +46,8 @@ type HandoverJournal struct {
 	ImportedLeases map[string]int `json:"imported_leases,omitempty"`
 	// RequireEvidence makes Confirm demand observed client behaviour (below).
 	RequireEvidence bool `json:"require_evidence,omitempty"`
+	// AbandonedDelegations counts prefix delegations a rollback had to end.
+	AbandonedDelegations int `json:"abandoned_delegations,omitempty"`
 }
 
 // ScopeEvidence is what the ledger saw from real clients since the takeover
@@ -73,6 +75,10 @@ type Handover struct {
 	SaveConfig func(Config) error
 	// RequireEvidence is recorded in the journal by Begin.
 	RequireEvidence bool
+	// AllowPD lets the target carry prefix delegation. dnsmasq's lease file cannot
+	// hold delegations, so rolling back abandons them: the operator must accept
+	// that in advance.
+	AllowPD bool
 }
 
 var handoverHistoryBucket = []byte("handover-history-v1")
@@ -239,6 +245,11 @@ func (h Handover) Begin(target Config, spec LegacySpec, grace time.Duration) err
 	}
 	if grace < 30*time.Second || grace > 30*time.Minute {
 		return fmt.Errorf("handover deadline must be 30..1800 seconds")
+	}
+	for _, sc := range target.Scopes {
+		if sc.PD != nil && !h.AllowPD {
+			return fmt.Errorf("scope %s delegates prefixes, which dnsmasq's lease file cannot carry: a rollback would abandon them. Repeat the request with allow_pd to accept that, or add prefix delegation with an ordinary apply after the takeover", sc.ID)
+		}
 	}
 	previous := h.Manager.Config()
 	for _, s := range previous.Scopes {
@@ -411,6 +422,13 @@ func (h Handover) Rollback() error {
 			return e
 		}
 	}
+	if j.Activated {
+		n, e := h.Manager.Store.abandonDelegations(j.Target)
+		if e != nil {
+			return e
+		}
+		j.AbandonedDelegations += n
+	}
 	if e = h.apply(disabled(j.Previous)); e != nil {
 		return e
 	}
@@ -449,3 +467,44 @@ func (h Handover) Recover() error {
 
 // SaveHandoverForTest lets other packages fabricate an interrupted journal.
 func (s *Store) SaveHandoverForTest(j HandoverJournal) error { return s.saveHandover(j) }
+
+// abandonDelegations ends every live prefix delegation in the target's PD pools:
+// the legacy allocator cannot serve them, and leaving them active would keep
+// routing prefixes to routers nothing renews. The ledger keeps the history.
+func (s *Store) abandonDelegations(target Config) (int, error) {
+	pools := map[string]bool{}
+	for _, sc := range target.Scopes {
+		if sc.PD != nil {
+			pools[sc.ID] = true
+		}
+	}
+	if len(pools) == 0 {
+		return 0, nil
+	}
+	now := s.now().Unix()
+	count := 0
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		var live []Binding
+		if e := tx.Bucket(leaseBucket).ForEach(func(_, raw []byte) error {
+			var b Binding
+			if e := json.Unmarshal(raw, &b); e != nil {
+				return e
+			}
+			if b.Origin == originPD && pools[b.Scope] && b.End > now && (b.State == "active" || b.State == "offered") {
+				live = append(live, b)
+			}
+			return nil
+		}); e != nil {
+			return e
+		}
+		for _, b := range live {
+			b.State, b.End, b.Evidence = "released", now, "abandoned: rolled back to the legacy allocator, which cannot serve delegations"
+			if e := s.save(tx, b, "release"); e != nil {
+				return e
+			}
+			count++
+		}
+		return nil
+	})
+	return count, err
+}
