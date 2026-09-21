@@ -20,6 +20,29 @@ type dnsmasqState struct {
 	Legacy func(addressbook.LegacySpec) addressbook.LegacyAuthority
 }
 
+// handoverPending reports whether a handover is mid-flight: a journal that
+// exists and has not been confirmed or rolled back. `applyDHCP` refuses to
+// replace the DHCP configuration under one, because the takeover's rollback
+// snapshot is the configuration that was just replaced.
+//
+// Tag-conditional like `handoverAction`: the journal belongs to this feature
+// (internal/addressbook/handover.go is `dnsmasq && dhcp`), so the no-dnsmasq
+// build answers false in dnsmasq_off.go rather than reaching for it.
+func (s *Server) handoverPending() (bool, error) {
+	if s.DHCP == nil {
+		return false, nil
+	}
+	journal, err := s.DHCP.Store.HandoverJournal()
+	if err != nil {
+		return false, err
+	}
+	switch journal.Phase {
+	case "", "confirmed", "rolled-back":
+		return false, nil
+	}
+	return true, nil
+}
+
 // handoverAction is the transactional takeover from a legacy dnsmasq.
 func (s *Server) handoverAction(ctx context.Context, req *pb.RegistryDocument) (*pb.RegistryResponse, error) {
 	var request struct {
@@ -106,14 +129,4 @@ func (s *Server) handoverAction(ctx context.Context, req *pb.RegistryDocument) (
 		return nil, e
 	}
 	return document(j)
-}
-
-// handoverPending reports whether a dnsmasq takeover is in flight, which blocks
-// ordinary configuration changes.
-func (s *Server) handoverPending() (bool, error) {
-	journal, err := s.DHCP.Store.HandoverJournal()
-	if err != nil {
-		return false, err
-	}
-	return journal.Phase != "" && journal.Phase != "confirmed" && journal.Phase != "rolled-back", nil
 }

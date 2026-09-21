@@ -25,6 +25,12 @@ var extraDomains = map[string]domainImpl{}
 
 func registerDomain(name string, d domainImpl) {
 	extraDomains[name] = d
+	// The two tables must move together. `extraDomains` is this package's
+	// Apply/Confirm routing; `state`'s is the transaction registry that refuses
+	// to read or write a domain it was never told about — a compiled-in feature
+	// that only registered here got `unknown domain "dhcp-v1"` from its own
+	// store, while the core-only build (which calls neither) correctly rejects
+	// the domain outright.
 	state.RegisterDomain(name)
 }
 
