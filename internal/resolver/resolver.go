@@ -1,3 +1,5 @@
+//go:build coredns
+
 // Package resolver embeds the small CoreDNS chain used by stack containers.
 // Host /etc/resolv.conf is never rewritten: NSS/mDNS must not recurse into us.
 package resolver
@@ -19,7 +21,6 @@ import (
 	"github.com/coredns/coredns/core/dnsserver"
 	"github.com/coredns/coredns/plugin"
 	"github.com/miekg/dns"
-	"github.com/xaiki/ghostd/internal/mdns"
 )
 
 const RuntimeDir = "/run/ghostd"
@@ -30,9 +31,23 @@ var (
 	browseFunc = browseLocal
 )
 
-// mdnsQuerier is the LAN client behind .local answers. When it cannot send
-// (no multicast interface), lookups fall back to the host's NSS via getent.
-var mdnsQuerier atomic.Pointer[mdns.Querier]
+// LANClient is the LAN-side client behind .local answers and DNS-SD browsing.
+// It is optional: a build without it resolves .local through the host's NSS
+// (getent) and does not answer DNS-SD questions. The mdns feature provides one.
+type LANClient interface {
+	// Lookup resolves a .local host name to addresses. An error means the client
+	// could not ask the LAN at all (no usable interface), not that nobody answered.
+	Lookup(ctx context.Context, name string) ([]net.IP, error)
+	// Browse asks for a DNS-SD record set (PTR/SRV/TXT) and returns the answers
+	// and the related SRV/TXT/address records.
+	Browse(ctx context.Context, name string, qtype uint16) (answers, extra []dns.RR, err error)
+}
+
+var errNoLAN = errors.New("no LAN discovery client in this build")
+
+type lanBox struct{ c LANClient }
+
+var lanClient atomic.Pointer[lanBox]
 
 func init() {
 	plugin.Register("ghostlocal", func(c *caddy.Controller) error {
@@ -51,15 +66,15 @@ func init() {
 // Option customises Start.
 type Option func(*options)
 type options struct {
-	acl     ACL
-	querier *mdns.Querier
+	acl ACL
+	lan LANClient
 }
 
 // WithACL gives each identity its own resolver listener and access policy.
 func WithACL(a ACL) Option { return func(o *options) { o.acl = a } }
 
-// WithQuerier sets the native mDNS client used for .local names and DNS-SD.
-func WithQuerier(q *mdns.Querier) Option { return func(o *options) { o.querier = q } }
+// WithLAN sets the native client used for .local names and DNS-SD.
+func WithLAN(c LANClient) Option { return func(o *options) { o.lan = c } }
 
 // Start binds TCP and UDP before publishing the environment consumed by Quadlet.
 // The address is the host tailnet IP, never a wildcard/public listener.
@@ -85,17 +100,16 @@ func start(address string, port int, upstream, directory string, opts ...Option)
 		}
 	}
 	setPolicies(o.acl)
-	if o.querier == nil {
-		o.querier = &mdns.Querier{}
+	if o.lan != nil {
+		lanClient.Store(&lanBox{o.lan})
 	}
-	mdnsQuerier.Store(o.querier)
 	corefile := pluginCorefile(port, ip.String(), upstream, o.acl.Identities...)
 	instance, err := caddy.Start(caddy.CaddyfileInput{Contents: []byte(corefile), ServerTypeName: "dns"})
 	if err != nil {
 		clearPolicies()
 		return nil, err
 	}
-	stop := func() { instance.ShutdownCallbacks(); _ = instance.Stop(); clearPolicies(); mdnsQuerier.Store(nil) }
+	stop := func() { instance.ShutdownCallbacks(); _ = instance.Stop(); clearPolicies(); lanClient.Store(nil) }
 	if err := os.MkdirAll(directory, 0755); err != nil {
 		stop()
 		return nil, err
@@ -212,6 +226,9 @@ func (h *localHandler) serveBrowse(ctx context.Context, w dns.ResponseWriter, r 
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	answers, extra, err := h.browse(ctx, q.Name, q.Qtype)
+	if errors.Is(err, errNoLAN) {
+		return dns.RcodeNotImplemented, nil
+	}
 	if err != nil {
 		return dns.RcodeServerFailure, err
 	}
@@ -232,50 +249,23 @@ func (h *localHandler) serveBrowse(ctx context.Context, w dns.ResponseWriter, r 
 	return dns.RcodeSuccess, w.WriteMsg(reply)
 }
 
-// browseLocal asks the LAN for a DNS-SD record set through the native client.
+// browseLocal asks the LAN for a DNS-SD record set through the LAN client.
 func browseLocal(ctx context.Context, name string, qtype uint16) ([]dns.RR, []dns.RR, error) {
-	q := mdnsQuerier.Load()
-	if q == nil {
-		return nil, nil, fmt.Errorf("mDNS client not running")
+	box := lanClient.Load()
+	if box == nil {
+		return nil, nil, errNoLAN
 	}
-	rrs, err := q.Query(ctx, name, qtype)
-	if err != nil && len(rrs) == 0 {
-		return nil, nil, err
-	}
-	answers := mdns.Answers(rrs, name, qtype)
-	return answers, mdns.Related(rrs, answers), nil
+	return box.c.Browse(ctx, name, qtype)
 }
 
-// lookupLocal resolves a .local host natively. Only when no LAN interface can
-// send a query does it fall back to the host's NSS, so a host that still runs
-// avahi keeps working while the native client is unavailable.
+// lookupLocal resolves a .local host natively when there is a LAN client. Only
+// when it cannot ask (or there is none) does it fall back to the host's NSS via
+// getent, so a host that still runs avahi keeps working.
 func lookupLocal(ctx context.Context, name string) ([]net.IP, error) {
-	if q := mdnsQuerier.Load(); q != nil {
-		var ips []net.IP
-		seen := map[string]bool{}
-		for _, qt := range []uint16{dns.TypeA, dns.TypeAAAA} {
-			rrs, err := q.Query(ctx, name, qt)
-			if err != nil && len(rrs) == 0 {
-				if ips == nil && qt == dns.TypeA {
-					return lookupHost(ctx, name)
-				}
-				continue
-			}
-			for _, rr := range mdns.Answers(rrs, name, qt) {
-				var ip net.IP
-				switch v := rr.(type) {
-				case *dns.A:
-					ip = v.A
-				case *dns.AAAA:
-					ip = v.AAAA
-				}
-				if ip != nil && !seen[ip.String()] {
-					seen[ip.String()] = true
-					ips = append(ips, ip)
-				}
-			}
+	if box := lanClient.Load(); box != nil {
+		if ips, err := box.c.Lookup(ctx, name); err == nil {
+			return ips, nil
 		}
-		return ips, nil
 	}
 	return lookupHost(ctx, name)
 }

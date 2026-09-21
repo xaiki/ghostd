@@ -30,16 +30,41 @@ speaks the methods in [proto/ghoststate.proto](proto/ghoststate.proto).
 
 ## Build
 
+The default build is **the core only**: the firewall and netconfig domains, the
+lease/confirm/rollback machinery and the tailnet RPC. Everything else is an
+optional feature compiled in by build tag, so a host carries only the code — and
+opens only the sockets — it asked for:
+
+| Tag | Adds | Requires |
+| --- | --- | --- |
+| `coredns` | The container resolver (CoreDNS) on the tailnet address, with the per-container DNS ACL | — |
+| `dhcp` | DHCPv4/v6, authoritative LAN DNS, the identity ledger, prefix delegation, TFTP/PXE, peer suggestions, warm standby, and their RPCs | `coredns` |
+| `dnsmasq` | Takeover from, and conversion of, a dnsmasq install (`--convert-dnsmasq`, the handover RPCs) | `dhcp` |
+| `mdns` | Native mDNS: `.local` and DNS-SD for containers (with `coredns`), and the `mdns-v1` advertisement domain | — |
+
 ```sh
-go test ./...
-go build -trimpath -o bin/ghostd ./cmd/ghostd
+go build -trimpath -o bin/ghostd ./cmd/ghostd                                         # core only
+go build -trimpath -tags "coredns mdns" -o bin/ghostd ./cmd/ghostd                    # container DNS + native .local
+go build -trimpath -tags "dhcp coredns" -o bin/ghostd ./cmd/ghostd                    # a DHCP/DNS authority
+go build -trimpath -tags "dhcp dnsmasq mdns coredns" -o bin/ghostd ./cmd/ghostd       # everything
+bin/ghostd --features                                                                 # what this binary contains
 ```
+
+A combination that breaks a dependency (`dnsmasq` without `dhcp`, `dhcp` without
+`coredns`) does not compile. Features that are not built in are absent, not
+disabled: their domains are rejected (`domain must be one of [...]`), their RPCs
+return `Unimplemented`, their flags do not exist, and their sockets are never
+opened; the default binary contains none of their dependencies. The rest of this
+documentation says which tag a feature needs.
 
 For a Linux ARM64 target built on another OS, the binary is CGO-free:
 
 ```sh
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -o bin/ghostd-linux-arm64 ./cmd/ghostd
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -tags "dhcp coredns" -o bin/ghostd-linux-arm64 ./cmd/ghostd
 ```
+
+Tests take the same tags (`go test -tags "dhcp dnsmasq mdns coredns" ./...`);
+`tests/tags.sh` builds, vets and tests every supported combination.
 
 ## Install
 
@@ -97,11 +122,11 @@ object) and a positive `dead_man_switch_seconds`. A second apply to the same
 domain is rejected while a lease is pending. Confirmation is not idempotent, and
 any authorized deployer can confirm a known pending lease.
 
-A separate registry surface serves DHCP, DNS and device identity: `GetRegistry`,
+With the `dhcp` tag, a separate registry surface serves DHCP, DNS and device identity: `GetRegistry`,
 `GetSuggestions`, `ImportLeases`, `ImportObservations`, `ReportHost`,
 `RepairIdentity` and `DHCPHandover` (takeover, verification, history, and warm
-standby promotion). See [docs/dhcp.md](docs/dhcp.md). Beyond `firewall` and
-`netconfig`, the optional `dhcp-v1` and `mdns-v1` domains ride the same lease.
+standby promotion; `dnsmasq` adds the handover). See [docs/dhcp.md](docs/dhcp.md). Beyond `firewall` and
+`netconfig`, the optional `dhcp-v1` (`dhcp`) and `mdns-v1` (`mdns`) domains ride the same lease.
 
 A worked `grpcurl`/`jq` example, including the fresh-connection rule for
 confirmation, is in [docs/operations.md](docs/operations.md).

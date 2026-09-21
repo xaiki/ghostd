@@ -1,3 +1,5 @@
+//go:build dnsmasq && dhcp
+
 package addressbook
 
 import (
@@ -224,13 +226,6 @@ func (s *Store) saveHandover(j HandoverJournal) error {
 		}
 		return b.Put([]byte("handover"), raw)
 	})
-}
-func disabled(c Config) Config {
-	c = cloneConfig(c)
-	for i := range c.Scopes {
-		c.Scopes[i].Enabled = false
-	}
-	return c
 }
 func (h Handover) apply(c Config) error {
 	return h.Manager.Apply(c, func() error { return h.SaveConfig(c) })

@@ -11,7 +11,7 @@ cleanup() {
  rm -f "$binary"
 }
 trap cleanup EXIT HUP INT TERM
-GOOS=linux GOARCH="$arch" CGO_ENABLED=0 go test -c ./internal/addressbook -o "$binary"
+GOOS=linux GOARCH="$arch" CGO_ENABLED=0 go test -tags "dhcp dnsmasq coredns" -c ./internal/addressbook -o "$binary"
 podman build -t localhost/ghostd-dhcp-lab -f tests/dhcp-lab/Containerfile tests/dhcp-lab
 podman run --rm --privileged --network none --env GHOSTD_DHCP_LAB=1 \
  --volume "$binary:/lab/test:ro" localhost/ghostd-dhcp-lab:latest \

@@ -10,7 +10,7 @@ name=ghostd-integration-lab
 cleanup() { [ "${GHOSTD_E2E_KEEP:-}" = 1 ] || podman rm -f "$name" >/dev/null 2>&1 || true; rm -rf "$bin"; }
 trap cleanup EXIT HUP INT TERM
 for pkg in mdns:./internal/mdns resolver:./internal/resolver nft:./internal/nft main:./cmd/ghostd state:./internal/state netconfig:./internal/netconfig addressbook:./internal/addressbook; do
-	GOOS=linux GOARCH="$arch" CGO_ENABLED=0 go test -c -o "$bin/${pkg%%:*}.test" "${pkg#*:}"
+	GOOS=linux GOARCH="$arch" CGO_ENABLED=0 go test -tags "dhcp dnsmasq mdns coredns" -c -o "$bin/${pkg%%:*}.test" "${pkg#*:}"
 done
 podman build -q -t localhost/ghostd-dhcp-lab -f tests/dhcp-lab/Containerfile tests/dhcp-lab >/dev/null
 podman run -d --name "$name" --privileged --systemd=always --network none \

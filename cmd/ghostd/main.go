@@ -15,26 +15,20 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
-	"reflect"
 	"strings"
 	"time"
 
 	"google.golang.org/grpc"
 
-	"github.com/xaiki/ghostd/internal/addressbook"
 	"github.com/xaiki/ghostd/internal/auth"
-	"github.com/xaiki/ghostd/internal/mdns"
 	"github.com/xaiki/ghostd/internal/netconfig"
 	"github.com/xaiki/ghostd/internal/nft"
-	"github.com/xaiki/ghostd/internal/replica"
-	"github.com/xaiki/ghostd/internal/resolver"
 	"github.com/xaiki/ghostd/internal/rpc"
 	"github.com/xaiki/ghostd/internal/sdnotify"
 	"github.com/xaiki/ghostd/internal/state"
@@ -65,40 +59,26 @@ func main() {
 	tailscaleIface := flag.String("tailscale-interface", defaultTailscaleIface,
 		"the interface name Apply's reachability guard always keeps open to this daemon's own port (nft.ReachabilityGuard)")
 	watchdogSec := flag.Int("watchdog-sec", 0, "systemd WatchdogSec= value, in seconds (0 disables watchdog pinging)")
-	reportTo := flag.String("report-to", "", "report this host interfaces once to a tailnet DHCP authority and exit")
-	convertDNSmasq := flag.String("convert-dnsmasq", "", "preview: convert this dnsmasq config (following includes) to a dhcp-v1 handover plan and exit; touches nothing")
-	legacyUnit := flag.String("legacy-unit", "dnsmasq.service", "the dnsmasq unit --convert-dnsmasq records in the plan")
-	follow := flag.String("follow", "", "run as a warm standby of the ghostd authority at this tailnet host:port: mirror its ledger, serve nothing until promoted (DHCPHandover action \"promote\")")
-	mdnsInterfaces := flag.String("mdns-interfaces", "", "comma-separated LAN interfaces the native mDNS client queries (default: every up multicast interface)")
+	showFeatures := flag.Bool("features", false, "list the optional features compiled into this binary and exit")
+	for _, f := range features {
+		if f.flags != nil {
+			f.flags()
+		}
+	}
 	flag.Parse()
-	if *follow != "" {
-		standbyMode, followAddr = true, *follow
-	}
-	if *mdnsInterfaces != "" {
-		for _, name := range strings.Split(*mdnsInterfaces, ",") {
-			if name = strings.TrimSpace(name); name != "" {
-				mdnsIfaces = append(mdnsIfaces, name)
-			}
+	if *showFeatures {
+		fmt.Println("core: firewall, netconfig")
+		if names := builtFeatures(); len(names) > 0 {
+			fmt.Println("optional:", strings.Join(names, ", "))
+		} else {
+			fmt.Println("optional: none")
 		}
-	}
-	if *convertDNSmasq != "" {
-		plan, err := addressbook.ConvertDNSmasq(*convertDNSmasq, addressbook.ConvertOptions{Files: addressbook.OSFiles, Unit: *legacyUnit, Addrs: addressbook.InterfaceAddrs})
-		if err != nil {
-			log.Fatalf("ghostd: cannot convert %s: %v", *convertDNSmasq, err)
-		}
-		out, _ := json.MarshalIndent(plan, "", "  ")
-		fmt.Println(string(out))
 		return
 	}
-	if *reportTo != "" {
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-		defer cancel()
-		reply, err := reportHost(ctx, *reportTo)
-		if err != nil {
-			log.Fatal(err)
+	for _, f := range features {
+		if f.cli != nil && f.cli() {
+			return
 		}
-		fmt.Println(reply)
-		return
 	}
 	if *observeOnly && *revertLease != "" {
 		log.Fatal("--observe-only cannot be combined with --revert-lease")
@@ -148,31 +128,35 @@ func main() {
 // durable lease, so late callbacks cannot undo a newer or confirmed apply.
 func recoverDomain(store *state.Store, domain, leaseID string) error {
 	key := rpc.NftRuleset
-	if domain == "netconfig" {
+	hook, extra := hookFor(domain)
+	switch {
+	case domain == "firewall":
+	case domain == "netconfig":
 		key = rpc.NetconfigState
-	} else if domain == "dhcp-v1" {
-		key = addressbook.ConfigFile
-	} else if domain == "mdns-v1" {
-		key = mdns.ConfigFile
-	} else if domain != "firewall" {
-		return fmt.Errorf("unknown domain %q", domain)
+	case extra:
+		key = hook.key
+	default:
+		return fmt.Errorf("unknown domain %q (is its feature built into this binary?)", domain)
 	}
 	d, err := store.Domain(domain, key)
 	if err != nil {
 		return err
 	}
 	ctx := context.Background()
-	if d.Pending != nil && (leaseID == "" || d.Pending.ID == leaseID) {
-		if domain == "firewall" {
-			err = nft.Restore(ctx, nft.ExecRunner{}, d.Pending.Snapshot)
-		} else if domain == "dhcp-v1" {
-			err = restoreDHCPConfig(store, d.Pending.Snapshot)
-		} else if domain == "mdns-v1" {
-			err = restoreMDNSConfig(store, d.Pending.Snapshot)
-		} else {
-			err = netconfig.Rollback(ctx, netconfig.ExecRunner{}, d.Pending.Snapshot)
+	restore := func(snapshot []byte, rollback bool) error {
+		switch {
+		case domain == "firewall":
+			return nft.Restore(ctx, nft.ExecRunner{}, snapshot)
+		case extra:
+			return hook.restore(store, snapshot)
+		case rollback:
+			return netconfig.Rollback(ctx, netconfig.ExecRunner{}, snapshot)
+		default:
+			return netconfig.Restore(ctx, netconfig.ExecRunner{}, snapshot)
 		}
-		if err != nil {
+	}
+	if d.Pending != nil && (leaseID == "" || d.Pending.ID == leaseID) {
+		if err = restore(d.Pending.Snapshot, true); err != nil {
 			return err
 		}
 		d.Pending = nil
@@ -181,16 +165,7 @@ func recoverDomain(store *state.Store, domain, leaseID string) error {
 	if leaseID != "" {
 		return nil
 	}
-	if domain == "firewall" {
-		return nft.Restore(ctx, nft.ExecRunner{}, d.Confirmed)
-	}
-	if domain == "dhcp-v1" {
-		return restoreDHCPConfig(store, d.Confirmed)
-	}
-	if domain == "mdns-v1" {
-		return restoreMDNSConfig(store, d.Confirmed)
-	}
-	return netconfig.Restore(ctx, netconfig.ExecRunner{}, d.Confirmed)
+	return restore(d.Confirmed, false)
 }
 
 func runRevert(store *state.Store, leaseID, domain string) error {
@@ -202,12 +177,6 @@ func runRevert(store *state.Store, leaseID, domain string) error {
 	return recoverDomain(store, domain, leaseID)
 }
 
-// mdnsIfaces is set from --mdns-interfaces before the daemon starts.
-var mdnsIfaces []string
-
-// followAddr is the leader a warm standby mirrors (--follow).
-var followAddr string
-
 func runDaemon(store *state.Store, port int, deployerTag string, tailscaleIface string, watchdogSec int) error {
 	return runDaemonMode(store, port, deployerTag, tailscaleIface, watchdogSec, false)
 }
@@ -215,15 +184,12 @@ func runDaemon(store *state.Store, port int, deployerTag string, tailscaleIface 
 func runDaemonMode(store *state.Store, port int, deployerTag string, tailscaleIface string, watchdogSec int, observeOnly bool) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	if authority := os.Getenv("GHOSTD_IDENTITY_AUTHORITY"); authority != "" && !observeOnly {
-		go runReports(ctx, authority)
-	}
 
 	unlock, err := store.Lock()
 	if err != nil {
 		return err
 	}
-	for _, domain := range []string{"firewall", "netconfig", "dhcp-v1", "mdns-v1"} {
+	for _, domain := range allDomains() {
 		if err := prepareDomain(store, domain, observeOnly); err != nil {
 			unlock()
 			return fmt.Errorf("boot restore %s: %w", domain, err)
@@ -231,15 +197,24 @@ func runDaemonMode(store *state.Store, port int, deployerTag string, tailscaleIf
 	}
 	unlock()
 
-	manager, stopRegistry, err := startAddressbook(store, observeOnly)
-	if err != nil {
-		return fmt.Errorf("start address registry: %w", err)
-	}
-	defer stopRegistry()
 	tsLocal := &tsclient.Client{}
-	manager.SetPeerSource(func(ctx context.Context) ([]addressbook.Peer, error) { return tailnetPeers(ctx, tsLocal) })
-	// DHCP and authoritative LAN DNS stay available even if tailscaled is
-	// unavailable at boot. RPC/container DNS begin once its address is known.
+	env := &featureEnv{ctx: ctx, store: store, observeOnly: observeOnly, tsLocal: tsLocal, fatal: make(chan error, 4), shared: map[string]any{}}
+	var stops stopper
+	defer func() { stops.run() }()
+	if names := builtFeatures(); len(names) > 0 {
+		log.Printf("ghostd: optional features: %s", strings.Join(names, ", "))
+	}
+	// Boot phase: what must not wait for tailscaled.
+	for _, f := range features {
+		if f.boot == nil {
+			continue
+		}
+		stop, err := f.boot(env)
+		if err != nil {
+			return fmt.Errorf("%s: %w", f.name, err)
+		}
+		stops.add(stop)
+	}
 	if watchdogSec > 0 {
 		go petWatchdog(time.Duration(watchdogSec) * time.Second / watchdogFraction)
 	}
@@ -254,10 +229,10 @@ func runDaemonMode(store *state.Store, port int, deployerTag string, tailscaleIf
 		if err == nil {
 			break
 		}
-		log.Printf("ghostd: waiting for tailnet control transport; local DHCP/DNS remains available: %v", err)
+		log.Printf("ghostd: waiting for tailnet control transport: %v", err)
 		select {
-		case e := <-manager.Errors:
-			return fmt.Errorf("DHCP/DNS listener failed: %w", e)
+		case e := <-env.fatal:
+			return e
 		case <-time.After(5 * time.Second):
 		}
 	}
@@ -267,27 +242,20 @@ func runDaemonMode(store *state.Store, port int, deployerTag string, tailscaleIf
 	}
 	log.Printf("ghostd: listening on %s (tailnet-only)", listenAddr)
 	defer listener.Close()
-	dnsAddress, _, err := net.SplitHostPort(listenAddr)
-	if err != nil {
+	if env.dnsAddress, _, err = net.SplitHostPort(listenAddr); err != nil {
 		return err
 	}
-	aclRaw, err := store.Load(resolver.ACLFile)
-	if err != nil {
-		return err
+	// Serve phase: what needs the tailnet address (container DNS).
+	for _, f := range features {
+		if f.serve == nil {
+			continue
+		}
+		stop, err := f.serve(env)
+		if err != nil {
+			return fmt.Errorf("%s: %w", f.name, err)
+		}
+		stops.add(stop)
 	}
-	acl, err := resolver.ParseACL(aclRaw)
-	if err != nil {
-		return fmt.Errorf("%s: %w", resolver.ACLFile, err)
-	}
-	stopDNS, err := resolver.Start(dnsAddress, resolver.RuntimeDir, resolver.WithACL(acl), resolver.WithQuerier(&mdns.Querier{Interfaces: mdnsIfaces}))
-	if err != nil {
-		return fmt.Errorf("start container DNS: %w", err)
-	}
-	if len(acl.Identities) > 0 {
-		log.Printf("ghostd: DNS ACL: %d identities, each on its own listener", len(acl.Identities))
-	}
-	defer stopDNS()
-	log.Printf("ghostd: container DNS listening on %s:53 (tailnet-only)", dnsAddress)
 
 	exePath, err := os.Executable()
 	if err != nil {
@@ -297,20 +265,18 @@ func runDaemonMode(store *state.Store, port int, deployerTag string, tailscaleIf
 	authenticator := auth.NewAuthenticator(tsLocal, deployerTag)
 	guard := nft.ReachabilityGuard{TailscaleInterface: tailscaleIface, Port: port}
 	server := rpc.NewServer(authenticator, store, leases, nft.ExecRunner{}, netconfig.ExecRunner{}, guard)
-
 	server.ObserveOnly = observeOnly
-	server.DHCP = manager
-	if standbyMode && !observeOnly {
-		follower := &replica.Follower{Store: store, Manager: manager, Leader: followAddr}
-		server.Standby = follower
-		go follower.Run(ctx)
-		log.Printf("ghostd: warm standby of %s; serving nothing until promoted", followAddr)
-	}
-	if !observeOnly {
-		advertiser := mdns.NewService()
-		defer advertiser.Close()
-		server.MDNS = advertiser
-		go watchMDNS(ctx, store, advertiser)
+	env.server = server
+	// Attach phase: connect each feature to the RPC server.
+	for _, f := range features {
+		if f.attach == nil {
+			continue
+		}
+		stop, err := f.attach(env)
+		if err != nil {
+			return fmt.Errorf("%s: %w", f.name, err)
+		}
+		stops.add(stop)
 	}
 	grpcServer := grpc.NewServer()
 	pb.RegisterHostStateServer(grpcServer, server)
@@ -321,8 +287,8 @@ func runDaemonMode(store *state.Store, port int, deployerTag string, tailscaleIf
 	select {
 	case err := <-serving:
 		return err
-	case err := <-manager.Errors:
-		return fmt.Errorf("DHCP/DNS listener failed: %w", err)
+	case err := <-env.fatal:
+		return err
 	}
 }
 
@@ -362,10 +328,8 @@ func prepareDomain(store *state.Store, domain string, observeOnly bool) error {
 	key := rpc.NftRuleset
 	if domain == "netconfig" {
 		key = rpc.NetconfigState
-	} else if domain == "dhcp-v1" {
-		key = addressbook.ConfigFile
-	} else if domain == "mdns-v1" {
-		key = mdns.ConfigFile
+	} else if hook, ok := hookFor(domain); ok {
+		key = hook.key
 	}
 	d, err := store.Domain(domain, key)
 	if err != nil {
@@ -375,65 +339,4 @@ func prepareDomain(store *state.Store, domain string, observeOnly bool) error {
 		return fmt.Errorf("observation mode requires a fresh %s domain; managed state exists", domain)
 	}
 	return nil
-}
-
-// tailnetPeers reads the peer inventory from the local tailscaled. LAN
-// endpoints come from what tailscaled itself learned about direct paths.
-func tailnetPeers(ctx context.Context, client *tsclient.Client) ([]addressbook.Peer, error) {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	status, err := client.Status(ctx)
-	if err != nil {
-		return nil, err
-	}
-	var peers []addressbook.Peer
-	for _, p := range status.Peer {
-		peer := addressbook.Peer{ID: string(p.ID), DNSName: p.DNSName, HostName: p.HostName, Online: p.Online,
-			LANAddrs: addressbook.PrivateEndpoints(append([]string{p.CurAddr}, p.Addrs...)...)}
-		for _, a := range p.TailscaleIPs {
-			peer.Addresses = append(peer.Addresses, a.String())
-		}
-		peers = append(peers, peer)
-	}
-	return peers, nil
-}
-
-// restoreMDNSConfig makes the persisted advertisement match a confirmed or
-// snapshot state; the watcher below brings the running service to it.
-func restoreMDNSConfig(store *state.Store, raw []byte) error {
-	if _, err := mdns.ParseConfig(raw); err != nil {
-		return err
-	}
-	if len(raw) == 0 {
-		raw = []byte(`{}`)
-	}
-	return store.Save(mdns.ConfigFile, raw)
-}
-
-// watchMDNS converges the running advertisement on the persisted one: at boot,
-// after a rollback, and after a failed start (a port that was busy, an
-// interface that was not up yet). A start that fails is retried, never fatal.
-func watchMDNS(ctx context.Context, store *state.Store, svc *mdns.Service) {
-	tick := time.NewTicker(3 * time.Second)
-	defer tick.Stop()
-	for {
-		if unlock, err := store.Lock(); err == nil {
-			raw, lerr := store.Load(mdns.ConfigFile)
-			if lerr == nil {
-				if want, perr := mdns.ParseConfig(raw); perr != nil {
-					log.Printf("ghostd: %s: %v", mdns.ConfigFile, perr)
-				} else if !reflect.DeepEqual(want, svc.Config()) {
-					if err := svc.Apply(want); err != nil {
-						log.Printf("ghostd: mDNS advertisement not running: %v", err)
-					}
-				}
-			}
-			unlock()
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-tick.C:
-		}
-	}
 }

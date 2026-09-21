@@ -1,3 +1,5 @@
+//go:build dnsmasq && dhcp
+
 package addressbook
 
 import (

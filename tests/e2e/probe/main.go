@@ -552,6 +552,54 @@ func expiry() {
 	check(dhcp("client2") == strings.TrimSpace(string(addr2)), "no lease lost across two takeovers")
 }
 
+// minimalPhase checks a daemon built with no optional features: the core works,
+// and nothing else is present — not the code, not the domains, not the sockets.
+func minimalPhase() {
+	waitReady()
+	step("minimal build: no optional feature is compiled in")
+	out, err := sh("/opt/ghostd/ghostd", "--features")
+	check(err == nil && strings.Contains(out, "optional: none"), "--features reports none: %q", out)
+	step("minimal build: the core domains still work end to end")
+	lease, err := apply("firewall", fmt.Sprintf(firewallDoc, 8080), 60)
+	must(err, "apply firewall")
+	check(strings.Contains(nft(), "8080"), "firewall applied")
+	must(confirm(lease), "confirm firewall")
+	lease, err = apply("netconfig", `{"actions":[["sysctl","net.ipv4.ip_forward=1"]]}`, 60)
+	must(err, "apply netconfig")
+	must(confirm(lease), "confirm netconfig")
+	step("minimal build: optional domains and RPCs are refused, not half-present")
+	for _, domain := range []string{"dhcp-v1", "mdns-v1"} {
+		_, err = apply(domain, `{}`, 30)
+		check(err != nil && strings.Contains(err.Error(), "must be one of"), "%s is not an available domain (%v)", domain, err)
+	}
+	_, err = rpc(func(ctx context.Context, c pb.HostStateClient) (*pb.RegistryResponse, error) {
+		return c.GetRegistry(ctx, &pb.RegistryRequest{})
+	})
+	check(err != nil && strings.Contains(err.Error(), "Unimplemented"), "GetRegistry is unimplemented (%v)", err)
+	_, err = rpc(func(ctx context.Context, c pb.HostStateClient) (*pb.RegistryResponse, error) {
+		return c.DHCPHandover(ctx, &pb.RegistryDocument{Json: `{"action":"status"}`})
+	})
+	check(err != nil && strings.Contains(err.Error(), "Unimplemented"), "DHCPHandover is unimplemented (%v)", err)
+	step("minimal build: no DNS, DHCP or mDNS socket is open")
+	sockets, _ := sh("ss", "-lunpH")
+	for _, port := range []string{":53 ", ":67 ", ":547 ", ":5353 ", ":69 "} {
+		owned := false
+		for _, line := range strings.Split(sockets, "\n") {
+			if strings.Contains(line, "ghostd") && strings.Contains(line, port) {
+				owned = true
+			}
+		}
+		check(!owned, "ghostd holds no UDP %s", strings.TrimSpace(port))
+	}
+	tcp, _ := sh("ss", "-ltnpH")
+	check(!strings.Contains(tcp, ":53 "), "ghostd holds no TCP 53")
+	if _, err := os.Stat("/run/ghostd/dns.env"); err == nil {
+		check(false, "the container resolver published dns.env")
+	} else {
+		check(true, "no container resolver environment published")
+	}
+}
+
 func main() {
 	_ = net.IPv4len
 	if len(os.Args) < 2 {
@@ -567,6 +615,8 @@ func main() {
 		expiry()
 	case "dns":
 		dnsPhase()
+	case "minimal":
+		minimalPhase()
 	case "apply": // debugging aid: probe apply <domain> <seconds> <file>
 		raw, err := os.ReadFile(os.Args[4])
 		must(err, "read target")

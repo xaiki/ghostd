@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -41,8 +42,25 @@ func (s *Store) Lock() (func(), error) {
 	return func() { syscall.Flock(int(f.Fd()), syscall.LOCK_UN); f.Close() }, nil
 }
 
+var (
+	domainsMu sync.RWMutex
+	domains   = map[string]bool{"firewall": true, "netconfig": true}
+)
+
+// RegisterDomain admits a domain a compiled-in feature owns (dhcp-v1, mdns-v1).
+// A domain whose feature is not built in stays unknown, so a stray transaction
+// record for it can never be read or written.
+func RegisterDomain(name string) {
+	domainsMu.Lock()
+	domains[name] = true
+	domainsMu.Unlock()
+}
+
 func domainFile(domain string) (string, error) {
-	if domain != "firewall" && domain != "netconfig" && domain != "dhcp-v1" && domain != "mdns-v1" {
+	domainsMu.RLock()
+	known := domains[domain]
+	domainsMu.RUnlock()
+	if !known {
 		return "", fmt.Errorf("unknown domain %q", domain)
 	}
 	return domain + "-transaction.json", nil

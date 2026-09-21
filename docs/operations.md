@@ -149,11 +149,12 @@ binary until every pending lease has been confirmed or recovered.
 | `--watchdog-sec` | `0` | Watchdog interval; match systemd `WatchdogSec` |
 | `--observe-only` | false | Reject writes, skip boot restore; fresh hosts only |
 | `--render-firewall` | false | Render stdin JSON to nft syntax and exit |
-| `--report-to` | empty | Report this host's interfaces once to a DHCP authority, then exit |
-| `--convert-dnsmasq` | empty | Preview a dnsmasq config as a handover plan and exit; changes nothing |
-| `--legacy-unit` | `dnsmasq.service` | The unit `--convert-dnsmasq` records in the plan |
-| `--mdns-interfaces` | every up multicast interface | LAN interfaces the native mDNS client queries |
-| `--follow` | empty | Run as a warm standby of the authority at this host:port |
+| `--features` | false | List the optional features compiled into this binary and exit |
+| `--report-to` (`dhcp`) | empty | Report this host's interfaces once to a DHCP authority, then exit |
+| `--convert-dnsmasq` (`dnsmasq`) | empty | Preview a dnsmasq config as a handover plan and exit; changes nothing |
+| `--legacy-unit` (`dnsmasq`) | `dnsmasq.service` | The unit `--convert-dnsmasq` records in the plan |
+| `--mdns-interfaces` (`mdns`) | every up multicast interface | LAN interfaces the native mDNS client queries |
+| `--follow` (`dhcp`) | empty | Run as a warm standby of the authority at this host:port |
 | `--revert-lease`, `--revert-domain` | empty | Internal timer recovery command; not for interactive use |
 
 Use a systemd `ExecStart` override for different settings. Keep the daemon and
@@ -198,10 +199,11 @@ the tailnet identity that the daemon already resolves. Set it with a systemd
 ## Testing
 
 ```sh
-go test ./...
-go test -race ./...
-go vet ./...
+go test ./...                     # the core only; add -tags for optional features
+go test -race -tags "dhcp dnsmasq mdns coredns" ./...
+go vet -tags "dhcp dnsmasq mdns coredns" ./...
 gofmt -l .
+tests/tags.sh                     # every supported tag combination, and the default build's dependency isolation
 ```
 
 Unit tests use fake command runners and need no privileges. Privileged
@@ -240,6 +242,8 @@ Three container harnesses need Podman and never touch a real network:
 | --- | --- |
 | `tests/integration/run.sh` | The opt-in privileged suites above, plus the resolver ACL on loopback aliases |
 | `tests/dhcp-lab/run.sh` | The DHCP takeover, relay, RA/SLAAC, DHCPv6 timers and prefix delegation, against real dnsmasq and ISC clients (see [dhcp.md](dhcp.md)) |
+| `tests/tags.sh` | Every supported tag combination builds, vets and tests; the default build carries none of the optional dependencies; unsupported combinations do not compile |
+| `GHOSTD_TAGS="" GHOSTD_E2E_MODE=minimal tests/e2e/run.sh` | The core-only binary under systemd: core domains work, optional domains/RPCs are refused, and no DNS/DHCP/mDNS socket is open |
 | `tests/e2e/run.sh` | The **real ghostd binary under real systemd** with a fake tailscaled: firewall/netconfig apply, confirm, timer revert and crash recovery; a dnsmasq takeover through the RPC with the daemon killed mid-window; PXE/TFTP; native mDNS and the DNS ACL with avahi and python-zeroconf as third parties; peer suggestions; switch evidence; mDNS advertisement; and a container reboot |
 
 ## Regenerating the proto bindings

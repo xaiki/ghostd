@@ -19,7 +19,7 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 for cmd in ghostd:./cmd/ghostd fakets:./tests/e2e/fakets probe:./tests/e2e/probe; do
-	GOOS=linux GOARCH="$arch" CGO_ENABLED=0 go build -trimpath -o "$bin/${cmd%%:*}" "${cmd#*:}"
+	GOOS=linux GOARCH="$arch" CGO_ENABLED=0 go build -trimpath -tags "${GHOSTD_TAGS-dhcp dnsmasq mdns coredns}" -o "$bin/${cmd%%:*}" "${cmd#*:}"
 done
 cp tests/e2e/fixtures.sh tests/e2e/zc.py "$bin/"
 podman build -q -t localhost/ghostd-dhcp-lab -f tests/dhcp-lab/Containerfile tests/dhcp-lab >/dev/null
@@ -46,10 +46,20 @@ podman cp tests/e2e/avahi/avahi-printer.conf "$name:/etc/avahi/avahi-printer.con
 podman cp tests/e2e/avahi/ipp.service "$name:/etc/avahi/services/ipp.service"
 podman cp tests/e2e/avahi/cast.service "$name:/etc/avahi/services/cast.service"
 podman cp tests/e2e/dns-acl.json "$name:/var/lib/ghostd/last-good/dns-acl.json"
+if [ "${GHOSTD_E2E_MODE:-full}" = minimal ]; then
+	podman exec "$name" sed -i 's/ --mdns-interfaces=lab0//' /etc/systemd/system/ghostd.service
+fi
 podman exec "$name" sh -c 'systemctl disable --now dnsmasq.service avahi-daemon.service avahi-daemon.socket 2>/dev/null; systemctl mask avahi-daemon.service avahi-daemon.socket 2>/dev/null; mkdir -p /var/lib/misc; : > /var/lib/misc/e2e.leases; systemctl daemon-reload; systemctl enable --now lab-fixtures.service fakets.service ghostd.service avahi-printer.service'
 
+# GHOSTD_E2E_MODE=minimal builds with no optional features (GHOSTD_TAGS="") and
+# checks that a host gets only the core: no DHCP, DNS or mDNS anywhere.
 run() { podman exec "$name" /opt/ghostd/probe "$1"; }
 fail() { podman exec "$name" journalctl -u ghostd.service -n 60 --no-pager >&2 || true; exit 1; }
+if [ "${GHOSTD_E2E_MODE:-full}" = minimal ]; then
+	run minimal || fail
+	echo; echo "e2e minimal-host check passed"
+	exit 0
+fi
 run pre || fail
 run dns || fail
 echo; echo "=== rebooting the container (systemd restart, /run cleared)"

@@ -1,4 +1,4 @@
-//go:build linux
+//go:build dnsmasq && dhcp && linux
 
 package addressbook
 

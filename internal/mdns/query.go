@@ -1,3 +1,5 @@
+//go:build mdns
+
 // Package mdns is ghostd's query-side multicast DNS client. It sends legacy
 // unicast queries (RFC 6762 section 6.7) from an ephemeral port, so it never
 // binds UDP 5353 and never has to share it with another mDNS daemon: replies

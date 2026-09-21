@@ -1,3 +1,5 @@
+//go:build dhcp
+
 package rpc
 
 import (
@@ -6,27 +8,48 @@ import (
 	"fmt"
 	"io"
 	"strings"
-	"time"
 
 	"github.com/xaiki/ghostd/internal/addressbook"
-	"github.com/xaiki/ghostd/internal/mdns"
 	pb "github.com/xaiki/ghostd/proto"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
 const domainDHCP = "dhcp-v1"
-const domainMDNS = "mdns-v1"
+
+// dhcpState is the dhcp feature's part of Server.
+type dhcpState struct {
+	DHCP *addressbook.Manager
+	// Standby, when set, makes this daemon a warm standby (internal/replica).
+	Standby StandbyControl
+}
+
+func init() {
+	registerDomain(domainDHCP, domainImpl{
+		configKey: addressbook.ConfigFile,
+		apply:     (*Server).applyDHCP,
+		restore:   (*Server).restoreDHCP,
+	})
+	registerStateExtender(func(s *Server, out *pb.State) error {
+		if s.DHCP == nil {
+			return nil
+		}
+		raw, err := json.Marshal(s.DHCP.Config())
+		if err != nil {
+			return err
+		}
+		out.DhcpConfigJson = string(raw)
+		return nil
+	})
+}
 
 func (s *Server) applyDHCP(ctx context.Context, req *pb.ApplyRequest) (*pb.ApplyResponse, error) {
 	if s.DHCP == nil {
 		return nil, status.Error(codes.Unimplemented, "DHCP registry unavailable")
 	}
-	journal, journalErr := s.DHCP.Store.HandoverJournal()
-	if journalErr != nil {
-		return nil, journalErr
-	}
-	if journal.Phase != "" && journal.Phase != "confirmed" && journal.Phase != "rolled-back" {
+	if pending, err := s.handoverPending(); err != nil {
+		return nil, err
+	} else if pending {
 		return nil, status.Error(codes.FailedPrecondition, "finish or roll back pending DHCP handover before changing configuration")
 	}
 	desired, err := addressbook.ParseConfig([]byte(req.GetDesiredStateJson()))
@@ -201,106 +224,6 @@ func (s *Server) RepairIdentity(ctx context.Context, req *pb.RegistryDocument) (
 	}
 	return document(map[string]bool{"repaired": true})
 }
-func (s *Server) DHCPHandover(ctx context.Context, req *pb.RegistryDocument) (*pb.RegistryResponse, error) {
-	var request struct {
-		Action  string                 `json:"action"`
-		Target  addressbook.Config     `json:"target"`
-		Legacy  addressbook.LegacySpec `json:"legacy"`
-		Seconds int                    `json:"seconds"`
-		// RequireEvidence makes confirmation wait for observed client
-		// renewal and fresh allocation in every enabled scope.
-		RequireEvidence bool `json:"require_evidence"`
-		// Force promotes a standby although the leader still answers.
-		Force bool `json:"force"`
-	}
-	if e := decodeDocument(req.GetJson(), &request); e != nil {
-		return nil, status.Error(codes.InvalidArgument, e.Error())
-	}
-	standbyAction := request.Action == "promote" || request.Action == "standby-status"
-	if e := s.registryAuthMode(ctx, request.Action != "status" && request.Action != "history" && request.Action != "standby-status", standbyAction); e != nil {
-		return nil, e
-	}
-	unlock, e := s.store.Lock()
-	if e != nil {
-		return nil, e
-	}
-	defer unlock()
-	if request.Action == "begin" {
-		if e = s.recoverExpired(ctx, domainDHCP); e != nil {
-			return nil, e
-		}
-	}
-	switch request.Action {
-	case "standby-status":
-		if s.Standby == nil {
-			return nil, status.Error(codes.FailedPrecondition, "this daemon is not a standby")
-		}
-		return document(s.Standby.Status())
-	case "promote":
-		if s.Standby == nil {
-			return nil, status.Error(codes.FailedPrecondition, "this daemon is not a standby")
-		}
-		if !s.DHCP.Standby() {
-			return nil, status.Error(codes.FailedPrecondition, "already promoted")
-		}
-		if !request.Force && s.Standby.LeaderAlive(ctx) {
-			return nil, status.Error(codes.FailedPrecondition, "the leader still answers: stop or fence it first (two authorities would hand out the same addresses), or promote with force")
-		}
-		if e := s.Standby.Promote(ctx); e != nil {
-			return nil, status.Error(codes.FailedPrecondition, e.Error())
-		}
-		return document(map[string]bool{"promoted": true})
-	}
-	j, e := s.DHCP.Store.HandoverJournal()
-	if e != nil {
-		return nil, e
-	}
-	spec := j.Legacy
-	if request.Action == "begin" {
-		spec = request.Legacy
-	}
-	var legacy addressbook.LegacyAuthority = addressbook.SystemDNSmasq{Spec: spec}
-	if s.Legacy != nil {
-		legacy = s.Legacy(spec)
-	}
-	handover := addressbook.Handover{Manager: s.DHCP, Legacy: legacy, SaveConfig: func(c addressbook.Config) error {
-		raw, e := json.Marshal(c)
-		if e != nil {
-			return e
-		}
-		return s.store.SaveExternallyManagedConfig(domainDHCP, addressbook.ConfigFile, raw)
-	}, RequireEvidence: request.RequireEvidence}
-	switch request.Action {
-	case "status":
-		st, e := handover.Status()
-		if e != nil {
-			return nil, e
-		}
-		return document(st)
-	case "history":
-		history, e := s.DHCP.Store.HandoverHistory()
-		if e != nil {
-			return nil, e
-		}
-		return document(history)
-	case "begin":
-		e = handover.Begin(request.Target, spec, time.Duration(request.Seconds)*time.Second)
-	case "confirm":
-		e = handover.Confirm()
-	case "rollback":
-		e = handover.Rollback()
-	default:
-		return nil, status.Error(codes.InvalidArgument, "unknown handover action")
-	}
-	if e != nil {
-		return nil, status.Error(codes.FailedPrecondition, e.Error())
-	}
-	j, e = s.DHCP.Store.HandoverJournal()
-	if e != nil {
-		return nil, e
-	}
-	return document(j)
-}
 
 // ImportObservations records switch evidence (DHCP snooping, MAC tables). It
 // is a deployer call: the exporter describes what it saw, and the ledger keeps
@@ -342,49 +265,49 @@ func (s *Server) GetSuggestions(ctx context.Context, _ *pb.RegistryRequest) (*pb
 	return document(suggestions)
 }
 
-// applyMDNS moves the advertised record set behind the ordinary lease: a bad
-// record set, a bound port or a name another host already owns leaves the old
-// set running, and an unconfirmed change reverts.
-func (s *Server) applyMDNS(ctx context.Context, req *pb.ApplyRequest) (*pb.ApplyResponse, error) {
-	if s.MDNS == nil {
-		return nil, status.Error(codes.Unimplemented, "mDNS advertisement unavailable")
+// DHCPHandover routes the authority-transition actions: warm-standby promotion
+// here, and (when the dnsmasq feature is built in) takeover from a legacy
+// allocator in handoverAction.
+func (s *Server) DHCPHandover(ctx context.Context, req *pb.RegistryDocument) (*pb.RegistryResponse, error) {
+	var head struct {
+		Action string `json:"action"`
+		Force  bool   `json:"force"`
 	}
-	desired, err := mdns.ParseConfig([]byte(req.GetDesiredStateJson()))
-	if err != nil {
-		return nil, status.Error(codes.InvalidArgument, err.Error())
+	if e := json.Unmarshal([]byte(req.GetJson()), &head); e != nil {
+		return nil, status.Error(codes.InvalidArgument, e.Error())
 	}
-	if err = s.recoverExpired(ctx, domainMDNS); err != nil {
-		return nil, err
+	if head.Action != "promote" && head.Action != "standby-status" {
+		return s.handoverAction(ctx, req)
 	}
-	snapshot, err := json.Marshal(s.MDNS.Config())
-	if err != nil {
-		return nil, err
+	if e := s.registryAuthMode(ctx, head.Action == "promote", true); e != nil {
+		return nil, e
 	}
-	lease, err := s.begin(ctx, req, snapshot)
-	if err != nil {
-		return nil, err
+	unlock, e := s.store.Lock()
+	if e != nil {
+		return nil, e
 	}
-	if err = s.MDNS.Apply(desired); err != nil {
-		return nil, status.Errorf(codes.FailedPrecondition, "mDNS apply failed; configuration rollback remains armed: %v", err)
+	defer unlock()
+	if s.Standby == nil {
+		return nil, status.Error(codes.FailedPrecondition, "this daemon is not a standby")
 	}
-	if err = s.store.Save(mdns.ConfigFile, []byte(req.GetDesiredStateJson())); err != nil {
-		return nil, status.Errorf(codes.Internal, "%v (rollback stays armed)", err)
+	if head.Action == "standby-status" {
+		return document(s.Standby.Status())
 	}
-	return s.finishApply(ctx, domainMDNS, lease)
+	if !s.DHCP.Standby() {
+		return nil, status.Error(codes.FailedPrecondition, "already promoted")
+	}
+	if !head.Force && s.Standby.LeaderAlive(ctx) {
+		return nil, status.Error(codes.FailedPrecondition, "the leader still answers: stop or fence it first (two authorities would hand out the same addresses), or promote with force")
+	}
+	if e := s.Standby.Promote(ctx); e != nil {
+		return nil, status.Error(codes.FailedPrecondition, e.Error())
+	}
+	return document(map[string]bool{"promoted": true})
 }
-func (s *Server) restoreMDNS(raw []byte) error {
-	if s.MDNS == nil {
-		return fmt.Errorf("mDNS service unavailable")
-	}
-	cfg, err := mdns.ParseConfig(raw)
-	if err != nil {
-		return err
-	}
-	if err = s.MDNS.Apply(cfg); err != nil {
-		return err
-	}
-	if len(raw) == 0 {
-		raw = []byte(`{}`)
-	}
-	return s.store.Save(mdns.ConfigFile, raw)
+
+// StandbyControl is what the RPC layer needs from a warm standby.
+type StandbyControl interface {
+	LeaderAlive(ctx context.Context) bool
+	Promote(ctx context.Context) error
+	Status() any
 }

@@ -1,3 +1,5 @@
+//go:build dhcp
+
 // Package replica runs a ghostd as a warm standby of another: it mirrors the
 // authority's DHCP/identity ledger and configuration over the tailnet, holds
 // every scope disabled while it does, and can be promoted — deliberately, and

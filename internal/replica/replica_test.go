@@ -1,3 +1,5 @@
+//go:build dhcp
+
 package replica
 
 import (

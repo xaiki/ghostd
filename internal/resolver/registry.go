@@ -1,3 +1,5 @@
+//go:build coredns && dhcp
+
 package resolver
 
 import (
@@ -16,6 +18,16 @@ var registry atomic.Pointer[addressbook.Manager]
 
 func SetRegistry(m *addressbook.Manager) { registry.Store(m) }
 func init() {
+	// The dhcp feature adds authoritative lease answers ahead of the cache.
+	leaseDirective = " ghostleases\n"
+	var ds []string
+	for _, d := range dnsserver.Directives {
+		ds = append(ds, d)
+		if d == "ghostacl" {
+			ds = append(ds, "ghostleases")
+		}
+	}
+	dnsserver.Directives = ds
 	plugin.Register("ghostleases", func(c *caddy.Controller) error {
 		for c.Next() {
 			if len(c.RemainingArgs()) != 0 {

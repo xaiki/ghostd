@@ -1,3 +1,5 @@
+//go:build dhcp
+
 package addressbook
 
 import (
@@ -193,10 +195,7 @@ func TestDelegationIsAttributedToTheRoutersDevice(t *testing.T) {
 	if got, _ := s.DNSBindings("v6", prefix.Name, ""); len(got) > 1 {
 		t.Fatal("delegation published in DNS")
 	}
-	text, err := ExportDNSmasq(snap)
-	if err != nil || strings.Contains(text, "fd78") {
-		t.Fatalf("delegation exported to a dnsmasq lease file: %v\n%s", err, text)
-	}
+	checkNoDelegationExport(t, snap)
 	m := NewManager(s)
 	defer m.Close()
 	if e := m.Apply(disabled(c), func() error { return nil }); e != nil {

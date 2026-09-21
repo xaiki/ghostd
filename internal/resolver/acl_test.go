@@ -1,3 +1,5 @@
+//go:build coredns
+
 package resolver
 
 import (

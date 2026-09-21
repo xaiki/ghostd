@@ -1,5 +1,12 @@
 # DHCP, DNS and device identity
 
+> **Build tags.** Everything here is optional and compiled in by tag: the DHCP
+> server, authoritative DNS, identity ledger, prefix delegation, TFTP and warm
+> standby need `dhcp` (which requires `coredns`); the dnsmasq takeover, converter
+> and verification need `dnsmasq`; native `.local`/DNS-SD needs `mdns`; the
+> per-container DNS ACL needs `coredns`. See the README's Build section. A binary
+> without a tag has neither the code nor the RPCs, flags or sockets.
+
 The optional `dhcp-v1` domain serves explicitly declared IPv4 and IPv6 scopes with
 authoritative DNS and a durable lease, identity and event ledger. It embeds
 CoreDHCP for the DHCP side and CoreDNS for authoritative lease DNS and local-name

@@ -2,6 +2,8 @@ package state
 
 import "testing"
 
+func init() { RegisterDomain("dhcp-v1") }
+
 func TestExternalConfigUpdatesBootRestoreWithoutOverridingPendingLease(t *testing.T) {
 	s, err := NewStore(t.TempDir())
 	if err != nil {

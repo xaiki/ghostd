@@ -1,3 +1,5 @@
+//go:build dhcp
+
 package addressbook
 
 import (
@@ -73,33 +75,5 @@ func TestDHCP6Lifecycle(t *testing.T) {
 	snap, _ := s.Snapshot("", "", 0)
 	if snap.Bindings[0].State != "released" {
 		t.Fatal(snap)
-	}
-}
-func TestV6DNSmasqImportIdentityAndRollback(t *testing.T) {
-	s := openTest(t)
-	c := disabled(config6())
-	text := "duid 00:03:00:01:00:11:22:33:44:55\n0 4294967295 fd00::6 host 00:03:00:01:00:11:22:33:44:66\n"
-	doc, e := ParseDNSmasq(c, text)
-	if e != nil {
-		t.Fatal(e)
-	}
-	if e = s.ImportDocument(c, doc); e != nil {
-		t.Fatal(e)
-	}
-	snap, _ := s.Snapshot("", "", 0)
-	if snap.Bindings[0].IAID != "ffffffff" || snap.Bindings[0].End != 253402300799 {
-		t.Fatal(snap)
-	}
-	exported, e := ExportDNSmasq(snap)
-	if e != nil {
-		t.Fatal(e)
-	}
-	round, e := ParseDNSmasq(c, exported)
-	if e != nil || round.ServerDUID != doc.ServerDUID || round.Leases[0].DUID != doc.Leases[0].DUID {
-		t.Fatal(round, e)
-	}
-	doc.ServerDUID = "00030001001122334477"
-	if e = s.ImportDocument(c, doc); e == nil {
-		t.Fatal("server identity changed under existing grants")
 	}
 }

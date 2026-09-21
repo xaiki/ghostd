@@ -1,12 +1,17 @@
+//go:build dhcp
+
 package main
 
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"flag"
 	"fmt"
+	"github.com/xaiki/ghostd/internal/replica"
 	"log"
+	"os"
 	"path/filepath"
+	tsclient "tailscale.com/client/local"
 	"time"
 
 	"github.com/xaiki/ghostd/internal/addressbook"
@@ -24,33 +29,21 @@ func restoreDHCPConfig(store *state.Store, raw []byte) error {
 	return store.Save(addressbook.ConfigFile, raw)
 }
 
-// newLegacy builds the legacy authority; tests replace it to avoid systemd.
-var newLegacy = func(spec addressbook.LegacySpec) addressbook.LegacyAuthority {
-	return addressbook.SystemDNSmasq{Spec: spec}
-}
-
-// recoverHandover rolls back an interrupted, or (with force) any unconfirmed,
-// dnsmasq takeover. The caller holds the store lock.
-func recoverHandover(store *state.Store, manager *addressbook.Manager, force bool) error {
-	journal, err := manager.Store.HandoverJournal()
-	if err != nil || journal.Phase == "" {
-		return err
-	}
-	handover := addressbook.Handover{Manager: manager, Legacy: newLegacy(journal.Legacy), SaveConfig: func(c addressbook.Config) error {
-		data, e := json.Marshal(c)
-		if e != nil {
-			return e
-		}
-		return store.SaveExternallyManagedConfig("dhcp-v1", addressbook.ConfigFile, data)
-	}}
-	if force && journal.Phase == "pending" {
-		return handover.Rollback()
-	}
-	return handover.Recover()
-}
-
 // standbyMode is set from --follow before the daemon starts.
 var standbyMode bool
+
+// handoverRecovery rolls back an interrupted, or (force) any unconfirmed,
+// takeover from a legacy allocator; it is set by the dnsmasq feature and nil
+// otherwise. rolledBack reports that the journal ended in "rolled-back". The
+// caller holds the store lock.
+var handoverRecovery func(store *state.Store, manager *addressbook.Manager, force bool) (rolledBack bool, err error)
+
+func recoverHandover(store *state.Store, manager *addressbook.Manager, force bool) (bool, error) {
+	if handoverRecovery == nil {
+		return false, nil
+	}
+	return handoverRecovery(store, manager, force)
+}
 
 func startAddressbook(store *state.Store, observeOnly bool) (*addressbook.Manager, func(), error) {
 	db, err := addressbook.Open(filepath.Join(store.Dir(), "addressbook.db"))
@@ -89,7 +82,7 @@ func startAddressbook(store *state.Store, observeOnly bool) (*addressbook.Manage
 		}
 		// A failing rollback stays journaled and is retried by the watcher below;
 		// it must not keep the RPC surface (the operator's repair path) down.
-		if recoverErr := recoverHandover(store, manager, false); recoverErr != nil {
+		if _, recoverErr := recoverHandover(store, manager, false); recoverErr != nil {
 			log.Printf("ghostd: handover recovery pending: %v", recoverErr)
 		}
 		raw, err = store.Load(addressbook.ConfigFile)
@@ -99,9 +92,9 @@ func startAddressbook(store *state.Store, observeOnly bool) (*addressbook.Manage
 		if err == nil {
 			if err = manager.Apply(config, func() error { return nil }); err != nil {
 				log.Printf("ghostd: DHCP configuration cannot start (%v); rolling back any pending takeover", err)
-				if recoverErr := recoverHandover(store, manager, true); recoverErr != nil {
+				if rolledBack, recoverErr := recoverHandover(store, manager, true); recoverErr != nil {
 					err = fmt.Errorf("%w; handover rollback: %v", err, recoverErr)
-				} else if journal, jerr := db.HandoverJournal(); jerr == nil && journal.Phase == "rolled-back" {
+				} else if rolledBack {
 					if raw, err = store.Load(addressbook.ConfigFile); err == nil {
 						if config, err = addressbook.ParseConfig(raw); err == nil {
 							err = manager.Apply(config, func() error { return nil })
@@ -140,7 +133,7 @@ func startAddressbook(store *state.Store, observeOnly bool) (*addressbook.Manage
 					log.Printf("ghostd DHCP reload lock: %v", err)
 					continue
 				}
-				recoveryErr := recoverHandover(store, manager, false)
+				_, recoveryErr := recoverHandover(store, manager, false)
 				if recoveryErr != nil {
 					log.Printf("ghostd handover recovery pending: %v", recoveryErr)
 				}
@@ -179,4 +172,92 @@ func startAddressbook(store *state.Store, observeOnly bool) (*addressbook.Manage
 		}
 	}()
 	return manager, func() { cancel(); <-done; resolver.SetRegistry(nil); manager.Close(); db.Close() }, nil
+}
+
+var (
+	reportTo   *string
+	followFlag *string
+)
+
+func init() {
+	registerDomainHook(domainHook{name: "dhcp-v1", key: addressbook.ConfigFile, restore: restoreDHCPConfig})
+	register(feature{
+		name: "dhcp",
+		flags: func() {
+			reportTo = flag.String("report-to", "", "report this host interfaces once to a tailnet DHCP authority and exit")
+			followFlag = flag.String("follow", "", "run as a warm standby of the ghostd authority at this tailnet host:port: mirror its ledger, serve nothing until promoted (DHCPHandover action \"promote\")")
+		},
+		cli: func() bool {
+			if *followFlag != "" {
+				standbyMode, followAddr = true, *followFlag
+			}
+			if *reportTo == "" {
+				return false
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			reply, err := reportHost(ctx, *reportTo)
+			if err != nil {
+				log.Fatal(err)
+			}
+			fmt.Println(reply)
+			return true
+		},
+		// DHCP and authoritative LAN DNS stay available even if tailscaled is
+		// unavailable at boot, so the registry starts before the tailnet wait.
+		boot: func(env *featureEnv) (func(), error) {
+			manager, stop, err := startAddressbook(env.store, env.observeOnly)
+			if err != nil {
+				return nil, fmt.Errorf("start address registry: %w", err)
+			}
+			env.shared["dhcp.manager"] = manager
+			go func() {
+				select {
+				case e := <-manager.Errors:
+					env.fatal <- fmt.Errorf("DHCP/DNS listener failed: %w", e)
+				case <-env.ctx.Done():
+				}
+			}()
+			return stop, nil
+		},
+		attach: func(env *featureEnv) (func(), error) {
+			manager := env.shared["dhcp.manager"].(*addressbook.Manager)
+			env.server.DHCP = manager
+			manager.SetPeerSource(func(ctx context.Context) ([]addressbook.Peer, error) { return tailnetPeers(ctx, env.tsLocal) })
+			if authority := os.Getenv("GHOSTD_IDENTITY_AUTHORITY"); authority != "" && !env.observeOnly {
+				go runReports(env.ctx, authority)
+			}
+			if standbyMode && !env.observeOnly {
+				follower := &replica.Follower{Store: env.store, Manager: manager, Leader: followAddr}
+				env.server.Standby = follower
+				go follower.Run(env.ctx)
+				log.Printf("ghostd: warm standby of %s; serving nothing until promoted", followAddr)
+			}
+			return nil, nil
+		},
+	})
+}
+
+// followAddr is the leader a warm standby mirrors (--follow).
+var followAddr string
+
+// tailnetPeers reads the peer inventory from the local tailscaled. LAN
+// endpoints come from what tailscaled itself learned about direct paths.
+func tailnetPeers(ctx context.Context, client *tsclient.Client) ([]addressbook.Peer, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	status, err := client.Status(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var peers []addressbook.Peer
+	for _, p := range status.Peer {
+		peer := addressbook.Peer{ID: string(p.ID), DNSName: p.DNSName, HostName: p.HostName, Online: p.Online,
+			LANAddrs: addressbook.PrivateEndpoints(append([]string{p.CurAddr}, p.Addrs...)...)}
+		for _, a := range p.TailscaleIPs {
+			peer.Addresses = append(peer.Addresses, a.String())
+		}
+		peers = append(peers, peer)
+	}
+	return peers, nil
 }

@@ -1,5 +1,8 @@
 # LAN discovery on behalf of containers — design
 
+Build tags: `mdns` (native client, `mdns-v1`) and `coredns` (container resolver,
+ACL); the two together give containers native `.local`.
+
 Status: **built, except the multicast reflector — which the design rules out.** The
 decisions this document left open are settled in [What was decided and built](#what-was-decided-and-built)
 below; the analysis after it is kept because it is why those decisions were made.

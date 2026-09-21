@@ -1,3 +1,5 @@
+//go:build dhcp
+
 package addressbook
 
 import "github.com/coredhcp/coredhcp/config"

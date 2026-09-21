@@ -3,11 +3,17 @@
 ## Build and test
 
 ```sh
-go build ./...
-go vet ./...
-gofmt -l .          # must print nothing
-go test -race ./...
+tests/tags.sh                                          # every supported feature combination
+go vet -tags "dhcp dnsmasq mdns coredns" ./...
+gofmt -l .                                             # must print nothing
+go test -race -tags "dhcp dnsmasq mdns coredns" ./...
 ```
+
+Optional features (`coredns`, `dhcp`, `dnsmasq`, `mdns`) are build tags; the
+default build is the core only and must stay free of their dependencies. A new
+optional part lives behind its tag with a `!tag` stub only where the core needs a
+type to exist, registers itself from `init()` (`cmd/ghostd/feature.go`,
+`internal/rpc/features.go`), and gets a row in `tests/tags.sh`.
 
 Unit tests use fake command runners and need no privileges. Privileged
 integration tests are opt-in behind environment variables and belong in a

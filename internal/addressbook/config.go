@@ -1,3 +1,5 @@
+//go:build dhcp
+
 // Package addressbook owns scoped address allocations and device attribution.
 // Configuration can be reverted independently of the durable allocation ledger.
 package addressbook
@@ -377,3 +379,11 @@ func (d DeviceConfig) HasAlias(name string) bool {
 }
 
 func jsonMarshal(v any) ([]byte, error) { return json.Marshal(v) }
+
+func disabled(c Config) Config {
+	c = cloneConfig(c)
+	for i := range c.Scopes {
+		c.Scopes[i].Enabled = false
+	}
+	return c
+}

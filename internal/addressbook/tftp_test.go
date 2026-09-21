@@ -1,3 +1,5 @@
+//go:build dhcp
+
 package addressbook
 
 import (
@@ -139,33 +141,5 @@ func TestBootAndTFTPConfigValidation(t *testing.T) {
 	cl.TFTP.Root = "/other"
 	if ok.Scopes[0].Boot.File != "pxe.bin" || ok.TFTP.Root != "/srv/tftp" {
 		t.Fatal("clone aliases boot/tftp")
-	}
-}
-
-func TestConvertCarriesBootAndTFTP(t *testing.T) {
-	conf := baseConf + "dhcp-boot=pxelinux.0\nenable-tftp\ntftp-root=/srv/tftp\n"
-	plan, err := convert(t, conf, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if b := plan.Target.Scopes[0].Boot; b == nil || b.File != "pxelinux.0" || b.NextServer != "" || plan.Target.TFTP == nil || plan.Target.TFTP.Root != "/srv/tftp" {
-		t.Fatal(plan.Target)
-	}
-	plan, err = convert(t, baseConf+"dhcp-boot=lpxelinux.0,,192.0.2.9\n", nil) // file,servername,address
-	if err != nil || plan.Target.Scopes[0].Boot.NextServer != "192.0.2.9" {
-		t.Fatal(err)
-	}
-	plan, err = convert(t, baseConf+"dhcp-boot=lpxelinux.0,192.0.2.9\n", nil)
-	if err != nil || plan.Target.Scopes[0].Boot.NextServer != "192.0.2.9" {
-		t.Fatal(err, plan.Target.Scopes[0].Boot)
-	}
-	for name, bad := range map[string]string{
-		"tftp without root": baseConf + "enable-tftp\n",
-		"interface tftp":    baseConf + "enable-tftp=eth0\ntftp-root=/srv\n",
-		"tagged boot":       baseConf + "dhcp-boot=tag:pxe,pxelinux.0\n",
-	} {
-		if _, err := convert(t, bad, nil); err == nil {
-			t.Errorf("%s accepted", name)
-		}
 	}
 }

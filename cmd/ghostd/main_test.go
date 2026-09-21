@@ -3,8 +3,6 @@ package main
 import (
 	"context"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -98,15 +96,5 @@ func TestObservationBootDoesNotRestoreOrAbandonManagedState(t *testing.T) {
 		if err := prepareDomain(store, domain, true); err == nil {
 			t.Fatal("pending rollback accepted in observation mode")
 		}
-	}
-}
-
-func TestConvertDNSmasqFlagIsPreviewOnly(t *testing.T) {
-	dir := t.TempDir()
-	conf := filepath.Join(dir, "dnsmasq.conf")
-	os.WriteFile(conf, []byte("interface=lo\ndomain=home.arpa\ndhcp-leasefile=/var/lib/misc/x.leases\ndhcp-range=127.0.0.10,127.0.0.20,255.0.0.0,1h\nunknown-thing=1\n"), 0600)
-	out, err := exec.Command("go", "run", ".", "--convert-dnsmasq="+conf).CombinedOutput()
-	if err == nil || !strings.Contains(string(out), "needs explicit conversion") {
-		t.Fatalf("unsupported semantics must be refused with an explanation: %v\n%s", err, out)
 	}
 }

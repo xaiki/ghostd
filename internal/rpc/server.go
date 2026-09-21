@@ -10,9 +10,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/xaiki/ghostd/internal/addressbook"
 	"github.com/xaiki/ghostd/internal/auth"
-	"github.com/xaiki/ghostd/internal/mdns"
 	"github.com/xaiki/ghostd/internal/netconfig"
 	"github.com/xaiki/ghostd/internal/nft"
 	"github.com/xaiki/ghostd/internal/observation"
@@ -40,14 +38,10 @@ const (
 type Server struct {
 	// ObserveOnly rejects every mutation RPC, independently of authorization.
 	ObserveOnly bool
-	DHCP        *addressbook.Manager
-	// Standby, when set, makes this daemon a warm standby (internal/replica).
-	Standby StandbyControl
-	// MDNS advertises the mdns-v1 record set; nil disables the domain.
-	MDNS *mdns.Service
-	// Legacy builds the allocator being replaced by a handover; nil means the
-	// real systemd-managed dnsmasq. Tests substitute a fake.
-	Legacy func(addressbook.LegacySpec) addressbook.LegacyAuthority
+	// Optional features' parts of the server (empty types when not built in).
+	dhcpState
+	dnsmasqState
+	mdnsState
 	pb.UnimplementedHostStateServer
 
 	authenticator   *auth.Authenticator
@@ -96,12 +90,10 @@ func (s *Server) GetState(ctx context.Context, req *pb.GetStateRequest) (*pb.Sta
 		return nil, status.Errorf(codes.Internal, "%v", err)
 	}
 	response := &pb.State{NftRulesetJson: ruleset, NetconfigJson: netconfigJSON}
-	if s.DHCP != nil {
-		raw, err := json.Marshal(s.DHCP.Config())
-		if err != nil {
-			return nil, err
+	for _, extend := range stateExtenders {
+		if err := extend(s, response); err != nil {
+			return nil, status.Errorf(codes.Internal, "%v", err)
 		}
-		response.DhcpConfigJson = string(raw)
 	}
 	if req.GetIncludeAdoptionEvidence() {
 		evidence := observation.Capture(ctx, s.netconfigRunner)
@@ -153,15 +145,15 @@ func (s *Server) Apply(ctx context.Context, req *pb.ApplyRequest) (*pb.ApplyResp
 		return s.applyFirewall(ctx, normalized)
 	case domainFirewall:
 		return s.applyFirewall(ctx, req)
-	case domainDHCP:
-		return s.applyDHCP(ctx, req)
-	case domainMDNS:
-		return s.applyMDNS(ctx, req)
 	case domainNetconfig:
 		return s.applyNetconfig(ctx, req)
 	default:
+		if d, ok := extraDomains[req.GetDomain()]; ok {
+			return d.apply(s, ctx, req)
+		}
 		return nil, status.Errorf(codes.InvalidArgument,
-			"rpc: domain must be %q, %q, %q or %q, got %q", domainFirewall, domainNetconfig, domainDHCP, domainMDNS, req.GetDomain())
+			"rpc: domain must be one of %v, got %q (domains of features not built into this daemon are unavailable)",
+			append([]string{domainFirewall, domainNetconfig}, extraDomainNames()...), req.GetDomain())
 	}
 }
 
@@ -254,11 +246,8 @@ func (s *Server) finishApply(ctx context.Context, domain, id string) (*pb.ApplyR
 }
 
 func legacyName(domain string) string {
-	if domain == domainMDNS {
-		return mdns.ConfigFile
-	}
-	if domain == domainDHCP {
-		return addressbook.ConfigFile
+	if d, ok := extraDomains[domain]; ok {
+		return d.configKey
 	}
 	if domain == domainFirewall {
 		return NftRuleset
@@ -288,10 +277,8 @@ func (s *Server) recoverExpired(ctx context.Context, domain string) error {
 	}
 	if domain == domainFirewall {
 		err = nft.Restore(ctx, s.nftRunner, d.Pending.Snapshot)
-	} else if domain == domainDHCP {
-		err = s.restoreDHCP(d.Pending.Snapshot)
-	} else if domain == domainMDNS {
-		err = s.restoreMDNS(d.Pending.Snapshot)
+	} else if impl, ok := extraDomains[domain]; ok {
+		err = impl.restore(s, d.Pending.Snapshot)
 	} else {
 		err = netconfig.Rollback(ctx, s.netconfigRunner, d.Pending.Snapshot)
 	}
@@ -352,7 +339,7 @@ func (s *Server) Confirm(ctx context.Context, req *pb.ConfirmRequest) (*pb.Confi
 		return nil, status.Errorf(codes.Internal, "%v", err)
 	}
 	defer unlock()
-	for _, domain := range []string{domainFirewall, domainNetconfig, domainDHCP, domainMDNS} {
+	for _, domain := range append([]string{domainFirewall, domainNetconfig}, extraDomainNames()...) {
 		d, err := s.store.Domain(domain, legacyName(domain))
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "%v", err)
@@ -397,11 +384,4 @@ func (s *Server) Confirm(ctx context.Context, req *pb.ConfirmRequest) (*pb.Confi
 		return &pb.ConfirmResponse{Ok: true}, nil
 	}
 	return nil, status.Error(codes.FailedPrecondition, "unknown or completed lease")
-}
-
-// StandbyControl is what the RPC layer needs from a warm standby.
-type StandbyControl interface {
-	LeaderAlive(ctx context.Context) bool
-	Promote(ctx context.Context) error
-	Status() any
 }
