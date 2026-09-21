@@ -178,6 +178,7 @@ func dhcp(ns string) string {
 	}
 	return m[len(m)-1][1]
 }
+
 // tftpGet fetches a file from the LAN's TFTP server as a client in a namespace.
 func tftpGet(ns, name string) ([]byte, error) {
 	dl := "/tmp/" + ns + ".tftp"
@@ -406,6 +407,57 @@ func dnsPhase() {
 	check(r != nil && r.Rcode == dns.RcodeRefused, "an unlisted ordinary name is refused before any cache or upstream")
 	r = ask("100.64.0.1", "_googlecast._tcp.local.", dns.TypePTR)
 	check(r != nil && r.Rcode == dns.RcodeSuccess && len(r.Answer) >= 1, "the base listener stays unrestricted")
+	mdnsPhase()
+}
+
+const mdnsAdvert = `{"interfaces":["lab0"],"host":"nas","records":[{"service":"_smb._tcp","instance":"NAS Share","port":445},{"service":"_ipp._tcp","instance":"Shared Queue","port":631,"txt":["rp=ipp/print"],"subtypes":["_universal"]}]}`
+
+// zc asks the LAN's multicast DNS as another host would: python-zeroconf, an
+// independent implementation, inside the printer's namespace.
+func zc(args ...string) string {
+	out, _ := sh("nsenter", append([]string{"--net=/run/netns/printer", "--", "python3", "/opt/ghostd/zc.py"}, args...)...)
+	return out
+}
+
+func mdnsPhase() {
+	const smb, smbName = "_smb._tcp.local.", "NAS Share._smb._tcp.local."
+	step("mDNS advertisement: ghostd answers for the declared record set (no other responder on the host)")
+	lease, err := apply("mdns-v1", mdnsAdvert, 60)
+	must(err, "apply mdns-v1")
+	must(confirm(lease), "confirm mdns-v1")
+	var info string
+	eventually("a third-party client to resolve the SMB instance", 30*time.Second, func() bool {
+		info = zc("info", smb, smbName)
+		return strings.Contains(info, "port=445")
+	})
+	check(strings.Contains(info, "addrs=10.77.0.1") && strings.Contains(info, "server=nas.local."), "SRV/A carry the port, host and address: %s", info)
+	check(strings.Contains(zc("browse", smb), "NAS Share"), "browse finds the SMB instance")
+	txtOK := eventually("TXT records to be served", 20*time.Second, func() bool {
+		return strings.Contains(zc("info", "_ipp._tcp.local.", "Shared Queue._ipp._tcp.local."), "txt=rp=ipp/print")
+	})
+	check(txtOK, "TXT records are served")
+	check(strings.Contains(zc("browse", "_universal._sub._ipp._tcp.local."), "Shared Queue"), "subtype browse works")
+	check(!strings.Contains(zc("browse", "_googlecast._tcp.local."), "NAS"), "ghostd is silent about services it does not advertise")
+	r := ask("100.64.0.1", "nas.local.", dns.TypeA)
+	check(r != nil && len(r.Answer) == 1, "ghostd's own resolver finds nas.local through the LAN")
+
+	step("mDNS advertisement: a name another host already owns is refused, and the old set keeps answering")
+	clash := `{"interfaces":["lab0"],"host":"nas","records":[{"service":"_ipp._tcp","instance":"Lobby Printer","port":631}]}`
+	_, err = apply("mdns-v1", clash, 6)
+	check(err != nil && strings.Contains(err.Error(), "already advertised"), "advertising over avahi's Lobby Printer is refused (%v)", err)
+	// The failed apply left its lease armed; let it revert on its own, which
+	// also proves the rollback path re-establishes the previous record set.
+	eventually("the failed change to revert to the confirmed set", 60*time.Second, func() bool {
+		return strings.Contains(zc("info", smb, smbName), "port=445")
+	})
+
+	step("mDNS advertisement: an unconfirmed change reverts by itself")
+	eventually("the failed change's lease to lapse", 40*time.Second, func() bool { _, e := apply("mdns-v1", `{}`, 8); return e == nil })
+	check(strings.Contains(zc("info", smb, smbName), "none"), "withdrawn immediately (goodbye)")
+	eventually("timer revert to bring the advertisement back", 60*time.Second, func() bool { return strings.Contains(zc("info", smb, smbName), "port=445") })
+	l2, err := apply("mdns-v1", mdnsAdvert, 60)
+	must(err, "reapply")
+	must(confirm(l2), "confirm reapply")
 }
 
 func post() {
@@ -459,6 +511,11 @@ func post() {
 	}
 	check(found && bindingFor("10.77.0.99") == nil, "switch sighting recorded without a binding")
 
+	step("mDNS advertisement survives the reboot")
+	eventually("confirmed advertisement to be answering again", 40*time.Second, func() bool {
+		return strings.Contains(zc("info", "_smb._tcp.local.", "NAS Share._smb._tcp.local."), "port=445")
+	})
+
 	step("rollback: dnsmasq resumes with every lease, including ghostd's new grant")
 	_, err = handover(`{"action":"rollback"}`)
 	must(err, "rollback")
@@ -510,6 +567,14 @@ func main() {
 		expiry()
 	case "dns":
 		dnsPhase()
+	case "apply": // debugging aid: probe apply <domain> <seconds> <file>
+		raw, err := os.ReadFile(os.Args[4])
+		must(err, "read target")
+		secs := 0
+		fmt.Sscan(os.Args[3], &secs)
+		lease, err := apply(os.Args[2], string(raw), int32(secs))
+		fmt.Println("lease:", lease, "err:", err)
+		return
 	default:
 		os.Exit(2)
 	}

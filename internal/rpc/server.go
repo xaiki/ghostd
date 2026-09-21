@@ -12,6 +12,7 @@ import (
 
 	"github.com/xaiki/ghostd/internal/addressbook"
 	"github.com/xaiki/ghostd/internal/auth"
+	"github.com/xaiki/ghostd/internal/mdns"
 	"github.com/xaiki/ghostd/internal/netconfig"
 	"github.com/xaiki/ghostd/internal/nft"
 	"github.com/xaiki/ghostd/internal/observation"
@@ -40,6 +41,8 @@ type Server struct {
 	// ObserveOnly rejects every mutation RPC, independently of authorization.
 	ObserveOnly bool
 	DHCP        *addressbook.Manager
+	// MDNS advertises the mdns-v1 record set; nil disables the domain.
+	MDNS *mdns.Service
 	// Legacy builds the allocator being replaced by a handover; nil means the
 	// real systemd-managed dnsmasq. Tests substitute a fake.
 	Legacy func(addressbook.LegacySpec) addressbook.LegacyAuthority
@@ -150,11 +153,13 @@ func (s *Server) Apply(ctx context.Context, req *pb.ApplyRequest) (*pb.ApplyResp
 		return s.applyFirewall(ctx, req)
 	case domainDHCP:
 		return s.applyDHCP(ctx, req)
+	case domainMDNS:
+		return s.applyMDNS(ctx, req)
 	case domainNetconfig:
 		return s.applyNetconfig(ctx, req)
 	default:
 		return nil, status.Errorf(codes.InvalidArgument,
-			"rpc: domain must be %q, %q or %q, got %q", domainFirewall, domainNetconfig, domainDHCP, req.GetDomain())
+			"rpc: domain must be %q, %q, %q or %q, got %q", domainFirewall, domainNetconfig, domainDHCP, domainMDNS, req.GetDomain())
 	}
 }
 
@@ -247,6 +252,9 @@ func (s *Server) finishApply(ctx context.Context, domain, id string) (*pb.ApplyR
 }
 
 func legacyName(domain string) string {
+	if domain == domainMDNS {
+		return mdns.ConfigFile
+	}
 	if domain == domainDHCP {
 		return addressbook.ConfigFile
 	}
@@ -280,6 +288,8 @@ func (s *Server) recoverExpired(ctx context.Context, domain string) error {
 		err = nft.Restore(ctx, s.nftRunner, d.Pending.Snapshot)
 	} else if domain == domainDHCP {
 		err = s.restoreDHCP(d.Pending.Snapshot)
+	} else if domain == domainMDNS {
+		err = s.restoreMDNS(d.Pending.Snapshot)
 	} else {
 		err = netconfig.Rollback(ctx, s.netconfigRunner, d.Pending.Snapshot)
 	}
@@ -340,7 +350,7 @@ func (s *Server) Confirm(ctx context.Context, req *pb.ConfirmRequest) (*pb.Confi
 		return nil, status.Errorf(codes.Internal, "%v", err)
 	}
 	defer unlock()
-	for _, domain := range []string{domainFirewall, domainNetconfig, domainDHCP} {
+	for _, domain := range []string{domainFirewall, domainNetconfig, domainDHCP, domainMDNS} {
 		d, err := s.store.Domain(domain, legacyName(domain))
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "%v", err)

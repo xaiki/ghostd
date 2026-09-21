@@ -42,7 +42,7 @@ func (s *Store) Lock() (func(), error) {
 }
 
 func domainFile(domain string) (string, error) {
-	if domain != "firewall" && domain != "netconfig" && domain != "dhcp-v1" {
+	if domain != "firewall" && domain != "netconfig" && domain != "dhcp-v1" && domain != "mdns-v1" {
 		return "", fmt.Errorf("unknown domain %q", domain)
 	}
 	return domain + "-transaction.json", nil

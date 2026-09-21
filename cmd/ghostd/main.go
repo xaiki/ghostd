@@ -22,6 +22,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"reflect"
 	"strings"
 	"time"
 
@@ -146,6 +147,8 @@ func recoverDomain(store *state.Store, domain, leaseID string) error {
 		key = rpc.NetconfigState
 	} else if domain == "dhcp-v1" {
 		key = addressbook.ConfigFile
+	} else if domain == "mdns-v1" {
+		key = mdns.ConfigFile
 	} else if domain != "firewall" {
 		return fmt.Errorf("unknown domain %q", domain)
 	}
@@ -159,6 +162,8 @@ func recoverDomain(store *state.Store, domain, leaseID string) error {
 			err = nft.Restore(ctx, nft.ExecRunner{}, d.Pending.Snapshot)
 		} else if domain == "dhcp-v1" {
 			err = restoreDHCPConfig(store, d.Pending.Snapshot)
+		} else if domain == "mdns-v1" {
+			err = restoreMDNSConfig(store, d.Pending.Snapshot)
 		} else {
 			err = netconfig.Rollback(ctx, netconfig.ExecRunner{}, d.Pending.Snapshot)
 		}
@@ -176,6 +181,9 @@ func recoverDomain(store *state.Store, domain, leaseID string) error {
 	}
 	if domain == "dhcp-v1" {
 		return restoreDHCPConfig(store, d.Confirmed)
+	}
+	if domain == "mdns-v1" {
+		return restoreMDNSConfig(store, d.Confirmed)
 	}
 	return netconfig.Restore(ctx, netconfig.ExecRunner{}, d.Confirmed)
 }
@@ -207,7 +215,7 @@ func runDaemonMode(store *state.Store, port int, deployerTag string, tailscaleIf
 	if err != nil {
 		return err
 	}
-	for _, domain := range []string{"firewall", "netconfig", "dhcp-v1"} {
+	for _, domain := range []string{"firewall", "netconfig", "dhcp-v1", "mdns-v1"} {
 		if err := prepareDomain(store, domain, observeOnly); err != nil {
 			unlock()
 			return fmt.Errorf("boot restore %s: %w", domain, err)
@@ -284,6 +292,12 @@ func runDaemonMode(store *state.Store, port int, deployerTag string, tailscaleIf
 
 	server.ObserveOnly = observeOnly
 	server.DHCP = manager
+	if !observeOnly {
+		advertiser := mdns.NewService()
+		defer advertiser.Close()
+		server.MDNS = advertiser
+		go watchMDNS(ctx, store, advertiser)
+	}
 	grpcServer := grpc.NewServer()
 	pb.RegisterHostStateServer(grpcServer, server)
 
@@ -336,6 +350,8 @@ func prepareDomain(store *state.Store, domain string, observeOnly bool) error {
 		key = rpc.NetconfigState
 	} else if domain == "dhcp-v1" {
 		key = addressbook.ConfigFile
+	} else if domain == "mdns-v1" {
+		key = mdns.ConfigFile
 	}
 	d, err := store.Domain(domain, key)
 	if err != nil {
@@ -366,4 +382,44 @@ func tailnetPeers(ctx context.Context, client *tsclient.Client) ([]addressbook.P
 		peers = append(peers, peer)
 	}
 	return peers, nil
+}
+
+// restoreMDNSConfig makes the persisted advertisement match a confirmed or
+// snapshot state; the watcher below brings the running service to it.
+func restoreMDNSConfig(store *state.Store, raw []byte) error {
+	if _, err := mdns.ParseConfig(raw); err != nil {
+		return err
+	}
+	if len(raw) == 0 {
+		raw = []byte(`{}`)
+	}
+	return store.Save(mdns.ConfigFile, raw)
+}
+
+// watchMDNS converges the running advertisement on the persisted one: at boot,
+// after a rollback, and after a failed start (a port that was busy, an
+// interface that was not up yet). A start that fails is retried, never fatal.
+func watchMDNS(ctx context.Context, store *state.Store, svc *mdns.Service) {
+	tick := time.NewTicker(3 * time.Second)
+	defer tick.Stop()
+	for {
+		if unlock, err := store.Lock(); err == nil {
+			raw, lerr := store.Load(mdns.ConfigFile)
+			if lerr == nil {
+				if want, perr := mdns.ParseConfig(raw); perr != nil {
+					log.Printf("ghostd: %s: %v", mdns.ConfigFile, perr)
+				} else if !reflect.DeepEqual(want, svc.Config()) {
+					if err := svc.Apply(want); err != nil {
+						log.Printf("ghostd: mDNS advertisement not running: %v", err)
+					}
+				}
+			}
+			unlock()
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+	}
 }

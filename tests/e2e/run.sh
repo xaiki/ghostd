@@ -12,14 +12,16 @@ case "$arch" in arm64|amd64) ;; *) echo 'GHOSTD_LAB_ARCH must be arm64 or amd64'
 bin=$(mktemp -d "${TMPDIR:-/tmp}/ghostd-e2e.XXXXXX")
 name=ghostd-e2e-lab
 cleanup() {
-	if [ "${GHOSTD_E2E_KEEP:-}" != 1 ]; then podman rm -f "$name" >/dev/null 2>&1 || true; fi
-	rm -rf "$bin"
+	if [ "${GHOSTD_E2E_KEEP:-}" != 1 ]; then
+		podman rm -f "$name" >/dev/null 2>&1 || true
+		rm -rf "$bin"
+	fi
 }
 trap cleanup EXIT HUP INT TERM
 for cmd in ghostd:./cmd/ghostd fakets:./tests/e2e/fakets probe:./tests/e2e/probe; do
 	GOOS=linux GOARCH="$arch" CGO_ENABLED=0 go build -trimpath -o "$bin/${cmd%%:*}" "${cmd#*:}"
 done
-cp tests/e2e/fixtures.sh "$bin/"
+cp tests/e2e/fixtures.sh tests/e2e/zc.py "$bin/"
 podman build -q -t localhost/ghostd-dhcp-lab -f tests/dhcp-lab/Containerfile tests/dhcp-lab >/dev/null
 podman rm -f "$name" >/dev/null 2>&1 || true
 podman run -d --name "$name" --privileged --systemd=always --network none \

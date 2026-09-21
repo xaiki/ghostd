@@ -37,4 +37,5 @@ if ! ip netns list | grep -qw printer; then
 	nsenter --net=/run/netns/printer -- ip link set lo up
 	nsenter --net=/run/netns/printer -- ip addr add 10.77.0.60/24 dev printerp
 	nsenter --net=/run/netns/printer -- ip link set printerp up
+	nsenter --net=/run/netns/printer -- ip route add 224.0.0.0/4 dev printerp
 fi

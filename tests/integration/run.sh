@@ -9,7 +9,7 @@ bin=$(mktemp -d "${TMPDIR:-/tmp}/ghostd-int.XXXXXX")
 name=ghostd-integration-lab
 cleanup() { [ "${GHOSTD_E2E_KEEP:-}" = 1 ] || podman rm -f "$name" >/dev/null 2>&1 || true; rm -rf "$bin"; }
 trap cleanup EXIT HUP INT TERM
-for pkg in resolver:./internal/resolver nft:./internal/nft main:./cmd/ghostd state:./internal/state netconfig:./internal/netconfig addressbook:./internal/addressbook; do
+for pkg in mdns:./internal/mdns resolver:./internal/resolver nft:./internal/nft main:./cmd/ghostd state:./internal/state netconfig:./internal/netconfig addressbook:./internal/addressbook; do
 	GOOS=linux GOARCH="$arch" CGO_ENABLED=0 go test -c -o "$bin/${pkg%%:*}.test" "${pkg#*:}"
 done
 podman build -q -t localhost/ghostd-dhcp-lab -f tests/dhcp-lab/Containerfile tests/dhcp-lab >/dev/null
@@ -27,5 +27,6 @@ x env GHOSTD_SYSTEMD_INTEGRATION=1 /t/state.test -test.run TestIntegration -test
 x unshare -n env GHOSTD_NETCONFIG_INTEGRATION=1 /t/netconfig.test -test.run TestIntegration -test.v
 x unshare -n sh -c "ip link set lo up && exec env GHOSTD_DHCP_INTEGRATION=1 /t/addressbook.test -test.run TestLinuxListenerAndPortOwnership -test.v"
 x /t/addressbook.test -test.run "TestProcessOwnsUDPPort|TestWriteLeases" -test.v
+x unshare -n sh -c "ip link set lo up && exec /t/mdns.test -test.v"
 x unshare -n sh -c "ip link set lo up && exec /t/resolver.test -test.run 'TestIdentityListeners|TestEmbedded' -test.v"
 echo "integration suites passed"

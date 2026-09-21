@@ -1,0 +1,350 @@
+package mdns
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"net/netip"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/miekg/dns"
+)
+
+// ConfigFile is the persisted advertisement target (the mdns-v1 domain).
+const ConfigFile = "mdns-config.json"
+
+// Config declares what ghostd advertises on behalf of things that cannot do it
+// themselves (a container on a bridge). The record set is data the operator
+// supplies, not something the daemon invents: a Time Machine record set in
+// particular must come from a captured, known-good advertisement.
+type Config struct {
+	// Interfaces are the LAN interfaces to advertise on and answer from.
+	Interfaces []string `json:"interfaces"`
+	// Host is the .local host name whose address records ghostd answers with the
+	// addresses of the advertising interface.
+	Host    string   `json:"host"`
+	Records []Record `json:"records"`
+}
+
+// Record is one DNS-SD service instance.
+type Record struct {
+	Service  string   `json:"service"`  // _smb._tcp
+	Instance string   `json:"instance"` // human name, any UTF-8 up to 63 bytes
+	Port     uint16   `json:"port"`
+	TXT      []string `json:"txt,omitempty"`
+	Subtypes []string `json:"subtypes,omitempty"` // _universal
+}
+
+var (
+	serviceRE = regexp.MustCompile(`^_[a-z0-9][a-z0-9-]{0,14}\._(tcp|udp)$`)
+	hostRE    = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
+	subtypeRE = regexp.MustCompile(`^_[a-z0-9][a-z0-9-]{0,62}$`)
+)
+
+func ParseConfig(raw []byte) (Config, error) {
+	var c Config
+	if len(strings.TrimSpace(string(raw))) == 0 {
+		return c, nil
+	}
+	d := json.NewDecoder(strings.NewReader(string(raw)))
+	d.DisallowUnknownFields()
+	if err := d.Decode(&c); err != nil {
+		return c, err
+	}
+	if err := d.Decode(new(any)); err != io.EOF {
+		return c, fmt.Errorf("trailing mdns config data")
+	}
+	return c, c.Validate()
+}
+
+// Empty reports whether the config advertises nothing.
+func (c Config) Empty() bool { return len(c.Records) == 0 }
+
+func (c Config) Validate() error {
+	if c.Empty() {
+		return nil
+	}
+	if len(c.Interfaces) == 0 || len(c.Interfaces) > 16 {
+		return fmt.Errorf("mdns: name 1..16 interfaces")
+	}
+	for _, i := range c.Interfaces {
+		if i == "" || len(i) > 15 || strings.ContainsAny(i, " /") {
+			return fmt.Errorf("mdns: bad interface %q", i)
+		}
+	}
+	if !hostRE.MatchString(c.Host) {
+		return fmt.Errorf("mdns: host must be one lower-case DNS label")
+	}
+	if len(c.Records) > 64 {
+		return fmt.Errorf("mdns: at most 64 records")
+	}
+	seen := map[string]bool{}
+	for _, r := range c.Records {
+		if !serviceRE.MatchString(r.Service) {
+			return fmt.Errorf("mdns: %q is not a service like _smb._tcp", r.Service)
+		}
+		if r.Instance == "" || len(r.Instance) > 63 || strings.ContainsAny(r.Instance, "\x00\r\n.") {
+			return fmt.Errorf("mdns: instance name %q must be 1..63 bytes without dots", r.Instance)
+		}
+		if r.Port == 0 && r.Service != "_adisk._tcp" && r.Service != "_device-info._tcp" {
+			return fmt.Errorf("mdns: %s/%s needs a port (only _adisk and _device-info are conventionally port 0)", r.Service, r.Instance)
+		}
+		key := strings.ToLower(r.Instance + "." + r.Service)
+		if seen[key] {
+			return fmt.Errorf("mdns: duplicate %s", key)
+		}
+		seen[key] = true
+		total := 0
+		for _, t := range r.TXT {
+			if len(t) > 255 {
+				return fmt.Errorf("mdns: TXT string over 255 bytes in %s", key)
+			}
+			total += len(t) + 1
+		}
+		if total > 1300 {
+			return fmt.Errorf("mdns: TXT record for %s too large", key)
+		}
+		for _, s := range r.Subtypes {
+			if !subtypeRE.MatchString(s) {
+				return fmt.Errorf("mdns: bad subtype %q", s)
+			}
+		}
+	}
+	return nil
+}
+
+// InterfaceAddrs lists an interface's non-link-local addresses.
+func InterfaceAddrs(name string) ([]netip.Addr, error) {
+	i, err := net.InterfaceByName(name)
+	if err != nil {
+		return nil, err
+	}
+	addrs, err := i.Addrs()
+	if err != nil {
+		return nil, err
+	}
+	var out []netip.Addr
+	for _, a := range addrs {
+		p, err := netip.ParsePrefix(a.String())
+		if err != nil || p.Addr().IsLinkLocalUnicast() || p.Addr().IsLoopback() {
+			continue
+		}
+		out = append(out, p.Addr())
+	}
+	return out, nil
+}
+
+const (
+	ttlHost    = 120
+	ttlService = 4500
+)
+
+// answerer builds responses from a Config. It is pure: no sockets, so the
+// record logic is testable without a network.
+type answerer struct {
+	cfg   Config
+	addrs func(iface string) ([]netip.Addr, error)
+}
+
+// norm makes a name comparable: miekg presents a space in a label as \032 and
+// so on, while configured instance names carry the raw character.
+func norm(name string) string {
+	var b strings.Builder
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if c == '\\' && i+1 < len(name) {
+			if i+3 < len(name) && name[i+1] >= '0' && name[i+1] <= '9' && name[i+2] >= '0' && name[i+2] <= '9' && name[i+3] >= '0' && name[i+3] <= '9' {
+				n := int(name[i+1]-'0')*100 + int(name[i+2]-'0')*10 + int(name[i+3]-'0')
+				if n < 256 {
+					b.WriteByte(byte(n))
+					i += 3
+					continue
+				}
+			}
+			i++
+			b.WriteByte(name[i])
+			continue
+		}
+		b.WriteByte(c)
+	}
+	return strings.ToLower(b.String())
+}
+
+func fq(parts ...string) string { return strings.Join(parts, ".") + "." }
+
+func (a answerer) hostName() string { return fq(a.cfg.Host, "local") }
+func (a answerer) instanceName(r Record) string {
+	return fq(r.Instance, r.Service, "local")
+}
+
+func (a answerer) hostRecords(iface string) []dns.RR {
+	ips, err := a.addrs(iface)
+	if err != nil {
+		return nil
+	}
+	var out []dns.RR
+	for _, ip := range ips {
+		h := dns.RR_Header{Name: a.hostName(), Class: dns.ClassINET | 0x8000, Ttl: ttlHost}
+		if ip.Is4() {
+			h.Rrtype = dns.TypeA
+			out = append(out, &dns.A{Hdr: h, A: net.IP(ip.AsSlice())})
+		} else {
+			h.Rrtype = dns.TypeAAAA
+			out = append(out, &dns.AAAA{Hdr: h, AAAA: net.IP(ip.AsSlice())})
+		}
+	}
+	return out
+}
+
+func (a answerer) instanceRecords(r Record) (srv, txt dns.RR) {
+	name := a.instanceName(r)
+	srv = &dns.SRV{Hdr: dns.RR_Header{Name: name, Rrtype: dns.TypeSRV, Class: dns.ClassINET | 0x8000, Ttl: ttlHost}, Port: r.Port, Target: a.hostName()}
+	strs := r.TXT
+	if len(strs) == 0 {
+		strs = []string{""} // RFC 6763: an empty TXT record is a single zero-length string
+	}
+	txt = &dns.TXT{Hdr: dns.RR_Header{Name: name, Rrtype: dns.TypeTXT, Class: dns.ClassINET | 0x8000, Ttl: ttlService}, Txt: strs}
+	return
+}
+
+func (a answerer) ptr(owner string, r Record) dns.RR {
+	return &dns.PTR{Hdr: dns.RR_Header{Name: owner, Rrtype: dns.TypePTR, Class: dns.ClassINET, Ttl: ttlService}, Ptr: a.instanceName(r)}
+}
+
+// all returns every record ghostd advertises on an interface: the announcement.
+func (a answerer) all(iface string, ttl uint32) []dns.RR {
+	var out []dns.RR
+	types := map[string]bool{}
+	for _, r := range a.cfg.Records {
+		out = append(out, a.ptr(fq(r.Service, "local"), r))
+		for _, sub := range r.Subtypes {
+			out = append(out, a.ptr(fq(sub, "_sub", r.Service, "local"), r))
+		}
+		srv, txt := a.instanceRecords(r)
+		out = append(out, srv, txt)
+		types[r.Service] = true
+	}
+	for svc := range types {
+		out = append(out, &dns.PTR{Hdr: dns.RR_Header{Name: "_services._dns-sd._udp.local.", Rrtype: dns.TypePTR, Class: dns.ClassINET, Ttl: ttlService}, Ptr: fq(svc, "local")})
+	}
+	out = append(out, a.hostRecords(iface)...)
+	if ttl != ttlService {
+		for _, rr := range out {
+			rr.Header().Ttl = ttl
+		}
+	}
+	return out
+}
+
+// Answer produces the response for a query received on iface, or nil when
+// there is nothing to say. Known-answer suppression (RFC 6762 7.1) applies to
+// shared PTR records.
+func (a answerer) Answer(q *dns.Msg, iface string) *dns.Msg {
+	if q.Response || q.Opcode != dns.OpcodeQuery {
+		return nil
+	}
+	known := map[string]bool{}
+	for _, k := range q.Answer {
+		if k.Header().Ttl >= ttlService/2 {
+			known[strings.ToLower(k.String())] = false
+			if p, ok := k.(*dns.PTR); ok {
+				known[norm(p.Hdr.Name)+"|"+norm(p.Ptr)] = true
+			}
+		}
+	}
+	resp := new(dns.Msg)
+	resp.Response, resp.Authoritative = true, true
+	haveAnswer := map[string]bool{}
+	add := func(list *[]dns.RR, rr dns.RR) {
+		key := strings.ToLower(rr.String())
+		if haveAnswer[key] {
+			return
+		}
+		haveAnswer[key] = true
+		*list = append(*list, rr)
+	}
+	for _, question := range q.Question {
+		name := norm(question.Name)
+		want := func(t uint16) bool { return question.Qtype == t || question.Qtype == dns.TypeANY }
+		if name == "_services._dns-sd._udp.local." && want(dns.TypePTR) {
+			for _, rr := range a.all(iface, ttlService) {
+				if p, ok := rr.(*dns.PTR); ok && norm(p.Hdr.Name) == name {
+					add(&resp.Answer, rr)
+				}
+			}
+			continue
+		}
+		if name == norm(a.hostName()) && (want(dns.TypeA) || want(dns.TypeAAAA)) {
+			for _, rr := range a.hostRecords(iface) {
+				if want(rr.Header().Rrtype) {
+					add(&resp.Answer, rr)
+				}
+			}
+			continue
+		}
+		for _, r := range a.cfg.Records {
+			srv, txt := a.instanceRecords(r)
+			owners := []string{fq(r.Service, "local")}
+			for _, sub := range r.Subtypes {
+				owners = append(owners, fq(sub, "_sub", r.Service, "local"))
+			}
+			for _, owner := range owners {
+				if norm(owner) == name && want(dns.TypePTR) {
+					p := a.ptr(owner, r)
+					if known[norm(owner)+"|"+norm(p.(*dns.PTR).Ptr)] {
+						continue
+					}
+					add(&resp.Answer, p)
+					add(&resp.Extra, srv)
+					add(&resp.Extra, txt)
+					for _, h := range a.hostRecords(iface) {
+						add(&resp.Extra, h)
+					}
+				}
+			}
+			if norm(a.instanceName(r)) == name {
+				if want(dns.TypeSRV) {
+					add(&resp.Answer, srv)
+					for _, h := range a.hostRecords(iface) {
+						add(&resp.Extra, h)
+					}
+				}
+				if want(dns.TypeTXT) {
+					add(&resp.Answer, txt)
+				}
+			}
+		}
+	}
+	if len(resp.Answer) == 0 {
+		return nil
+	}
+	return resp
+}
+
+// conflicts reports whether a response from another host claims one of the
+// names ghostd is about to advertise (a probing failure, RFC 6762 section 8).
+func (a answerer) conflicts(resp *dns.Msg) string {
+	if !resp.Response {
+		return ""
+	}
+	mine := map[string]bool{norm(a.hostName()): true}
+	for _, r := range a.cfg.Records {
+		mine[norm(a.instanceName(r))] = true
+	}
+	for _, rr := range append(append([]dns.RR{}, resp.Answer...), resp.Extra...) {
+		h := rr.Header()
+		if !mine[norm(h.Name)] {
+			continue
+		}
+		switch h.Rrtype {
+		case dns.TypeSRV, dns.TypeTXT, dns.TypeA, dns.TypeAAAA:
+			return h.Name
+		}
+	}
+	return ""
+}
+
+var probeGap = 250 * time.Millisecond
