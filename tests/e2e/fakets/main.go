@@ -18,6 +18,7 @@ func main() {
 	sock := flag.String("socket", "/var/run/tailscale/tailscaled.sock", "LocalAPI socket")
 	ip := flag.String("ip", "127.0.0.1", "tailnet address reported for this node")
 	tag := flag.String("tag", "tag:stack-deployer", "tag given to every caller; empty makes callers plain peers")
+	peers := flag.String("peers", "/run/tailscale/peers.json", "optional JSON object of node-key -> PeerStatus to report as tailnet peers")
 	flag.Parse()
 	_ = os.Remove(*sock)
 	l, err := net.Listen("unix", *sock)
@@ -26,10 +27,17 @@ func main() {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/localapi/v0/status", func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]any{
+		status := map[string]any{
 			"Version": "1.0-fake", "BackendState": "Running",
 			"Self": map[string]any{"ID": "self", "DNSName": "ghostd-e2e.example.ts.net.", "TailscaleIPs": []string{*ip}, "Online": true},
-		})
+		}
+		if raw, err := os.ReadFile(*peers); err == nil {
+			var p map[string]any
+			if json.Unmarshal(raw, &p) == nil {
+				status["Peer"] = p
+			}
+		}
+		json.NewEncoder(w).Encode(status)
 	})
 	mux.HandleFunc("/localapi/v0/whois", func(w http.ResponseWriter, r *http.Request) {
 		addr := strings.TrimSpace(r.URL.Query().Get("addr"))

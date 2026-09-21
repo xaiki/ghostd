@@ -159,6 +159,9 @@ func startAddressbook(store *state.Store, observeOnly bool) (*addressbook.Manage
 					if err := manager.CollectNeighbors(ctx); err != nil {
 						log.Printf("ghostd neighbor observation: %v", err)
 					}
+					if err := manager.CollectPeers(ctx); err != nil {
+						log.Printf("ghostd peer inventory: %v", err)
+					}
 					nextExpiry = time.Now().Add(30 * time.Second)
 				}
 			}

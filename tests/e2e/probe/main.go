@@ -340,8 +340,44 @@ func post() {
 	check(dhcp("client1") == strings.TrimSpace(string(addr1)), "client1 renews its address from ghostd")
 	check(dhcp("client2") == strings.TrimSpace(string(addr2)), "client2 renews its address from ghostd")
 
+	step("peer inventory: a direct tailnet endpoint at a leased address becomes a reviewable suggestion")
+	a1 := strings.TrimSpace(string(addr1))
+	peers := fmt.Sprintf(`{"nodekey:%s":{"ID":"n-client1","HostName":"nas","DNSName":"nas.e2e.ts.net.","TailscaleIPs":["100.64.0.9"],"CurAddr":"%s:41641","Addrs":["203.0.113.7:41641"],"Online":true}}`, strings.Repeat("ab", 32), a1)
+	must(os.WriteFile("/run/tailscale/peers.json", []byte(peers), 0644), "write peers")
+	var sugg []map[string]any
+	eventually("the watcher to poll peers and produce a suggestion", 90*time.Second, func() bool {
+		r, err := rpc(func(ctx context.Context, c pb.HostStateClient) (*pb.RegistryResponse, error) {
+			return c.GetSuggestions(ctx, &pb.RegistryRequest{})
+		})
+		return err == nil && json.Unmarshal([]byte(r.Json), &sugg) == nil && len(sugg) > 0
+	})
+	if len(sugg) > 0 {
+		check(sugg[0]["strength"] == "endpoint" && sugg[0]["address"] == a1 && sugg[0]["peer_id"] == "n-client1", "endpoint-strength suggestion for %s: %v", a1, sugg[0]["evidence"])
+		check(bindingFor(a1)["tailnet_node_id"] == nil, "nothing was applied by itself")
+		repair, _ := json.Marshal([]any{sugg[0]["repair"]})
+		_, err := rpc(func(ctx context.Context, c pb.HostStateClient) (*pb.RegistryResponse, error) {
+			return c.RepairIdentity(ctx, &pb.RegistryDocument{Json: string(repair)})
+		})
+		check(err == nil, "reviewer applies the suggestion through RepairIdentity (%v)", err)
+		check(bindingFor(a1)["tailnet_node_id"] == "n-client1", "binding now linked to the tailnet node")
+		check(dhcp("client1") == a1 && bindingFor(a1)["tailnet_node_id"] == "n-client1", "association survives the client's next renewal")
+	}
+
+	step("switch evidence: imported as an observation, never a grant")
+	_, err := rpc(func(ctx context.Context, c pb.HostStateClient) (*pb.RegistryResponse, error) {
+		return c.ImportObservations(ctx, &pb.RegistryDocument{Json: `{"ttl_seconds":600,"observations":[{"scope":"lab0","address":"10.77.0.99","mac":"02:00:00:00:00:99","detail":"sw1 Gi1/0/7"}]}`})
+	})
+	check(err == nil, "ImportObservations accepted (%v)", err)
+	obs, _ := registry()["observations"].([]any)
+	found := false
+	for _, o := range obs {
+		m := o.(map[string]any)
+		found = found || (m["origin"] == "switch-snooping" && m["address"] == "10.77.0.99")
+	}
+	check(found && bindingFor("10.77.0.99") == nil, "switch sighting recorded without a binding")
+
 	step("rollback: dnsmasq resumes with every lease, including ghostd's new grant")
-	_, err := handover(`{"action":"rollback"}`)
+	_, err = handover(`{"action":"rollback"}`)
 	must(err, "rollback")
 	active, masked = legacyState()
 	check(active && !masked, "dnsmasq active and unmasked")

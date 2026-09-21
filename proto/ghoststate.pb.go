@@ -540,7 +540,7 @@ const file_ghoststate_proto_rawDesc = "" +
 	"\x0eConfirmRequest\x12\x19\n" +
 	"\blease_id\x18\x01 \x01(\tR\aleaseId\"!\n" +
 	"\x0fConfirmResponse\x12\x0e\n" +
-	"\x02ok\x18\x01 \x01(\bR\x02ok2\x83\x04\n" +
+	"\x02ok\x18\x01 \x01(\bR\x02ok2\x92\x05\n" +
 	"\tHostState\x122\n" +
 	"\bGetState\x12\x17.ghostd.GetStateRequest\x1a\r.ghostd.State\x124\n" +
 	"\x05Apply\x12\x14.ghostd.ApplyRequest\x1a\x15.ghostd.ApplyResponse\x12:\n" +
@@ -550,7 +550,9 @@ const file_ghoststate_proto_rawDesc = "" +
 	"\n" +
 	"ReportHost\x12\x18.ghostd.RegistryDocument\x1a\x18.ghostd.RegistryResponse\x12D\n" +
 	"\x0eRepairIdentity\x12\x18.ghostd.RegistryDocument\x1a\x18.ghostd.RegistryResponse\x12B\n" +
-	"\fDHCPHandover\x12\x18.ghostd.RegistryDocument\x1a\x18.ghostd.RegistryResponseB\x1fZ\x1dgithub.com/xaiki/ghostd/protob\x06proto3"
+	"\fDHCPHandover\x12\x18.ghostd.RegistryDocument\x1a\x18.ghostd.RegistryResponse\x12H\n" +
+	"\x12ImportObservations\x12\x18.ghostd.RegistryDocument\x1a\x18.ghostd.RegistryResponse\x12C\n" +
+	"\x0eGetSuggestions\x12\x17.ghostd.RegistryRequest\x1a\x18.ghostd.RegistryResponseB\x1fZ\x1dgithub.com/xaiki/ghostd/protob\x06proto3"
 
 var (
 	file_ghoststate_proto_rawDescOnce sync.Once
@@ -577,27 +579,31 @@ var file_ghoststate_proto_goTypes = []any{
 	(*ConfirmResponse)(nil),  // 8: ghostd.ConfirmResponse
 }
 var file_ghoststate_proto_depIdxs = []int32{
-	3, // 0: ghostd.HostState.GetState:input_type -> ghostd.GetStateRequest
-	5, // 1: ghostd.HostState.Apply:input_type -> ghostd.ApplyRequest
-	7, // 2: ghostd.HostState.Confirm:input_type -> ghostd.ConfirmRequest
-	0, // 3: ghostd.HostState.GetRegistry:input_type -> ghostd.RegistryRequest
-	1, // 4: ghostd.HostState.ImportLeases:input_type -> ghostd.RegistryDocument
-	1, // 5: ghostd.HostState.ReportHost:input_type -> ghostd.RegistryDocument
-	1, // 6: ghostd.HostState.RepairIdentity:input_type -> ghostd.RegistryDocument
-	1, // 7: ghostd.HostState.DHCPHandover:input_type -> ghostd.RegistryDocument
-	4, // 8: ghostd.HostState.GetState:output_type -> ghostd.State
-	6, // 9: ghostd.HostState.Apply:output_type -> ghostd.ApplyResponse
-	8, // 10: ghostd.HostState.Confirm:output_type -> ghostd.ConfirmResponse
-	2, // 11: ghostd.HostState.GetRegistry:output_type -> ghostd.RegistryResponse
-	2, // 12: ghostd.HostState.ImportLeases:output_type -> ghostd.RegistryResponse
-	2, // 13: ghostd.HostState.ReportHost:output_type -> ghostd.RegistryResponse
-	2, // 14: ghostd.HostState.RepairIdentity:output_type -> ghostd.RegistryResponse
-	2, // 15: ghostd.HostState.DHCPHandover:output_type -> ghostd.RegistryResponse
-	8, // [8:16] is the sub-list for method output_type
-	0, // [0:8] is the sub-list for method input_type
-	0, // [0:0] is the sub-list for extension type_name
-	0, // [0:0] is the sub-list for extension extendee
-	0, // [0:0] is the sub-list for field type_name
+	3,  // 0: ghostd.HostState.GetState:input_type -> ghostd.GetStateRequest
+	5,  // 1: ghostd.HostState.Apply:input_type -> ghostd.ApplyRequest
+	7,  // 2: ghostd.HostState.Confirm:input_type -> ghostd.ConfirmRequest
+	0,  // 3: ghostd.HostState.GetRegistry:input_type -> ghostd.RegistryRequest
+	1,  // 4: ghostd.HostState.ImportLeases:input_type -> ghostd.RegistryDocument
+	1,  // 5: ghostd.HostState.ReportHost:input_type -> ghostd.RegistryDocument
+	1,  // 6: ghostd.HostState.RepairIdentity:input_type -> ghostd.RegistryDocument
+	1,  // 7: ghostd.HostState.DHCPHandover:input_type -> ghostd.RegistryDocument
+	1,  // 8: ghostd.HostState.ImportObservations:input_type -> ghostd.RegistryDocument
+	0,  // 9: ghostd.HostState.GetSuggestions:input_type -> ghostd.RegistryRequest
+	4,  // 10: ghostd.HostState.GetState:output_type -> ghostd.State
+	6,  // 11: ghostd.HostState.Apply:output_type -> ghostd.ApplyResponse
+	8,  // 12: ghostd.HostState.Confirm:output_type -> ghostd.ConfirmResponse
+	2,  // 13: ghostd.HostState.GetRegistry:output_type -> ghostd.RegistryResponse
+	2,  // 14: ghostd.HostState.ImportLeases:output_type -> ghostd.RegistryResponse
+	2,  // 15: ghostd.HostState.ReportHost:output_type -> ghostd.RegistryResponse
+	2,  // 16: ghostd.HostState.RepairIdentity:output_type -> ghostd.RegistryResponse
+	2,  // 17: ghostd.HostState.DHCPHandover:output_type -> ghostd.RegistryResponse
+	2,  // 18: ghostd.HostState.ImportObservations:output_type -> ghostd.RegistryResponse
+	2,  // 19: ghostd.HostState.GetSuggestions:output_type -> ghostd.RegistryResponse
+	10, // [10:20] is the sub-list for method output_type
+	0,  // [0:10] is the sub-list for method input_type
+	0,  // [0:0] is the sub-list for extension type_name
+	0,  // [0:0] is the sub-list for extension extendee
+	0,  // [0:0] is the sub-list for field type_name
 }
 
 func init() { file_ghoststate_proto_init() }

@@ -21,6 +21,11 @@ service HostState {
   rpc ReportHost(RegistryDocument) returns (RegistryResponse);
   rpc RepairIdentity(RegistryDocument) returns (RegistryResponse);
   rpc DHCPHandover(RegistryDocument) returns (RegistryResponse);
+  // Switch DHCP-snooping / MAC-table evidence. Deployer only; never a grant.
+  rpc ImportObservations(RegistryDocument) returns (RegistryResponse);
+  // Reviewable proposals linking LAN bindings to tailnet peers. Read-only;
+  // nothing is applied except through RepairIdentity.
+  rpc GetSuggestions(RegistryRequest) returns (RegistryResponse);
 }
 
 message RegistryRequest {

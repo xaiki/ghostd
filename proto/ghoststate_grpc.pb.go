@@ -19,14 +19,16 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	HostState_GetState_FullMethodName       = "/ghostd.HostState/GetState"
-	HostState_Apply_FullMethodName          = "/ghostd.HostState/Apply"
-	HostState_Confirm_FullMethodName        = "/ghostd.HostState/Confirm"
-	HostState_GetRegistry_FullMethodName    = "/ghostd.HostState/GetRegistry"
-	HostState_ImportLeases_FullMethodName   = "/ghostd.HostState/ImportLeases"
-	HostState_ReportHost_FullMethodName     = "/ghostd.HostState/ReportHost"
-	HostState_RepairIdentity_FullMethodName = "/ghostd.HostState/RepairIdentity"
-	HostState_DHCPHandover_FullMethodName   = "/ghostd.HostState/DHCPHandover"
+	HostState_GetState_FullMethodName           = "/ghostd.HostState/GetState"
+	HostState_Apply_FullMethodName              = "/ghostd.HostState/Apply"
+	HostState_Confirm_FullMethodName            = "/ghostd.HostState/Confirm"
+	HostState_GetRegistry_FullMethodName        = "/ghostd.HostState/GetRegistry"
+	HostState_ImportLeases_FullMethodName       = "/ghostd.HostState/ImportLeases"
+	HostState_ReportHost_FullMethodName         = "/ghostd.HostState/ReportHost"
+	HostState_RepairIdentity_FullMethodName     = "/ghostd.HostState/RepairIdentity"
+	HostState_DHCPHandover_FullMethodName       = "/ghostd.HostState/DHCPHandover"
+	HostState_ImportObservations_FullMethodName = "/ghostd.HostState/ImportObservations"
+	HostState_GetSuggestions_FullMethodName     = "/ghostd.HostState/GetSuggestions"
 )
 
 // HostStateClient is the client API for HostState service.
@@ -50,6 +52,11 @@ type HostStateClient interface {
 	ReportHost(ctx context.Context, in *RegistryDocument, opts ...grpc.CallOption) (*RegistryResponse, error)
 	RepairIdentity(ctx context.Context, in *RegistryDocument, opts ...grpc.CallOption) (*RegistryResponse, error)
 	DHCPHandover(ctx context.Context, in *RegistryDocument, opts ...grpc.CallOption) (*RegistryResponse, error)
+	// Switch DHCP-snooping / MAC-table evidence. Deployer only; never a grant.
+	ImportObservations(ctx context.Context, in *RegistryDocument, opts ...grpc.CallOption) (*RegistryResponse, error)
+	// Reviewable proposals linking LAN bindings to tailnet peers. Read-only;
+	// nothing is applied except through RepairIdentity.
+	GetSuggestions(ctx context.Context, in *RegistryRequest, opts ...grpc.CallOption) (*RegistryResponse, error)
 }
 
 type hostStateClient struct {
@@ -140,6 +147,26 @@ func (c *hostStateClient) DHCPHandover(ctx context.Context, in *RegistryDocument
 	return out, nil
 }
 
+func (c *hostStateClient) ImportObservations(ctx context.Context, in *RegistryDocument, opts ...grpc.CallOption) (*RegistryResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RegistryResponse)
+	err := c.cc.Invoke(ctx, HostState_ImportObservations_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *hostStateClient) GetSuggestions(ctx context.Context, in *RegistryRequest, opts ...grpc.CallOption) (*RegistryResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RegistryResponse)
+	err := c.cc.Invoke(ctx, HostState_GetSuggestions_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // HostStateServer is the server API for HostState service.
 // All implementations must embed UnimplementedHostStateServer
 // for forward compatibility.
@@ -161,6 +188,11 @@ type HostStateServer interface {
 	ReportHost(context.Context, *RegistryDocument) (*RegistryResponse, error)
 	RepairIdentity(context.Context, *RegistryDocument) (*RegistryResponse, error)
 	DHCPHandover(context.Context, *RegistryDocument) (*RegistryResponse, error)
+	// Switch DHCP-snooping / MAC-table evidence. Deployer only; never a grant.
+	ImportObservations(context.Context, *RegistryDocument) (*RegistryResponse, error)
+	// Reviewable proposals linking LAN bindings to tailnet peers. Read-only;
+	// nothing is applied except through RepairIdentity.
+	GetSuggestions(context.Context, *RegistryRequest) (*RegistryResponse, error)
 	mustEmbedUnimplementedHostStateServer()
 }
 
@@ -194,6 +226,12 @@ func (UnimplementedHostStateServer) RepairIdentity(context.Context, *RegistryDoc
 }
 func (UnimplementedHostStateServer) DHCPHandover(context.Context, *RegistryDocument) (*RegistryResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method DHCPHandover not implemented")
+}
+func (UnimplementedHostStateServer) ImportObservations(context.Context, *RegistryDocument) (*RegistryResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ImportObservations not implemented")
+}
+func (UnimplementedHostStateServer) GetSuggestions(context.Context, *RegistryRequest) (*RegistryResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetSuggestions not implemented")
 }
 func (UnimplementedHostStateServer) mustEmbedUnimplementedHostStateServer() {}
 func (UnimplementedHostStateServer) testEmbeddedByValue()                   {}
@@ -360,6 +398,42 @@ func _HostState_DHCPHandover_Handler(srv interface{}, ctx context.Context, dec f
 	return interceptor(ctx, in, info, handler)
 }
 
+func _HostState_ImportObservations_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RegistryDocument)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(HostStateServer).ImportObservations(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: HostState_ImportObservations_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(HostStateServer).ImportObservations(ctx, req.(*RegistryDocument))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _HostState_GetSuggestions_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RegistryRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(HostStateServer).GetSuggestions(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: HostState_GetSuggestions_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(HostStateServer).GetSuggestions(ctx, req.(*RegistryRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // HostState_ServiceDesc is the grpc.ServiceDesc for HostState service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -398,6 +472,14 @@ var HostState_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "DHCPHandover",
 			Handler:    _HostState_DHCPHandover_Handler,
+		},
+		{
+			MethodName: "ImportObservations",
+			Handler:    _HostState_ImportObservations_Handler,
+		},
+		{
+			MethodName: "GetSuggestions",
+			Handler:    _HostState_GetSuggestions_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

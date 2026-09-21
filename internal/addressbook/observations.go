@@ -19,8 +19,10 @@ type Observation struct {
 	Address string `json:"address"`
 	MAC     string `json:"mac"`
 	Origin  string `json:"origin"`
-	Seen    int64  `json:"seen"`
-	Until   int64  `json:"until"`
+	// Detail names where the sighting came from, for example a switch port.
+	Detail string `json:"detail,omitempty"`
+	Seen   int64  `json:"seen"`
+	Until  int64  `json:"until"`
 	// Historical marks evidence reconstructed from the event log for a past
 	// instant, as opposed to a current sighting.
 	Historical bool `json:"historical,omitempty"`
@@ -29,6 +31,29 @@ type Observation struct {
 // Observe records kernel neighbor evidence separately from DHCP allocations.
 // It neither claims a grant nor publishes an uncorroborated name in DNS.
 func (s *Store) Observe(c Config, observations []Observation) error {
+	for i := range observations {
+		observations[i].Origin = "kernel-neighbor"
+	}
+	return s.observe(c, observations, 120)
+}
+
+// ObserveSwitch records DHCP-snooping / MAC-table evidence exported by a
+// switch. It is stored and aged exactly like a kernel sighting and is equally
+// never a grant; ttl bounds how long the switch's word is trusted.
+func (s *Store) ObserveSwitch(c Config, observations []Observation, ttl int64) error {
+	if ttl < 10 || ttl > 3600 {
+		return fmt.Errorf("ttl must be 10..3600 seconds")
+	}
+	for i := range observations {
+		observations[i].Origin = "switch-snooping"
+		if len(observations[i].Detail) > 128 {
+			return fmt.Errorf("observation detail too long")
+		}
+	}
+	return s.observe(c, observations, ttl)
+}
+
+func (s *Store) observe(c Config, observations []Observation, ttl int64) error {
 	if len(observations) > 10000 {
 		return fmt.Errorf("too many observations")
 	}
@@ -48,9 +73,8 @@ func (s *Store) Observe(c Config, observations []Observation) error {
 			}
 			o.Address = ip.String()
 			o.MAC = mac.String()
-			o.Origin = "kernel-neighbor"
 			o.Seen = s.now().Unix()
-			o.Until = o.Seen + 120
+			o.Until = o.Seen + ttl
 			raw, e := json.Marshal(o)
 			if e != nil {
 				return e

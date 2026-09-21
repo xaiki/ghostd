@@ -151,11 +151,13 @@ func (s *Store) Report(c Config, node Node) ([]Binding, error) {
 			b.Evidence = "authenticated self-report + active DHCP MAC/address"
 			if b.Origin == "neighbor-report" {
 				var o Observation
+				source := "kernel-neighbor"
 				if raw := tx.Bucket(observationBucket).Get(bindingKey(b.Scope, b.Address)); raw != nil && json.Unmarshal(raw, &o) == nil && o.MAC == b.MAC && o.Until > now {
 					changed = changed || b.End != o.Until
 					b.End = o.Until
+					source = o.Origin
 				}
-				b.Evidence = "authenticated self-report + fresh kernel neighbor (not a DHCP grant)"
+				b.Evidence = "authenticated self-report + fresh " + source + " sighting (not a DHCP grant)"
 			}
 			if changed {
 				if err := s.save(tx, b, "associate"); err != nil {

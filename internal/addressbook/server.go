@@ -26,6 +26,7 @@ type Manager struct {
 	dhcp    map[string]*core.Servers
 	dns     map[string]*dnsPair
 	ra      map[string]*raListener
+	peers   func(context.Context) ([]Peer, error)
 }
 type dnsPair struct {
 	udp, tcp *dns.Server
@@ -329,4 +330,27 @@ func (s *Store) Handle4(c Config, scope Scope, r *dhcpv4.DHCPv4) (*dhcpv4.DHCPv4
 		return dhcpv4.NewReplyFromRequest(r, dhcpv4.WithMessageType(dhcpv4.MessageTypeAck), dhcpv4.WithClientIP(r.ClientIPAddr), dhcpv4.WithOption(dhcpv4.OptServerIdentifier(server)), dhcpv4.WithOption(dhcpv4.OptDNS(server)), dhcpv4.WithDomainSearchList(scope.Zone))
 	}
 	return nil, nil
+}
+
+// SetPeerSource wires the tailnet peer inventory (the authority's own
+// tailscaled) into the registry; without it no suggestions are produced.
+func (m *Manager) SetPeerSource(f func(context.Context) ([]Peer, error)) {
+	m.mu.Lock()
+	m.peers = f
+	m.mu.Unlock()
+}
+
+// CollectPeers refreshes the peer inventory once.
+func (m *Manager) CollectPeers(ctx context.Context) error {
+	m.mu.RLock()
+	f := m.peers
+	m.mu.RUnlock()
+	if f == nil {
+		return nil
+	}
+	peers, err := f(ctx)
+	if err != nil {
+		return err
+	}
+	return m.Store.SightPeers(peers)
 }

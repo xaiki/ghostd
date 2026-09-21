@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -188,5 +189,40 @@ func TestHandoverInteractionWithOrdinaryApplyOverRPC(t *testing.T) {
 	}
 	if _, e = s.Apply(ctx, &pb.ApplyRequest{Domain: domainDHCP, DesiredStateJson: dormantScope, DeadManSwitchSeconds: 60}); e != nil {
 		t.Fatal("apply blocked after rollback:", e)
+	}
+}
+
+func TestSwitchObservationsAndSuggestionsOverRPC(t *testing.T) {
+	s := registryServer(t)
+	ctx := withPeer(context.Background())
+	if _, e := s.Apply(ctx, &pb.ApplyRequest{Domain: domainDHCP, DesiredStateJson: dormantScope, DeadManSwitchSeconds: 60}); e != nil {
+		t.Fatal(e)
+	}
+	doc := `{"ttl_seconds":600,"observations":[{"scope":"lan","address":"10.0.0.50","mac":"00:11:22:33:44:77","detail":"sw1 Gi1/0/7"}]}`
+	if _, e := s.ImportObservations(ctx, &pb.RegistryDocument{Json: doc}); e != nil {
+		t.Fatal(e)
+	}
+	got, e := s.GetRegistry(ctx, &pb.RegistryRequest{})
+	if e != nil || !strings.Contains(got.Json, `"switch-snooping"`) || !strings.Contains(got.Json, "sw1 Gi1/0/7") {
+		t.Fatal(got, e)
+	}
+	// Bad input and unknown fields are refused, and a plain peer may not write.
+	if _, e = s.ImportObservations(ctx, &pb.RegistryDocument{Json: `{"observations":[{"scope":"lan","address":"10.0.0.50","mac":"zz"}]}`}); status.Code(e) != codes.InvalidArgument {
+		t.Fatal(e)
+	}
+	if _, e = s.ImportObservations(ctx, &pb.RegistryDocument{Json: `{"observations":[],"extra":1}`}); status.Code(e) != codes.InvalidArgument {
+		t.Fatal(e)
+	}
+	plain, _, _, _ := newTestServer(t, nil)
+	plain.DHCP = s.DHCP
+	if _, e = plain.ImportObservations(ctx, &pb.RegistryDocument{Json: doc}); status.Code(e) != codes.PermissionDenied {
+		t.Fatal("plain peer wrote switch evidence:", e)
+	}
+	if _, e = plain.GetSuggestions(ctx, &pb.RegistryRequest{}); e != nil {
+		t.Fatal("suggestions are read-only:", e)
+	}
+	sg, e := s.GetSuggestions(ctx, &pb.RegistryRequest{})
+	if e != nil || sg.Json != "[]" {
+		t.Fatal(sg, e)
 	}
 }

@@ -262,3 +262,43 @@ func (s *Server) DHCPHandover(ctx context.Context, req *pb.RegistryDocument) (*p
 	}
 	return document(j)
 }
+
+// ImportObservations records switch evidence (DHCP snooping, MAC tables). It
+// is a deployer call: the exporter describes what it saw, and the ledger keeps
+// that apart from any grant.
+func (s *Server) ImportObservations(ctx context.Context, req *pb.RegistryDocument) (*pb.RegistryResponse, error) {
+	if e := s.registryAuth(ctx, true); e != nil {
+		return nil, e
+	}
+	var doc struct {
+		TTL          int64                     `json:"ttl_seconds"`
+		Observations []addressbook.Observation `json:"observations"`
+	}
+	if e := decodeDocument(req.GetJson(), &doc); e != nil {
+		return nil, status.Error(codes.InvalidArgument, e.Error())
+	}
+	if doc.TTL == 0 {
+		doc.TTL = 300
+	}
+	unlock, e := s.store.Lock()
+	if e != nil {
+		return nil, e
+	}
+	defer unlock()
+	if e = s.DHCP.Store.ObserveSwitch(s.DHCP.Config(), doc.Observations, doc.TTL); e != nil {
+		return nil, status.Error(codes.InvalidArgument, e.Error())
+	}
+	return document(map[string]int{"observed": len(doc.Observations)})
+}
+
+// GetSuggestions lists reviewable peer associations. It is read-only.
+func (s *Server) GetSuggestions(ctx context.Context, _ *pb.RegistryRequest) (*pb.RegistryResponse, error) {
+	if e := s.registryAuth(ctx, false); e != nil {
+		return nil, e
+	}
+	suggestions, e := s.DHCP.Store.Suggest(s.DHCP.Config())
+	if e != nil {
+		return nil, e
+	}
+	return document(suggestions)
+}

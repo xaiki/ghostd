@@ -208,6 +208,7 @@ func runDaemonMode(store *state.Store, port int, deployerTag string, tailscaleIf
 	}
 	defer stopRegistry()
 	tsLocal := &tsclient.Client{}
+	manager.SetPeerSource(func(ctx context.Context) ([]addressbook.Peer, error) { return tailnetPeers(ctx, tsLocal) })
 	// DHCP and authoritative LAN DNS stay available even if tailscaled is
 	// unavailable at boot. RPC/container DNS begin once its address is known.
 	if watchdogSec > 0 {
@@ -320,4 +321,25 @@ func prepareDomain(store *state.Store, domain string, observeOnly bool) error {
 		return fmt.Errorf("observation mode requires a fresh %s domain; managed state exists", domain)
 	}
 	return nil
+}
+
+// tailnetPeers reads the peer inventory from the local tailscaled. LAN
+// endpoints come from what tailscaled itself learned about direct paths.
+func tailnetPeers(ctx context.Context, client *tsclient.Client) ([]addressbook.Peer, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	status, err := client.Status(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var peers []addressbook.Peer
+	for _, p := range status.Peer {
+		peer := addressbook.Peer{ID: string(p.ID), DNSName: p.DNSName, HostName: p.HostName, Online: p.Online,
+			LANAddrs: addressbook.PrivateEndpoints(append([]string{p.CurAddr}, p.Addrs...)...)}
+		for _, a := range p.TailscaleIPs {
+			peer.Addresses = append(peer.Addresses, a.String())
+		}
+		peers = append(peers, peer)
+	}
+	return peers, nil
 }
