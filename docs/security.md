@@ -1,7 +1,8 @@
 # Authentication and privilege
 
-ghostd authenticates every RPC caller through the host's own `tailscaled`, using
-its `WhoIs` API. There is no Unix-login path, no password, no token to
+ghostd authenticates every RPC caller through the host's own overlay client —
+`tailscaled` — using its `WhoIs` API, behind a provider seam (`internal/overlay`)
+that also serves Headscale; see [Choosing an overlay](#choosing-an-overlay). There is no Unix-login path, no password, no token to
 distribute, and no application-layer TLS — transport encryption comes from
 Tailscale, and the listener binds the node's tailnet address alone
 (`internal/auth`, `cmd/ghostd/main.go`). Binding a specific address rather than
@@ -176,3 +177,34 @@ to:
 - **The TFTP server** is read-only and confined to its root, but it is
   unauthenticated by nature; serve only files that may be world-readable on the
   LAN.
+
+## Choosing an overlay
+
+The network ghostd authenticates over is a provider, chosen by build tag
+(`tailscale`, `headscale`) and `--overlay`. A provider supplies three things: the
+one address to listen on (never a wildcard), who a remote address is, and (for
+DHCP peer suggestions) the peer list. Nothing else in ghostd sees a provider's
+own types.
+
+| | `tailscale` | `headscale` |
+| --- | --- | --- |
+| Host client | `tailscaled` | `tailscaled` joined to Headscale |
+| Identity | node, login, tags | node, login (Headscale user), tags |
+| Deploy authorization | capability `ghostd.local/cap/deploy`, tag, or `--deployer-user` | tag or `--deployer-user` only |
+| Report authorization | capability `ghostd.local/cap/report`, deploy, or tag | deploy (tag or login), since there is no report capability |
+
+**Headscale has no application-capability grants**, so the headscale provider
+drops any capability the client reports rather than believe something its control
+plane cannot have issued. Grant deployers with an ACL policy that tags the
+deployer nodes and lets them reach the daemon's port, and list workstation
+owners with `--deployer-user`:
+
+```json
+{"tagOwners": {"tag:stack-deployer": ["ops@example.com"]},
+ "acls": [{"action": "accept", "src": ["tag:stack-deployer"], "dst": ["*:7443"]}]}
+```
+
+Switching an existing host between the two is a rebuild (or a different binary)
+and a service argument: state, leases and rollback are independent of the
+overlay. Other overlays (plain WireGuard, for example) implement `overlay.Provider`
+and register from `init()` behind their own tag.

@@ -9,7 +9,8 @@ gofmt -l .                                             # must print nothing
 go test -race -tags "tailscale dhcp dnsmasq mdns coredns" ./...
 ```
 
-Optional features (`coredns`, `dhcp`, `dnsmasq`, `mdns`) are build tags; the
+The overlay providers (`tailscale`, `headscale`) and optional features
+(`coredns`, `dhcp`, `dnsmasq`, `mdns`) are build tags; the
 default build is the core only and must stay free of their dependencies. A new
 optional part lives behind its tag with a `!tag` stub only where the core needs a
 type to exist, registers itself from `init()` (`cmd/ghostd/feature.go`,
@@ -30,8 +31,8 @@ e2e container running for inspection.
 The daemon is CGO-free and cross-compiles:
 
 ```sh
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -o bin/ghostd-linux-arm64 ./cmd/ghostd
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o bin/ghostd-linux-amd64 ./cmd/ghostd
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -tags tailscale -o bin/ghostd-linux-arm64 ./cmd/ghostd
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -tags tailscale -o bin/ghostd-linux-amd64 ./cmd/ghostd
 ```
 
 ## Regenerating proto bindings

@@ -23,7 +23,7 @@ speaks the methods in [proto/ghoststate.proto](proto/ghoststate.proto).
 - `nft` with JSON input/output and inet-family NAT support; `ip` from
   iproute2; `sysctl`; `getent`; and `systemd-run` plus `systemctl` on the
   daemon's `PATH`.
-- A running, joined `tailscaled` using a kernel Tailscale interface. The default
+- A running, joined `tailscaled` (Tailscale, or Headscale-managed) using a kernel Tailscale interface. The default
   interface name is `tailscale0`; userspace-networking mode is not supported.
 - Go **1.26.7 or newer** to build (see [go.mod](go.mod)). Go is needed on the
   build machine only, never on the target.
@@ -45,12 +45,23 @@ opens only the sockets — it asked for:
 | `mdns` | Native mDNS: `.local` and DNS-SD for containers (with `coredns`), and the `mdns-v1` advertisement domain | — |
 
 ```sh
-go build -trimpath -o bin/ghostd ./cmd/ghostd                                         # core only
-go build -trimpath -tags "coredns mdns" -o bin/ghostd ./cmd/ghostd                    # container DNS + native .local
-go build -trimpath -tags "dhcp coredns" -o bin/ghostd ./cmd/ghostd                    # a DHCP/DNS authority
-go build -trimpath -tags "tailscale dhcp dnsmasq mdns coredns" -o bin/ghostd ./cmd/ghostd       # everything
+go build -trimpath -tags tailscale -o bin/ghostd ./cmd/ghostd                         # firewall + netconfig over Tailscale
+go build -trimpath -tags headscale -o bin/ghostd ./cmd/ghostd                         # the same over Headscale
+go build -trimpath -tags "tailscale coredns mdns" -o bin/ghostd ./cmd/ghostd          # + container DNS with native .local
+go build -trimpath -tags "tailscale dhcp coredns" -o bin/ghostd ./cmd/ghostd          # + a DHCP/DNS authority
+go build -trimpath -tags "tailscale dhcp dnsmasq mdns coredns" -o bin/ghostd ./cmd/ghostd   # everything
 bin/ghostd --features                                                                 # what this binary contains
 ```
+
+The **overlay** (the private network ghostd authenticates callers over and binds
+its listeners to) is a provider behind `internal/overlay`, chosen by tag at build
+time and by `--overlay` at run time; a binary needs at least one to serve, but
+`--render-firewall`, `--revert-lease` and `--features` work without. Headscale
+hosts run the same `tailscaled` client, so the two providers share one local-API
+client and differ only in what they trust it to say: **Headscale has no
+application-capability grants**, so the headscale provider ignores any capability
+the client reports and authorizes by node tag (`--deployer-tag`) or owner login
+(`--deployer-user`). See [docs/security.md](docs/security.md#choosing-an-overlay).
 
 A combination that breaks a dependency (`dnsmasq` without `dhcp`, `dhcp` without
 `coredns`) does not compile. Features that are not built in are absent, not
@@ -62,7 +73,7 @@ documentation says which tag a feature needs.
 For a Linux ARM64 target built on another OS, the binary is CGO-free:
 
 ```sh
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -tags "dhcp coredns" -o bin/ghostd-linux-arm64 ./cmd/ghostd
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -tags "tailscale dhcp coredns" -o bin/ghostd-linux-arm64 ./cmd/ghostd
 ```
 
 Tests take the same tags (`go test -tags "tailscale dhcp dnsmasq mdns coredns" ./...`);
