@@ -1,4 +1,4 @@
-module smarthome/ghostd
+module github.com/xaiki/ghostd
 
 go 1.26.7
 

@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package ghostd;
 
-option go_package = "smarthome/ghostd/proto";
+option go_package = "github.com/xaiki/ghostd/proto";
 
 // HostState is ghostd's whole RPC surface (README.md): the
 // daemon does not decide policy, it executes a state Nornir already

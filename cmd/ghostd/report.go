@@ -9,10 +9,10 @@ import (
 	"net/netip"
 	"time"
 
+	"github.com/xaiki/ghostd/internal/addressbook"
+	pb "github.com/xaiki/ghostd/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-	"smarthome/ghostd/internal/addressbook"
-	pb "smarthome/ghostd/proto"
 )
 
 // Identity is resolved by the receiver using tailscaled WhoIs. The sender can

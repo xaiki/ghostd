@@ -80,7 +80,7 @@ func TestCancelStopsTheArmedUnit(t *testing.T) {
 		t.Fatalf("expected arm + cancel calls, got %v", runner.calls)
 	}
 	cancelCall := runner.calls[1]
-	if cancelCall[0] != "systemctl" || cancelCall[1] != "stop" || cancelCall[2] != "smarthome-ghostd-revert-lease-1.timer" {
+	if cancelCall[0] != "systemctl" || cancelCall[1] != "stop" || cancelCall[2] != "ghostd-revert-lease-1.timer" {
 		t.Fatalf("expected systemctl stop, got %v", cancelCall)
 	}
 }

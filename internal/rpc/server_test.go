@@ -16,11 +16,11 @@ import (
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/tailcfg"
 
-	"smarthome/ghostd/internal/auth"
-	"smarthome/ghostd/internal/netconfig"
-	"smarthome/ghostd/internal/nft"
-	"smarthome/ghostd/internal/state"
-	pb "smarthome/ghostd/proto"
+	"github.com/xaiki/ghostd/internal/auth"
+	"github.com/xaiki/ghostd/internal/netconfig"
+	"github.com/xaiki/ghostd/internal/nft"
+	"github.com/xaiki/ghostd/internal/state"
+	pb "github.com/xaiki/ghostd/proto"
 )
 
 // validDesiredStateJSON is the smallest DesiredState that passes

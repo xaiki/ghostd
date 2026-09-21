@@ -109,7 +109,7 @@ IP; optional port). The deployed daemon reports its active interfaces every
 minute. A standalone invocation also works:
 
 ```
-/opt/smarthome/ghostd/ghostd --report-to AUTHORITY
+/opt/ghostd/ghostd --report-to AUTHORITY
 ```
 
 The authority's `ghostd.reporters` accepts explicit user/group/tag selectors,

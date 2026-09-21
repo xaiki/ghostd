@@ -47,7 +47,7 @@ func NewLeases(binaryPath string, runner CommandRunner) *Leases {
 }
 
 func unitName(leaseID string) string {
-	return "smarthome-ghostd-revert-" + leaseID
+	return "ghostd-revert-" + leaseID
 }
 
 // NewLeaseID mints an opaque lease identifier — a caller has no business
@@ -76,7 +76,7 @@ func (l *Leases) Arm(leaseID string, domain string, timeout time.Duration, store
 	unit := unitName(leaseID)
 	args := []string{
 		"--unit=" + unit,
-		"--description=smarthome-ghostd dead-man's-switch revert",
+		"--description=ghostd dead-man's-switch revert",
 		fmt.Sprintf("--on-active=%ds", int(timeout.Seconds())),
 		"--timer-property=AccuracySec=100ms",
 		"--property=Restart=on-failure",

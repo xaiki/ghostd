@@ -1,4 +1,4 @@
-// smarthome-ghostd: one rootful daemon per host, owning firewalling
+// ghostd: one rootful daemon per host, owning firewalling
 // (nftables), netconfig, and ingress port mapping, authenticated over the
 // tailnet rather than by Unix login. See README.md.
 //
@@ -25,21 +25,21 @@ import (
 
 	"google.golang.org/grpc"
 
-	"smarthome/ghostd/internal/addressbook"
-	"smarthome/ghostd/internal/auth"
-	"smarthome/ghostd/internal/netconfig"
-	"smarthome/ghostd/internal/nft"
-	"smarthome/ghostd/internal/resolver"
-	"smarthome/ghostd/internal/rpc"
-	"smarthome/ghostd/internal/sdnotify"
-	"smarthome/ghostd/internal/state"
-	pb "smarthome/ghostd/proto"
+	"github.com/xaiki/ghostd/internal/addressbook"
+	"github.com/xaiki/ghostd/internal/auth"
+	"github.com/xaiki/ghostd/internal/netconfig"
+	"github.com/xaiki/ghostd/internal/nft"
+	"github.com/xaiki/ghostd/internal/resolver"
+	"github.com/xaiki/ghostd/internal/rpc"
+	"github.com/xaiki/ghostd/internal/sdnotify"
+	"github.com/xaiki/ghostd/internal/state"
+	pb "github.com/xaiki/ghostd/proto"
 
 	tsclient "tailscale.com/client/local"
 )
 
 const (
-	defaultStoreDir       = "/var/lib/smarthome-ghostd/last-good"
+	defaultStoreDir       = "/var/lib/ghostd/last-good"
 	defaultPort           = 7443
 	defaultDeployTag      = "tag:stack-deployer"
 	defaultTailscaleIface = "tailscale0" // Linux's own convention; see the --tailscale-interface flag

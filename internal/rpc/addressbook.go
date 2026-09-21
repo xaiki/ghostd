@@ -8,10 +8,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/xaiki/ghostd/internal/addressbook"
+	pb "github.com/xaiki/ghostd/proto"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"smarthome/ghostd/internal/addressbook"
-	pb "smarthome/ghostd/proto"
 )
 
 const domainDHCP = "dhcp-v1"

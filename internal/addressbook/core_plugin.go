@@ -13,7 +13,7 @@ import (
 	"github.com/coredhcp/coredhcp/plugins"
 	"github.com/insomniacslk/dhcp/dhcpv4"
 	"github.com/insomniacslk/dhcp/dhcpv6"
-	core "smarthome/ghostd/internal/coredhcpserver"
+	core "github.com/xaiki/ghostd/internal/coredhcpserver"
 )
 
 type pluginInstance struct {

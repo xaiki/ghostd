@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"smarthome/ghostd/internal/addressbook"
-	"smarthome/ghostd/internal/state"
+	"github.com/xaiki/ghostd/internal/addressbook"
+	"github.com/xaiki/ghostd/internal/state"
 )
 
 func TestDeadmanDHCPRevertsConfigWithoutRewindingLeases(t *testing.T) {

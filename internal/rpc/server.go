@@ -8,19 +8,18 @@ import (
 	"context"
 	"encoding/json"
 	"log"
-	"smarthome/ghostd/internal/observation"
 	"time"
 
+	"github.com/xaiki/ghostd/internal/addressbook"
+	"github.com/xaiki/ghostd/internal/auth"
+	"github.com/xaiki/ghostd/internal/netconfig"
+	"github.com/xaiki/ghostd/internal/nft"
+	"github.com/xaiki/ghostd/internal/observation"
+	"github.com/xaiki/ghostd/internal/state"
+	pb "github.com/xaiki/ghostd/proto"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
-
-	"smarthome/ghostd/internal/addressbook"
-	"smarthome/ghostd/internal/auth"
-	"smarthome/ghostd/internal/netconfig"
-	"smarthome/ghostd/internal/nft"
-	"smarthome/ghostd/internal/state"
-	pb "smarthome/ghostd/proto"
 )
 
 // Legacy blob names are read only when a domain has no transaction record.

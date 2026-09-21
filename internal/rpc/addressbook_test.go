@@ -7,11 +7,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/xaiki/ghostd/internal/addressbook"
+	"github.com/xaiki/ghostd/internal/auth"
+	pb "github.com/xaiki/ghostd/proto"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"smarthome/ghostd/internal/addressbook"
-	"smarthome/ghostd/internal/auth"
-	pb "smarthome/ghostd/proto"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/tailcfg"
 )

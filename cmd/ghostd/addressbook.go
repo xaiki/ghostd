@@ -8,9 +8,9 @@ import (
 	"path/filepath"
 	"time"
 
-	"smarthome/ghostd/internal/addressbook"
-	"smarthome/ghostd/internal/resolver"
-	"smarthome/ghostd/internal/state"
+	"github.com/xaiki/ghostd/internal/addressbook"
+	"github.com/xaiki/ghostd/internal/resolver"
+	"github.com/xaiki/ghostd/internal/state"
 )
 
 func restoreDHCPConfig(store *state.Store, raw []byte) error {

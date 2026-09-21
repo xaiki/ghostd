@@ -549,7 +549,7 @@ const file_ghoststate_proto_rawDesc = "" +
 	"\n" +
 	"ReportHost\x12\x18.ghostd.RegistryDocument\x1a\x18.ghostd.RegistryResponse\x12D\n" +
 	"\x0eRepairIdentity\x12\x18.ghostd.RegistryDocument\x1a\x18.ghostd.RegistryResponse\x12B\n" +
-	"\fDHCPHandover\x12\x18.ghostd.RegistryDocument\x1a\x18.ghostd.RegistryResponseB\x18Z\x16smarthome/ghostd/protob\x06proto3"
+	"\fDHCPHandover\x12\x18.ghostd.RegistryDocument\x1a\x18.ghostd.RegistryResponseB\x1fZ\x1dgithub.com/xaiki/ghostd/protob\x06proto3"
 
 var (
 	file_ghoststate_proto_rawDescOnce sync.Once

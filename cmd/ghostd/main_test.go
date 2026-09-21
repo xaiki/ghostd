@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"smarthome/ghostd/internal/nft"
-	"smarthome/ghostd/internal/rpc"
-	"smarthome/ghostd/internal/state"
+	"github.com/xaiki/ghostd/internal/nft"
+	"github.com/xaiki/ghostd/internal/rpc"
+	"github.com/xaiki/ghostd/internal/state"
 )
 
 func TestIntegrationRevertUsesSnapshotAndLateTimerCannotUndoConfirm(t *testing.T) {

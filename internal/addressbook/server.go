@@ -7,13 +7,13 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
-	core "smarthome/ghostd/internal/coredhcpserver"
 	"sync"
 
 	"github.com/coredns/coredns/plugin"
 	"github.com/insomniacslk/dhcp/dhcpv4"
 	"github.com/insomniacslk/dhcp/dhcpv6"
 	"github.com/miekg/dns"
+	core "github.com/xaiki/ghostd/internal/coredhcpserver"
 )
 
 type Manager struct {

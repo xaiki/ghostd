@@ -19,7 +19,7 @@ import (
 	"github.com/miekg/dns"
 )
 
-const RuntimeDir = "/run/smarthome-ghostd"
+const RuntimeDir = "/run/ghostd"
 
 func init() {
 	plugin.Register("ghostlocal", func(c *caddy.Controller) error {

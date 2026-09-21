@@ -10,7 +10,7 @@ recovered from a durable pre-apply snapshot, even if the daemon exits.
 
 The Go module is self-contained: this directory can be published as its own
 repository. It needs neither Python nor the parent project's inventory, plugins,
-or deployment tools. The current module name (`smarthome/ghostd`), service name,
+or deployment tools. The current module name (`github.com/xaiki/ghostd`), service name,
 and default paths are retained for existing installations.
 
 ## Requirements
@@ -75,11 +75,11 @@ CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -o bin/ghostd-linux-arm
 On the target Linux host, install its native binary and the supplied unit:
 
 ```sh
-sudo install -D -m 0755 bin/ghostd /opt/smarthome/ghostd/ghostd
-sudo install -m 0644 systemd/smarthome-ghostd.service /etc/systemd/system/smarthome-ghostd.service
+sudo install -D -m 0755 bin/ghostd /opt/ghostd/ghostd
+sudo install -m 0644 systemd/ghostd.service /etc/systemd/system/ghostd.service
 sudo systemctl daemon-reload
-sudo systemctl enable --now smarthome-ghostd.service
-sudo systemctl status smarthome-ghostd.service
+sudo systemctl enable --now ghostd.service
+sudo systemctl status ghostd.service
 ```
 
 Use the cross-compiled binary instead of `bin/ghostd` when applicable. The unit
@@ -243,7 +243,7 @@ rollback occurred.
 
 ## Persistence and recovery
 
-The default store is `/var/lib/smarthome-ghostd/last-good`, created with mode 0700.
+The default store is `/var/lib/ghostd/last-good`, created with mode 0700.
 Transaction files are mode 0600 and atomically replaced with file and directory
 syncs. They contain confirmed state and, while applying, the lease ID, deadline,
 pre-apply snapshot, target, source peer, and successful-apply marker. Preserve this
@@ -271,9 +271,9 @@ new domain transaction record does not exist.
 Useful diagnostics on the host:
 
 ```sh
-sudo journalctl -u smarthome-ghostd.service -b
-sudo systemctl list-timers 'smarthome-ghostd-revert-*'
-sudo journalctl -u 'smarthome-ghostd-revert-*' -b
+sudo journalctl -u ghostd.service -b
+sudo systemctl list-timers 'ghostd-revert-*'
+sudo journalctl -u 'ghostd-revert-*' -b
 sudo nft list table inet stack_ghostd
 ```
 
@@ -290,7 +290,7 @@ until all pending leases have been confirmed or recovered.
 | `--port` | `7443` | TCP listener and firewall reachability-guard port |
 | `--deployer-tag` | `tag:stack-deployer` | Alternative caller node tag for mutations |
 | `--tailscale-interface` | `tailscale0` | Interface allowed by the reachability guard |
-| `--store-dir` | `/var/lib/smarthome-ghostd/last-good` | Durable transaction storage |
+| `--store-dir` | `/var/lib/ghostd/last-good` | Durable transaction storage |
 | `--watchdog-sec` | `0` | Watchdog interval setting; match systemd `WatchdogSec` |
 | `--render-firewall` | false | Render stdin JSON to nft syntax and exit |
 | `--revert-lease`, `--revert-domain` | empty | Internal timer recovery command |
@@ -362,7 +362,7 @@ answers are cached for at most 30 seconds. A failed host lookup returns SERVFAIL
 not a fabricated address; missing names return NXDOMAIN.
 
 After binding successfully, ghostd atomically publishes
-`/run/smarthome-ghostd/dns.env` and `resolv.conf`. Systemd owns this runtime
+`/run/ghostd/dns.env` and `resolv.conf`. Systemd owns this runtime
 directory. Generated bridged Quadlets on ghostd-enabled hosts read `dns.env`
 into the service environment and pass its address as Podman's upstream DNS.
 Aardvark continues answering container aliases. The resolver file is available

@@ -1,6 +1,6 @@
 # ghostd — installation and recovery instructions: README.md.
 [Unit]
-Description=smarthome-ghostd — tailnet-authenticated firewall/netconfig/ingress daemon
+Description=ghostd — tailnet-authenticated firewall/netconfig/ingress daemon
 # tailscaled.service: ghostd binds its RPC listener to the tailnet address
 # alone, waiting for it while configured LAN DHCP/DNS remains available.
 # Start after tailscaled has a chance to be up. network-pre.target:
@@ -14,9 +14,9 @@ Wants=network-pre.target tailscaled.service
 
 [Service]
 Type=notify
-RuntimeDirectory=smarthome-ghostd
+RuntimeDirectory=ghostd
 RuntimeDirectoryMode=0755
-ExecStart=/opt/smarthome/ghostd/ghostd --watchdog-sec=30
+ExecStart=/opt/ghostd/ghostd --watchdog-sec=30
 Restart=always
 RestartSec=5
 WatchdogSec=30
