@@ -145,6 +145,9 @@ type natRule struct {
 	lanIndex int
 	label    string
 	now      func() time.Time
+	// removed holds instances that left (goodbye or expiry) since the last
+	// announcement, so the LAN is told with TTL-0 records rather than left to cache.
+	removed []*natInstance
 }
 
 type natHost struct {
@@ -305,8 +308,19 @@ func (n *natRule) learn(m *dns.Msg) (changed bool) {
 func (n *natRule) drop(i *natInstance) {
 	if i.hostPort != 0 {
 		delete(n.used, i.hostPort)
+		c := *i
+		n.removed = append(n.removed, &c)
 	}
 	delete(n.insts, i.key())
+}
+
+// takeRemoved returns and clears the instances withdrawn since the last call.
+func (n *natRule) takeRemoved() []*natInstance {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	out := n.removed
+	n.removed = nil
+	return out
 }
 
 // expire removes instances whose records lapsed, reporting whether any did.
@@ -356,8 +370,12 @@ func (n *natRule) mappings() []natMapping {
 // at ghostd's LAN address and the mapped port. Only IPv4 is mapped, so only IPv4
 // addresses are published.
 func (n *natRule) answerer(addrs func(string) ([]netip.Addr, error)) answerer {
+	return n.answererFor(n.published(), addrs)
+}
+
+func (n *natRule) answererFor(insts []*natInstance, addrs func(string) ([]netip.Addr, error)) answerer {
 	cfg := Config{Host: n.label}
-	for _, i := range n.published() {
+	for _, i := range insts {
 		var subs []string
 		for s := range i.subtypes {
 			subs = append(subs, s)
@@ -426,14 +444,30 @@ func (r *running) announceNAT(n *natRule, ttl uint32) {
 	if i, ok := r.ifaces[n.lanIndex]; ok {
 		name = i.Name
 	}
-	rrs := a.all(name, ttl)
-	if len(rrs) == 0 {
-		return
+	if rrs := a.all(name, ttl); len(rrs) > 0 {
+		m := new(dns.Msg)
+		m.Response, m.Authoritative = true, true
+		m.Answer = rrs
+		r.emit(n.lanIndex, m)
 	}
-	m := new(dns.Msg)
-	m.Response, m.Authoritative = true, true
-	m.Answer = rrs
-	r.emit(n.lanIndex, m)
+	// Whatever left since the last announcement is withdrawn explicitly (TTL 0), so
+	// LAN caches drop it now instead of after its lifetime.
+	if gone := n.takeRemoved(); len(gone) > 0 && ttl != 0 {
+		bye := n.answererFor(gone, r.a.addrs).all(name, 0)
+		var srvOnly []dns.RR
+		for _, rr := range bye {
+			switch rr.Header().Rrtype {
+			case dns.TypePTR, dns.TypeSRV, dns.TypeTXT:
+				srvOnly = append(srvOnly, rr) // the host's address record may still serve others
+			}
+		}
+		if len(srvOnly) > 0 {
+			m := new(dns.Msg)
+			m.Response, m.Authoritative = true, true
+			m.Answer = srvOnly
+			r.emit(n.lanIndex, m)
+		}
+	}
 }
 
 // natLearn is called for a container network's responses.
@@ -482,9 +516,12 @@ func (r *running) natAnswer(m *dns.Msg, src *net.UDPAddr, ifIndex int, v6 bool) 
 	}
 }
 
+// natSweep is how often expired instances are swept.
+var natSweep = 5 * time.Second
+
 // runNAT sweeps expired instances every few seconds.
 func (r *running) runNAT() {
-	t := time.NewTicker(5 * time.Second)
+	t := time.NewTicker(natSweep)
 	defer t.Stop()
 	for {
 		select {

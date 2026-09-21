@@ -242,6 +242,17 @@ func TestContainerServiceIsReadvertisedOnTheLANAndMapped(t *testing.T) {
 	if len(n.published()) != 0 || strings.Contains(fake.last(), "dnat") {
 		t.Fatal("goodbye left a mapping behind:", fake.last())
 	}
+	withdrawn := false
+	for _, m := range emitted {
+		for _, rr := range m.Answer {
+			if p, ok := rr.(*dns.PTR); ok && p.Hdr.Ttl == 0 && strings.Contains(p.Ptr, "Office") {
+				withdrawn = true
+			}
+		}
+	}
+	if !withdrawn {
+		t.Fatal("the LAN was not sent a TTL-0 withdrawal for the instance that left:", emitted)
+	}
 	// Stopping withdraws everything and removes the table.
 	r.handle(pack(containerAnnouncement("printer", "10.90.0.10", "Office", 631, 120)), &net.UDPAddr{IP: net.ParseIP("10.90.0.10"), Port: 5353}, 10, false)
 	r.stopNAT()
