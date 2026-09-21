@@ -3,7 +3,7 @@
 Build tags: `mdns` (native client, `mdns-v1`) and `coredns` (container resolver,
 ACL); the two together give containers native `.local`.
 
-Status: **built, except the multicast reflector — which the design rules out.** The
+Status: **built, including the per-container multicast reflector.** The
 decisions this document left open are settled in [What was decided and built](#what-was-decided-and-built)
 below; the analysis after it is kept because it is why those decisions were made.
 
@@ -13,12 +13,12 @@ below; the analysis after it is kept because it is why those decisions were made
 | --- | --- | --- |
 | Retiring avahi breaks `.local` | ghostd owns mDNS **queries** natively: legacy-unicast queries from an ephemeral port, so it never binds UDP 5353. `getent` remains only as a fallback when no interface can send. Lab: no avahi on the host, a third-party responder on the LAN, `.local` still resolves. | `internal/mdns/query.go`, `internal/resolver/resolver.go` |
 | Which ACL shape | **Authenticated unicast browsing.** The identity of a query is the resolver *listener* it arrived on, never a source address. Per-container networks and one shared permission were rejected: the first costs a network per permission set, the second is not an ACL. | `internal/resolver/acl.go` |
-| Reflector | **Not built, deliberately.** One multicast stream cannot carry one container's permission, so reflecting into a shared bridge would defeat the ACL. An application that can only speak mDNS itself still needs host networking (shape (a) stays as the escape hatch). | — |
+| Reflector | **Built, per container network.** Reflecting into a *shared* bridge cannot carry a per-container permission, but a network per container (or pod) can: the permission is then a property of the network. ghostd relays between the LAN and each container network's bridge through that network's own filter — LAN records for the allowed service classes (plus the SRV/TXT/address records of the instances they name) inward, and only allowed *queries* outward. An app that speaks mDNS itself needs no host networking. Shape (a) remains the escape hatch. | `internal/mdns/reflect.go` |
 | Where the record set is declared | The `mdns-v1` domain: an explicit, reviewable list, riding the ordinary lease, confirmation and rollback. | `internal/mdns/advertise.go`, `internal/rpc/addressbook.go` |
 | Conflicts | Before advertising, ghostd **probes** each name; a name another host already owns refuses the apply and leaves the previous set running. Lab: avahi owns "Lobby Printer"; advertising over it is refused. | `internal/mdns/service.go` |
 | Records are captured, not recalled | Unchanged. ghostd ships **no** Time Machine record set: supply one captured from a known-good advertisement. | — |
 
-The ACL and the mDNS domain are described for operators in [dhcp.md](dhcp.md#per-container-dns-acl)
+The reflector's one deliberate limit: a container's own advertisements are not reflected out, because its address is private to the bridge; anything that must be found from the LAN is declared in `mdns-v1` with the host's address and published port. The ACL, the reflector and the mDNS domain are described for operators in [dhcp.md](dhcp.md#per-container-dns-acl)
 and [operations.md](operations.md#mdns-advertisement).
 
 ## Analysis (why)

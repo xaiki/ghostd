@@ -30,6 +30,13 @@ func NewService() *Service { return &Service{Addrs: InterfaceAddrs} }
 
 func (s *Service) Config() Config { s.mu.Lock(); defer s.mu.Unlock(); return s.cfg }
 
+// reflectRule is a ReflectRule resolved to interface indexes with its filter.
+type reflectRule struct {
+	cfg      ReflectRule
+	f        *filter
+	lan, net int
+}
+
 type running struct {
 	a      answerer
 	ifaces map[int]net.Interface
@@ -40,6 +47,11 @@ type running struct {
 
 	// testSend captures replies instead of using sockets.
 	testSend func(*dns.Msg)
+	// testForward captures reflected messages (destination interface index).
+	testForward func(ifIndex int, m *dns.Msg)
+
+	advertise map[int]bool
+	rules     []*reflectRule
 
 	mu      sync.Mutex
 	probing bool
@@ -89,8 +101,8 @@ func (s *Service) Close() {
 }
 
 func (s *Service) start(cfg Config) (*running, error) {
-	r := &running{a: answerer{cfg: cfg, addrs: s.Addrs}, ifaces: map[int]net.Interface{}, done: make(chan struct{})}
-	for _, name := range cfg.Interfaces {
+	r := &running{a: answerer{cfg: cfg, addrs: s.Addrs}, ifaces: map[int]net.Interface{}, advertise: map[int]bool{}, done: make(chan struct{})}
+	lookup := func(name string) (*net.Interface, error) {
 		i, err := net.InterfaceByName(name)
 		if err != nil {
 			return nil, fmt.Errorf("mdns: interface %s: %w", name, err)
@@ -99,6 +111,27 @@ func (s *Service) start(cfg Config) (*running, error) {
 			return nil, fmt.Errorf("mdns: interface %s is not multicast capable", name)
 		}
 		r.ifaces[i.Index] = *i
+		return i, nil
+	}
+	if len(cfg.Records) > 0 {
+		for _, name := range cfg.Interfaces {
+			i, err := lookup(name)
+			if err != nil {
+				return nil, err
+			}
+			r.advertise[i.Index] = true
+		}
+	}
+	for _, rule := range cfg.Reflect {
+		lan, err := lookup(rule.LAN)
+		if err != nil {
+			return nil, err
+		}
+		ctr, err := lookup(rule.Network)
+		if err != nil {
+			return nil, err
+		}
+		r.rules = append(r.rules, &reflectRule{cfg: rule, f: newFilter(rule.AllowServices), lan: lan.Index, net: ctr.Index})
 	}
 	pc4, err := net.ListenPacket("udp4", "0.0.0.0:5353")
 	if err != nil {
@@ -125,12 +158,15 @@ func (s *Service) start(cfg Config) (*running, error) {
 			_ = r.c6.JoinGroup(&i, &net.UDPAddr{IP: group6.IP})
 		}
 	}
-	r.probing = true
+	r.probing = len(cfg.Records) > 0
 	r.wg.Add(1)
 	go func() { defer r.wg.Done(); r.serve4() }()
 	if r.c6 != nil {
 		r.wg.Add(1)
 		go func() { defer r.wg.Done(); r.serve6() }()
+	}
+	if len(cfg.Records) == 0 {
+		return r, nil // a pure reflector claims no names: nothing to probe or announce
 	}
 	// Probe: ask for every name we are about to claim, three times. Anyone who
 	// answers already owns it, and we must not advertise over them.
@@ -143,8 +179,8 @@ func (s *Service) start(cfg Config) (*running, error) {
 		for _, name := range names {
 			q.Question = append(q.Question, dns.Question{Name: name, Qtype: dns.TypeANY, Qclass: dns.ClassINET | 0x8000})
 		}
-		for _, i := range r.ifaces {
-			r.send4(q, i.Index, group4)
+		for idx := range r.advertise {
+			r.send4(q, idx, group4)
 		}
 		time.Sleep(probeGap)
 	}
@@ -187,7 +223,8 @@ func (r *running) send6(m *dns.Msg, ifIndex int, dst *net.UDPAddr) {
 }
 
 func (r *running) announce(ttl uint32) {
-	for _, i := range r.ifaces {
+	for idx := range r.advertise {
+		i := r.ifaces[idx]
 		m := new(dns.Msg)
 		m.Response, m.Authoritative = true, true
 		m.Answer = r.a.all(i.Name, ttl)
@@ -239,6 +276,10 @@ func (r *running) handle(data []byte, src *net.UDPAddr, ifIndex int, v6 bool) {
 	}
 	m := new(dns.Msg)
 	if m.Unpack(data) != nil {
+		return
+	}
+	r.reflect(m, ifIndex, v6)
+	if !r.advertise[ifIndex] {
 		return
 	}
 	if m.Response {
@@ -321,5 +362,36 @@ func (r *running) serve6() {
 		if udp, ok := src.(*net.UDPAddr); ok {
 			r.handle(append([]byte(nil), buf[:n]...), udp, cm.IfIndex, true)
 		}
+	}
+}
+
+// reflect relays one packet between a LAN and the container networks attached to
+// it, through each network's own filter.
+func (r *running) reflect(m *dns.Msg, ifIndex int, v6 bool) {
+	for _, rule := range r.rules {
+		switch {
+		case ifIndex == rule.net && !m.Response:
+			// A container asking: only what the network may ask goes to the LAN.
+			if q := rule.f.Queries(m); q != nil {
+				r.forward(q, rule.lan, v6)
+			}
+		case ifIndex == rule.lan && m.Response:
+			// The LAN answering or announcing: only what the network may see goes in.
+			if resp := rule.f.Responses(m); resp != nil {
+				r.forward(resp, rule.net, v6)
+			}
+		}
+	}
+}
+
+func (r *running) forward(m *dns.Msg, ifIndex int, v6 bool) {
+	if r.testForward != nil {
+		r.testForward(ifIndex, m)
+		return
+	}
+	if v6 {
+		r.send6(m, ifIndex, group6)
+	} else {
+		r.send4(m, ifIndex, group4)
 	}
 }

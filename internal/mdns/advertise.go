@@ -29,6 +29,9 @@ type Config struct {
 	// addresses of the advertising interface.
 	Host    string   `json:"host"`
 	Records []Record `json:"records"`
+	// Reflect relays mDNS between the LAN and per-container networks, filtered by
+	// what each network may see (see reflect.go).
+	Reflect []ReflectRule `json:"reflect,omitempty"`
 }
 
 // Record is one DNS-SD service instance.
@@ -62,11 +65,17 @@ func ParseConfig(raw []byte) (Config, error) {
 	return c, c.Validate()
 }
 
-// Empty reports whether the config advertises nothing.
-func (c Config) Empty() bool { return len(c.Records) == 0 }
+// Empty reports whether the config advertises and reflects nothing.
+func (c Config) Empty() bool { return len(c.Records) == 0 && len(c.Reflect) == 0 }
 
 func (c Config) Validate() error {
 	if c.Empty() {
+		return nil
+	}
+	if err := c.validateReflect(); err != nil {
+		return err
+	}
+	if len(c.Records) == 0 {
 		return nil
 	}
 	if len(c.Interfaces) == 0 || len(c.Interfaces) > 16 {
@@ -350,3 +359,38 @@ func (a answerer) conflicts(resp *dns.Msg) string {
 }
 
 var probeGap = 250 * time.Millisecond
+
+func (c Config) validateReflect() error {
+	if len(c.Reflect) > 32 {
+		return fmt.Errorf("mdns: at most 32 reflect rules")
+	}
+	networks := map[string]bool{}
+	for _, r := range c.Reflect {
+		for _, n := range []string{r.LAN, r.Network} {
+			if n == "" || len(n) > 15 || strings.ContainsAny(n, " /") {
+				return fmt.Errorf("mdns: bad reflect interface %q", n)
+			}
+		}
+		if r.LAN == r.Network {
+			return fmt.Errorf("mdns: reflect lan and network are both %s", r.LAN)
+		}
+		if networks[r.Network] {
+			return fmt.Errorf("mdns: network %s has two reflect rules; a network is one permission set, list its services once", r.Network)
+		}
+		networks[r.Network] = true
+		if len(r.AllowServices) == 0 || len(r.AllowServices) > 32 {
+			return fmt.Errorf("mdns: network %s needs 1..32 allow_services", r.Network)
+		}
+		for _, s := range r.AllowServices {
+			if !serviceRE.MatchString(s) {
+				return fmt.Errorf("mdns: %q is not a service class like _ipp._tcp", s)
+			}
+		}
+	}
+	for _, r := range c.Reflect {
+		if networks[r.LAN] {
+			return fmt.Errorf("mdns: %s is both a LAN and a container network", r.LAN)
+		}
+	}
+	return nil
+}

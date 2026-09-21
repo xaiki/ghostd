@@ -224,7 +224,7 @@ func bindingFor(address string) map[string]any {
 	return nil
 }
 
-const firewallDoc = `{"zones":{"trusted":{"interfaces":["tailscale0"]},"lan":{"interfaces":["lab0"],"services":["dns","dhcp","mdns","tftp"],"ports":[{"port":%d,"proto":"tcp"}]}}}`
+const firewallDoc = `{"zones":{"trusted":{"interfaces":["tailscale0"]},"ctr":{"interfaces":["ctr0","ctr1"],"services":["mdns"]},"lan":{"interfaces":["lab0"],"services":["dns","dhcp","mdns","tftp"],"ports":[{"port":%d,"proto":"tcp"}]}}}`
 
 func target(enabled bool) string {
 	return fmt.Sprintf(`{"scopes":[{"id":"lan","interface":"lab0","subnet":"10.77.0.0/24","server":"10.77.0.1","router":"10.77.0.1","start":"10.77.0.10","end":"10.77.0.30","zone":"lab.home.arpa","lease_seconds":600,"enabled":%t}],"devices":[]}`, enabled)
@@ -410,13 +410,17 @@ func dnsPhase() {
 	mdnsPhase()
 }
 
-const mdnsAdvert = `{"interfaces":["lab0"],"host":"nas","records":[{"service":"_smb._tcp","instance":"NAS Share","port":445},{"service":"_ipp._tcp","instance":"Shared Queue","port":631,"txt":["rp=ipp/print"],"subtypes":["_universal"]}]}`
+const mdnsAdvert = `{"interfaces":["lab0"],"host":"nas","reflect":[{"lan":"lab0","network":"ctr0","allow_services":["_ipp._tcp"]},{"lan":"lab0","network":"ctr1","allow_services":["_googlecast._tcp"]}],"records":[{"service":"_smb._tcp","instance":"NAS Share","port":445},{"service":"_ipp._tcp","instance":"Shared Queue","port":631,"txt":["rp=ipp/print"],"subtypes":["_universal"]}]}`
 
 // zc asks the LAN's multicast DNS as another host would: python-zeroconf, an
 // independent implementation, inside the printer's namespace.
-func zc(args ...string) string {
-	out, _ := sh("nsenter", append([]string{"--net=/run/netns/printer", "--", "python3", "/opt/ghostd/zc.py"}, args...)...)
-	return out
+func zc(args ...string) string { return zcIn("printer", "10.77.0.60", args...) }
+
+// zcIn runs the client inside a namespace, bound to that namespace's address.
+func zcIn(ns, addr string, args ...string) string {
+	cmd := exec.Command("nsenter", append([]string{"--net=/run/netns/" + ns, "--", "env", "ZC_IFACE=" + addr, "python3", "/opt/ghostd/zc.py"}, args...)...)
+	out, _ := cmd.CombinedOutput()
+	return strings.TrimSpace(string(out))
 }
 
 func mdnsPhase() {
@@ -440,6 +444,22 @@ func mdnsPhase() {
 	check(!strings.Contains(zc("browse", "_googlecast._tcp.local."), "NAS"), "ghostd is silent about services it does not advertise")
 	r := ask("100.64.0.1", "nas.local.", dns.TypeA)
 	check(r != nil && len(r.Answer) == 1, "ghostd's own resolver finds nas.local through the LAN")
+
+	step("mDNS reflector: each container network sees only its own service classes from the LAN")
+	// ctr0 may browse printers: the avahi printer on the LAN appears in its multicast domain.
+	var seen string
+	eventually("the LAN printer to be reflected into ctr0", 30*time.Second, func() bool {
+		seen = zcIn("cnt0", "10.90.0.10", "browse", "_ipp._tcp.local.")
+		return strings.Contains(seen, "Lobby Printer")
+	})
+	check(!strings.Contains(seen, "Shared Queue"), "ghostd's own advertisement is not reflected back at a container: %q", seen)
+	cinfo := zcIn("cnt0", "10.90.0.10", "info", "_ipp._tcp.local.", "Lobby Printer._ipp._tcp.local.")
+	check(strings.Contains(cinfo, "port=631") && strings.Contains(cinfo, "10.77.0.60") && strings.Contains(cinfo, "server=printer.local."), "the instance's SRV, TXT and address came through: %s", cinfo)
+	check(zcIn("cnt0", "10.90.0.10", "browse", "_googlecast._tcp.local.") == "", "ctr0 cannot see the speaker")
+	check(zcIn("cnt0", "10.90.0.10", "info", "_googlecast._tcp.local.", "Lobby Speaker._googlecast._tcp.local.") == "none", "nor resolve it directly")
+	check(strings.Contains(zcIn("cnt1", "10.91.0.10", "browse", "_googlecast._tcp.local."), "Lobby Speaker"), "ctr1 sees the speaker")
+	check(zcIn("cnt1", "10.91.0.10", "browse", "_ipp._tcp.local.") == "", "and not the printer")
+	check(zcIn("cnt1", "10.91.0.10", "info", "_ipp._tcp.local.", "Lobby Printer._ipp._tcp.local.") == "none", "not even by name")
 
 	step("mDNS advertisement: a name another host already owns is refused, and the old set keeps answering")
 	clash := `{"interfaces":["lab0"],"host":"nas","records":[{"service":"_ipp._tcp","instance":"Lobby Printer","port":631}]}`

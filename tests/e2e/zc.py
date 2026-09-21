@@ -5,12 +5,13 @@ LAN client namespace, so ghostd is answering a host that is not itself.
   zc.py info   <type> <instance-fqdn>   -> port=... addrs=a,b server=... txt=k=v;...   (or "none")
   zc.py browse <type>                   -> one instance name per line
 """
+import os
 import sys
 import time
 
 from zeroconf import ServiceBrowser, ServiceListener, Zeroconf
 
-zc = Zeroconf(interfaces=["10.77.0.60"])
+zc = Zeroconf(interfaces=[os.environ.get("ZC_IFACE", "10.77.0.60")])
 try:
     mode = sys.argv[1]
     if mode == "info":

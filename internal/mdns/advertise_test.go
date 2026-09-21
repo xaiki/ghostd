@@ -183,7 +183,7 @@ func TestLegacyUnicastAnswersDropCacheFlushAndCapTTL(t *testing.T) {
 	if resp.Answer[0].Header().Class&0x8000 == 0 {
 		t.Fatal("multicast answers keep the cache-flush bit")
 	}
-	r := &running{a: a, ifaces: map[int]net.Interface{1: {Index: 1, Name: "lab0"}}, done: make(chan struct{})}
+	r := &running{a: a, ifaces: map[int]net.Interface{1: {Index: 1, Name: "lab0"}}, advertise: map[int]bool{1: true}, done: make(chan struct{})}
 	var sent *dns.Msg
 	r.testSend = func(m *dns.Msg) { sent = m }
 	wire, _ := q.Pack()

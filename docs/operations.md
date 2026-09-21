@@ -188,6 +188,30 @@ known-good advertisement). An unconfirmed change reverts, and after a reboot the
 confirmed set is re-advertised by a watcher that also retries a start that failed
 because an interface was not up yet.
 
+### Per-container reflector
+
+`reflect` in the same target relays mDNS between the LAN and **per-container
+networks** (one Podman network per container or pod, whose bridge is a multicast
+domain of its own), so an application that speaks mDNS itself works on the
+container network with no host networking:
+
+```json
+{"reflect": [
+  {"lan": "eth0", "network": "podman-print", "allow_services": ["_ipp._tcp"]},
+  {"lan": "eth0", "network": "podman-music", "allow_services": ["_googlecast._tcp"]}]}
+```
+
+The permission is the network: each rule has its own filter. Toward the container
+go LAN records for the allowed classes and for the instances they name (PTR, SRV,
+TXT, and the address records of the hosts their SRVs point at, remembered for two
+minutes); nothing else — no other class, no service enumeration, no unrelated
+host. Toward the LAN go only the container's *queries* for allowed classes and the
+hosts those services named. One rule per network (a network is one permission
+set); `records` and `host` are needed only if you also advertise. A container's own
+advertisements are not reflected outward (its address is private to the bridge):
+declare anything the LAN must find in `records`. The container bridge's firewall
+zone needs the `mdns` service.
+
 ## Environment
 
 | Variable | Purpose |

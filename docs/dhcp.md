@@ -545,6 +545,6 @@ real tailnet. Do those checks on a test VLAN before a production cutover.
 ## Current limits
 
 Multi-master allocation and automatic failover are not built and are excluded by
-design (see [Warm standby](#warm-standby)); the multicast reflector is excluded by
-the ACL design ([lan-discovery.md](lan-discovery.md)). Known gaps in what has
+design (see [Warm standby](#warm-standby)). The mDNS reflector is built per container
+network ([operations.md](operations.md#per-container-reflector)). Known gaps in what has
 landed are listed in [dhcp-remaining.md](dhcp-remaining.md).

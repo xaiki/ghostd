@@ -39,3 +39,24 @@ if ! ip netns list | grep -qw printer; then
 	nsenter --net=/run/netns/printer -- ip link set printerp up
 	nsenter --net=/run/netns/printer -- ip route add 224.0.0.0/4 dev printerp
 fi
+
+# Two container networks, each a multicast domain of its own with one "container"
+# (a namespace with a static address) attached: the per-container mDNS reflector's
+# targets. ctr0 will be allowed printers only, ctr1 speakers only.
+for n in 0 1; do
+	br="ctr$n"; ns="cnt$n"
+	ip link add "$br" type bridge 2>/dev/null || true
+	ip addr replace "10.9$n.0.1/24" dev "$br"
+	ip link set "$br" up
+	if ! ip netns list | grep -qw "$ns"; then
+		ip netns add "$ns"
+		ip link add "$ns" type veth peer name "${ns}p" address "02:00:00:00:09:0$n"
+		ip link set "$ns" master "$br"
+		ip link set "$ns" up
+		ip link set "${ns}p" netns "$ns"
+		nsenter --net="/run/netns/$ns" -- ip link set lo up
+		nsenter --net="/run/netns/$ns" -- ip addr add "10.9$n.0.10/24" dev "${ns}p"
+		nsenter --net="/run/netns/$ns" -- ip link set "${ns}p" up
+		nsenter --net="/run/netns/$ns" -- ip route add 224.0.0.0/4 dev "${ns}p"
+	fi
+done
