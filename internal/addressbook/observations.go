@@ -21,6 +21,9 @@ type Observation struct {
 	Origin  string `json:"origin"`
 	Seen    int64  `json:"seen"`
 	Until   int64  `json:"until"`
+	// Historical marks evidence reconstructed from the event log for a past
+	// instant, as opposed to a current sighting.
+	Historical bool `json:"historical,omitempty"`
 }
 
 // Observe records kernel neighbor evidence separately from DHCP allocations.
@@ -52,8 +55,31 @@ func (s *Store) Observe(c Config, observations []Observation) error {
 			if e != nil {
 				return e
 			}
-			if e = tx.Bucket(observationBucket).Put(bindingKey(o.Scope, o.Address), raw); e != nil {
+			key := bindingKey(o.Scope, o.Address)
+			// Refreshing an unchanged, still-valid sighting only extends the
+			// latest bucket; a first sighting, a changed MAC or a sighting after
+			// the previous one expired is history worth keeping.
+			var prev Observation
+			old := tx.Bucket(observationBucket).Get(key)
+			fresh := old == nil || json.Unmarshal(old, &prev) != nil || prev.MAC != o.MAC || prev.Until <= o.Seen
+			if e = tx.Bucket(observationBucket).Put(key, raw); e != nil {
 				return e
+			}
+			if fresh {
+				if old != nil && prev.Until > 0 && (prev.MAC != o.MAC || prev.Until <= o.Seen) {
+					// Close out the earlier sighting at its own expiry, or now if
+					// a different MAC superseded it while still valid.
+					if prev.Until > o.Seen {
+						prev.Until = o.Seen
+					}
+					if e = appendEvent(tx, Event{Time: s.now().Unix(), Kind: "observation-end", Observation: &prev}); e != nil {
+						return e
+					}
+				}
+				oc := o
+				if e = appendEvent(tx, Event{Time: s.now().Unix(), Kind: "observation", Observation: &oc}); e != nil {
+					return e
+				}
 			}
 		}
 		return nil
@@ -109,6 +135,67 @@ type IdentityRepair struct {
 	Name           string `json:"name"`
 	NodeID         string `json:"tailnet_node_id"`
 	Reason         string `json:"reason"`
+	// Persist records the edit as a durable client association, so the identity
+	// follows the client across expiry, reallocation and address changes.
+	Persist bool `json:"persist,omitempty"`
+	// Forget removes the client's association (the binding edit still applies).
+	Forget bool `json:"forget,omitempty"`
+}
+
+// Association is an operator-asserted, durable client → device mapping. It is
+// consulted by allocation, is never rewritten by lease expiry, and keeps every
+// replaced mapping in History so historical ownership stays answerable.
+type Association struct {
+	Client  string               `json:"client"`
+	Device  string               `json:"device"`
+	Name    string               `json:"name"`
+	NodeID  string               `json:"tailnet_node_id,omitempty"`
+	Reason  string               `json:"reason"`
+	Updated int64                `json:"updated"`
+	History []AssociationVersion `json:"history,omitempty"`
+}
+type AssociationVersion struct {
+	Device  string `json:"device"`
+	Name    string `json:"name"`
+	NodeID  string `json:"tailnet_node_id,omitempty"`
+	Reason  string `json:"reason"`
+	Updated int64  `json:"updated"`
+	Ended   int64  `json:"ended"`
+}
+
+func readAssociation(tx *bolt.Tx, client string) (Association, bool, error) {
+	raw := tx.Bucket(associationBucket).Get([]byte(client))
+	if raw == nil {
+		return Association{}, false, nil
+	}
+	var a Association
+	return a, true, json.Unmarshal(raw, &a)
+}
+
+func (s *Store) putAssociation(tx *bolt.Tx, r IdentityRepair) error {
+	if r.Forget {
+		if _, ok, e := readAssociation(tx, r.Client); e != nil || !ok {
+			return e
+		}
+		return tx.Bucket(associationBucket).Delete([]byte(r.Client))
+	}
+	if !r.Persist {
+		return nil
+	}
+	now := s.now().Unix()
+	a, ok, e := readAssociation(tx, r.Client)
+	if e != nil {
+		return e
+	}
+	if ok && (a.Device != r.Device || a.Name != r.Name || a.NodeID != r.NodeID) {
+		a.History = append(a.History, AssociationVersion{Device: a.Device, Name: a.Name, NodeID: a.NodeID, Reason: a.Reason, Updated: a.Updated, Ended: now})
+	}
+	a.Client, a.Device, a.Name, a.NodeID, a.Reason, a.Updated = r.Client, r.Device, r.Name, r.NodeID, r.Reason, now
+	raw, e := json.Marshal(a)
+	if e != nil {
+		return e
+	}
+	return tx.Bucket(associationBucket).Put([]byte(r.Client), raw)
 }
 
 // Repair supports explicit merge/split/unlink by assigning selected bindings in
@@ -123,9 +210,25 @@ func (s *Store) Repair(c Config, changes []IdentityRepair) error {
 				return fmt.Errorf("repair requires valid device/name and reason")
 			}
 			for _, d := range c.Devices {
-				if ((d.Name == r.Name || d.HasAlias(r.Name)) && d.ID != r.Device) || (d.ID == r.Device && (d.Name != r.Name || (d.NodeID != "" && d.NodeID != r.NodeID))) {
+				// Declared node identity may be several ids; a repair must name
+				// one of them, exactly as automatic reports are judged.
+				if ((d.Name == r.Name || d.HasAlias(r.Name)) && d.ID != r.Device) || (d.ID == r.Device && (d.Name != r.Name || (d.DeclaresNodes() && !d.HasNode(r.NodeID)))) {
 					return fmt.Errorf("repair conflicts with inventory")
 				}
+			}
+			// The name must also not belong to another live, undeclared device.
+			now := s.now().Unix()
+			if e := tx.Bucket(leaseBucket).ForEach(func(_, raw []byte) error {
+				var other Binding
+				if e := json.Unmarshal(raw, &other); e != nil {
+					return e
+				}
+				if other.Name == r.Name && other.Device != r.Device && other.State == "active" && other.End > now && !(other.Scope == r.Scope && other.Address == r.Address) {
+					return fmt.Errorf("name %q is already held by live device %s", r.Name, other.Device)
+				}
+				return nil
+			}); e != nil {
+				return e
 			}
 			b, e := readBinding(tx, r.Scope, r.Address)
 			if e != nil {
@@ -144,6 +247,9 @@ func (s *Store) Repair(c Config, changes []IdentityRepair) error {
 			b.NodeID = r.NodeID
 			b.Evidence = "operator repair: " + r.Reason
 			if e = s.save(tx, b, "identity-repair"); e != nil {
+				return e
+			}
+			if e = s.putAssociation(tx, r); e != nil {
 				return e
 			}
 		}

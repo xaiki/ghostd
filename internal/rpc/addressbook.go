@@ -217,7 +217,11 @@ func (s *Server) DHCPHandover(ctx context.Context, req *pb.RegistryDocument) (*p
 	if request.Action == "begin" {
 		spec = request.Legacy
 	}
-	handover := addressbook.Handover{Manager: s.DHCP, Legacy: addressbook.SystemDNSmasq{Spec: spec}, SaveConfig: func(c addressbook.Config) error {
+	var legacy addressbook.LegacyAuthority = addressbook.SystemDNSmasq{Spec: spec}
+	if s.Legacy != nil {
+		legacy = s.Legacy(spec)
+	}
+	handover := addressbook.Handover{Manager: s.DHCP, Legacy: legacy, SaveConfig: func(c addressbook.Config) error {
 		raw, e := json.Marshal(c)
 		if e != nil {
 			return e

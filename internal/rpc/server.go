@@ -40,6 +40,9 @@ type Server struct {
 	// ObserveOnly rejects every mutation RPC, independently of authorization.
 	ObserveOnly bool
 	DHCP        *addressbook.Manager
+	// Legacy builds the allocator being replaced by a handover; nil means the
+	// real systemd-managed dnsmasq. Tests substitute a fake.
+	Legacy func(addressbook.LegacySpec) addressbook.LegacyAuthority
 	pb.UnimplementedHostStateServer
 
 	authenticator   *auth.Authenticator

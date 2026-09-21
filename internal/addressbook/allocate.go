@@ -2,6 +2,7 @@ package addressbook
 
 import (
 	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"net"
 	"net/netip"
@@ -141,6 +142,14 @@ func (s *Store) Allocate(c Config, scopeID, client, mac, claimed, requested stri
 			result.NodeID = old.NodeID
 			result.Evidence = old.Evidence
 		}
+		// A durable operator association outranks what the last lease carried, but
+		// never the inventory: a reservation below still wins.
+		if a, ok, e := readAssociation(tx, client); e != nil {
+			return e
+		} else if ok {
+			result.Device, result.Name, result.NodeID = a.Device, a.Name, a.NodeID
+			result.Evidence = "operator repair: " + a.Reason
+		}
 		if r, ok := reservation(scope, client, mac); ok {
 			d, _ := c.Device(r.Device)
 			result.Device = d.ID
@@ -185,23 +194,27 @@ func (s *Store) Release(scope, client, ip string, decline bool) error {
 		return s.save(tx, b, kind)
 	})
 }
+
+// Expire reads only the expiry index up to now, and at most 1000 entries per
+// call, so its work is bounded by what is due rather than by ledger size.
 func (s *Store) Expire() error {
 	now := s.now().Unix()
 	return s.db.Update(func(tx *bolt.Tx) error {
-		var expired []Binding
-		if err := tx.Bucket(leaseBucket).ForEach(func(_, raw []byte) error {
-			var b Binding
-			if e := json.Unmarshal(raw, &b); e != nil {
-				return e
-			}
-			if len(expired) < 1000 && b.End <= now && (b.State == "active" || b.State == "offered" || b.State == "declined") {
-				expired = append(expired, b)
-			}
-			return nil
-		}); err != nil {
-			return err
+		var due [][]byte
+		cursor := tx.Bucket(expiryBucket).Cursor()
+		for k, _ := cursor.First(); k != nil && len(due) < 1000 && int64(binary.BigEndian.Uint64(k)) <= now; k, _ = cursor.Next() {
+			due = append(due, append([]byte(nil), k...))
 		}
-		for _, b := range expired {
+		for _, k := range due {
+			raw := tx.Bucket(leaseBucket).Get(k[8:])
+			var b Binding
+			if raw == nil || json.Unmarshal(raw, &b) != nil || !liveState(b.State) || b.End != int64(binary.BigEndian.Uint64(k)) {
+				// A stale index entry (the binding moved on) is simply dropped.
+				if err := tx.Bucket(expiryBucket).Delete(k); err != nil {
+					return err
+				}
+				continue
+			}
 			b.State = "expired"
 			if err := s.save(tx, b, "expire"); err != nil {
 				return err

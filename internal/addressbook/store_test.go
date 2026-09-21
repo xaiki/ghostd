@@ -1,6 +1,7 @@
 package addressbook
 
 import (
+	bolt "go.etcd.io/bbolt"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -144,5 +145,105 @@ func TestDNSIndexTracksIdentityAndExpiry(t *testing.T) {
 	}
 	if rows, e := s.DNSBindings("lan", "", b.Address); e != nil || len(rows) != 0 {
 		t.Fatal("expired PTR answered", rows, e)
+	}
+}
+
+func TestSOASerialFollowsDNSConfiguration(t *testing.T) {
+	s := openTest(t)
+	m := NewManager(s)
+	defer m.Close()
+	c := disabled(testConfig())
+	apply := func(c Config) uint32 {
+		t.Helper()
+		if e := m.Apply(c, func() error { return nil }); e != nil {
+			t.Fatal(e)
+		}
+		return s.Revision()
+	}
+	r1 := apply(c)
+	if r1 == 0 {
+		t.Fatal("configuration did not advance the serial")
+	}
+	if r2 := apply(c); r2 != r1 {
+		t.Fatal("re-applying identical configuration moved the serial", r1, r2)
+	}
+	c.Scopes[0].Zone = "lan.example"
+	r3 := apply(c)
+	if r3 <= r1 {
+		t.Fatal("zone change did not advance the serial", r1, r3)
+	}
+	c.Devices = []DeviceConfig{{ID: "d1", Name: "printer", Aliases: []string{"lp"}}}
+	if r4 := apply(c); r4 <= r3 {
+		t.Fatal("alias change did not advance the serial", r3, r4)
+	}
+	// A rollback to older configuration still moves forward.
+	old := disabled(testConfig())
+	if r5 := apply(old); r5 <= r3 {
+		t.Fatal("rollback did not advance the serial")
+	}
+}
+
+func TestExpiryIndexBoundsWorkAndMigrates(t *testing.T) {
+	s := openTest(t)
+	c := testConfig()
+	now := int64(1000)
+	s.now = func() time.Time { return time.Unix(now, 0) }
+	a, e := s.Allocate(c, "lan", "mac:00:11:22:33:44:55", "00:11:22:33:44:55", "", "10.0.0.6", true)
+	if e != nil {
+		t.Fatal(e)
+	}
+	now += 300
+	if _, e = s.Allocate(c, "lan", "mac:00:11:22:33:44:55", "00:11:22:33:44:55", "", a.Address, true); e != nil { // renew moves the end
+		t.Fatal(e)
+	}
+	now = a.End + 1 // past the original end, before the renewed one
+	if e = s.Expire(); e != nil {
+		t.Fatal(e)
+	}
+	cur, _ := s.Snapshot("", "", 0)
+	if cur.Bindings[0].State != "active" {
+		t.Fatal("stale index entry expired a renewed lease", cur.Bindings[0])
+	}
+	now += 1000
+	if e = s.Expire(); e != nil {
+		t.Fatal(e)
+	}
+	cur, _ = s.Snapshot("", "", 0)
+	if cur.Bindings[0].State != "expired" {
+		t.Fatal(cur.Bindings[0])
+	}
+	// A ledger written before the index existed is backfilled on open.
+	path := s.db.Path()
+	if e = s.db.Update(func(tx *bolt.Tx) error { return tx.DeleteBucket(expiryBucket) }); e != nil {
+		t.Fatal(e)
+	}
+	s.Close()
+	s2, e := Open(path)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer s2.Close()
+	s2.now = s.now
+	now = 5000
+	if _, e = s2.Allocate(c, "lan", "mac:00:11:22:33:44:66", "00:11:22:33:44:66", "", "10.0.0.7", true); e != nil {
+		t.Fatal(e)
+	}
+	if e = s2.db.Update(func(tx *bolt.Tx) error { return tx.DeleteBucket(expiryBucket) }); e != nil {
+		t.Fatal(e)
+	}
+	s2.Close()
+	s3, e := Open(path)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer s3.Close()
+	s3.now = s.now
+	now = 9000
+	if e = s3.Expire(); e != nil {
+		t.Fatal(e)
+	}
+	got, _ := s3.Snapshot("lan", "10.0.0.7", 0)
+	if got.Bindings[0].State != "expired" {
+		t.Fatal("index not rebuilt on upgrade", got.Bindings[0])
 	}
 }

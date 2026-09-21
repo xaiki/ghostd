@@ -27,8 +27,12 @@ type HandoverJournal struct {
 	Previous Config     `json:"previous"`
 	Legacy   LegacySpec `json:"legacy"`
 	Snapshot string     `json:"snapshot,omitempty"`
-	Error    string     `json:"error,omitempty"`
-	Revision uint32     `json:"revision"`
+	// Activated is persisted before ghostd may grant anything. Until it is set
+	// the legacy lease file is still authoritative and rollback must not depend
+	// on parsing or importing the snapshot; afterwards the current ledger is.
+	Activated bool   `json:"activated,omitempty"`
+	Error     string `json:"error,omitempty"`
+	Revision  uint32 `json:"revision"`
 }
 
 type Handover struct {
@@ -135,6 +139,10 @@ func (h Handover) begin(j *HandoverJournal) error {
 	if e = h.Manager.Store.ImportDocument(disabled(j.Target), doc); e != nil {
 		return e
 	}
+	j.Activated = true
+	if e = h.Manager.Store.saveHandover(*j); e != nil {
+		return e
+	}
 	if e = h.apply(j.Target); e != nil {
 		return e
 	}
@@ -194,14 +202,16 @@ func (h Handover) Rollback() error {
 	if e = h.apply(disabled(j.Target)); e != nil {
 		return e
 	}
-	// Keep all legacy leases even if an import failed partway (imports themselves
-	// are atomic). Re-import before export preserves the final stopped snapshot.
-	if j.Snapshot != "" {
+	if j.Activated {
+		// ghostd may have granted leases: export the current ledger, whatever the
+		// original snapshot held (it may have been empty). The snapshot parsed
+		// when it was imported, so it parses again; re-import first so legacy
+		// leases an interrupted import missed are not lost. Current ownership
+		// wins over older expiries; never overwrite new grants.
 		doc, e := ParseDNSmasq(j.Target, j.Snapshot)
 		if e != nil {
 			return e
 		}
-		// Current ownership wins over older expiries; never overwrite new grants.
 		current, e := h.Manager.Store.Snapshot("", "", 0)
 		if e != nil {
 			return e
@@ -244,13 +254,28 @@ func (h Handover) Rollback() error {
 	j.Deadline = 0
 	return h.Manager.Store.saveHandover(j)
 }
+
+// NeedsRecovery reports whether the journal records a takeover that must be
+// rolled back: interrupted before pending, mid-rollback, or past its deadline.
+func (j HandoverJournal) NeedsRecovery() bool {
+	switch j.Phase {
+	case "stopping", "snapshot", "rolling-back":
+		return true
+	case "pending":
+		return time.Now().Unix() >= j.Deadline
+	}
+	return false
+}
 func (h Handover) Recover() error {
 	j, e := h.Manager.Store.HandoverJournal()
 	if e != nil {
 		return e
 	}
-	if j.Phase == "stopping" || j.Phase == "snapshot" || j.Phase == "rolling-back" || (j.Phase == "pending" && time.Now().Unix() >= j.Deadline) {
+	if j.NeedsRecovery() {
 		return h.Rollback()
 	}
 	return nil
 }
+
+// SaveHandoverForTest lets other packages fabricate an interrupted journal.
+func (s *Store) SaveHandoverForTest(j HandoverJournal) error { return s.saveHandover(j) }

@@ -172,6 +172,13 @@ func (m *Manager) Apply(c Config, save func() error) error {
 			}
 		}
 	}
+	// Zone, alias and address changes alter DNS answers without any lease
+	// event, so they must advance the SOA serial (derived from the event
+	// sequence) too. Bumping before save is safe: serials only need to grow.
+	if e := m.Store.NoteDNSConfig(c); e != nil {
+		cleanup()
+		return e
+	}
 	if e := save(); e != nil {
 		cleanup()
 		return e
