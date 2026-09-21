@@ -15,6 +15,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -61,7 +62,18 @@ func main() {
 		"the interface name Apply's reachability guard always keeps open to this daemon's own port (nft.ReachabilityGuard)")
 	watchdogSec := flag.Int("watchdog-sec", 0, "systemd WatchdogSec= value, in seconds (0 disables watchdog pinging)")
 	reportTo := flag.String("report-to", "", "report this host interfaces once to a tailnet DHCP authority and exit")
+	convertDNSmasq := flag.String("convert-dnsmasq", "", "preview: convert this dnsmasq config (following includes) to a dhcp-v1 handover plan and exit; touches nothing")
+	legacyUnit := flag.String("legacy-unit", "dnsmasq.service", "the dnsmasq unit --convert-dnsmasq records in the plan")
 	flag.Parse()
+	if *convertDNSmasq != "" {
+		plan, err := addressbook.ConvertDNSmasq(*convertDNSmasq, addressbook.ConvertOptions{Files: addressbook.OSFiles, Unit: *legacyUnit, Addrs: addressbook.InterfaceAddrs})
+		if err != nil {
+			log.Fatalf("ghostd: cannot convert %s: %v", *convertDNSmasq, err)
+		}
+		out, _ := json.MarshalIndent(plan, "", "  ")
+		fmt.Println(string(out))
+		return
+	}
 	if *reportTo != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()

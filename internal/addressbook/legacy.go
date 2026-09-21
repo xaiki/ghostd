@@ -137,11 +137,12 @@ func (l SystemDNSmasq) Validate(c Config) error {
 	if !strings.Contains(command, "dnsmasq") || !regexp.MustCompile(`(?:=|\s)`+regexp.QuoteMeta(l.Spec.ConfigPath)+`(?:\s|;|$)`).MatchString(command) {
 		return fmt.Errorf("unit ExecStart must explicitly name the checked dnsmasq config")
 	}
-	raw, e := os.ReadFile(l.Spec.ConfigPath)
+	// Includes are followed, so what is validated is what dnsmasq would read.
+	text, e := FlattenDNSmasq(l.Spec.ConfigPath, OSFiles)
 	if e != nil {
 		return e
 	}
-	return ValidateDNSmasqConfig(c, string(raw), l.Spec.LeasePath)
+	return ValidateDNSmasqConfig(c, text, l.Spec.LeasePath)
 }
 
 // ValidateDNSmasqConfig refuses implicit defaults and includes: takeover must
@@ -150,6 +151,8 @@ func ValidateDNSmasqConfig(c Config, text, leasePath string) error {
 	ranges := map[string]bool{}
 	interfaces := map[string]bool{}
 	domains := map[string]bool{}
+	scopedDomains := map[netip.Prefix]string{}
+	excluded := map[string]bool{}
 	lease := false
 	ra := false
 	for _, line := range strings.Split(text, "\n") {
@@ -162,7 +165,21 @@ func ValidateDNSmasqConfig(c Config, text, leasePath string) error {
 		case "interface":
 			interfaces[value] = true
 		case "domain":
-			domains[value] = true
+			f := strings.Split(value, ",")
+			switch len(f) {
+			case 1:
+				domains[value] = true
+			case 2:
+				p, e := netip.ParsePrefix(f[1])
+				if e != nil {
+					return fmt.Errorf("scoped domain needs a CIDR, got %q", f[1])
+				}
+				scopedDomains[p.Masked()] = f[0]
+			default:
+				return fmt.Errorf("unsupported domain directive %q", value)
+			}
+		case "except-interface", "no-dhcp-interface":
+			excluded[value] = true
 		case "dhcp-leasefile":
 			if value != leasePath {
 				return fmt.Errorf("lease path differs from config")
@@ -257,7 +274,16 @@ func ValidateDNSmasqConfig(c Config, text, leasePath string) error {
 		if s.Is6() && (s.RA != nil) != ra {
 			return fmt.Errorf("target must preserve explicit RA enablement")
 		}
-		if !s.Enabled || !ranges[s.ID] || !interfaces[s.Interface] || !domains[s.Zone] {
+		zoneOK := domains[s.Zone]
+		for p, z := range scopedDomains {
+			if z == s.Zone && p.Overlaps(netip.MustParsePrefix(s.Subnet)) {
+				zoneOK = true
+			}
+		}
+		if excluded[s.Interface] {
+			return fmt.Errorf("scope %s is on interface %s, which the legacy configuration excludes from DHCP", s.ID, s.Interface)
+		}
+		if !s.Enabled || !ranges[s.ID] || !interfaces[s.Interface] || !zoneOK {
 			return fmt.Errorf("scope %s does not match explicit legacy range/interface/domain", s.ID)
 		}
 	}

@@ -1,12 +1,15 @@
 package addressbook
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"github.com/miekg/dns"
 	bolt "go.etcd.io/bbolt"
 	"net"
 	"reflect"
+	"sort"
+	"strings"
 	"time"
 )
 
@@ -33,12 +36,165 @@ type HandoverJournal struct {
 	Activated bool   `json:"activated,omitempty"`
 	Error     string `json:"error,omitempty"`
 	Revision  uint32 `json:"revision"`
+	// Started/Finished bracket the transaction; ImportedLeases counts legacy
+	// leases carried into each scope, which decides what client evidence a
+	// confirmation can reasonably demand.
+	Started        int64          `json:"started,omitempty"`
+	Finished       int64          `json:"finished,omitempty"`
+	ImportedLeases map[string]int `json:"imported_leases,omitempty"`
+	// RequireEvidence makes Confirm demand observed client behaviour (below).
+	RequireEvidence bool `json:"require_evidence,omitempty"`
+}
+
+// ScopeEvidence is what the ledger saw from real clients since the takeover
+// began: renewals of leases inherited from the legacy allocator, and fresh
+// grants. Both are events the DHCP path only writes for a real client exchange.
+type ScopeEvidence struct {
+	Imported int `json:"imported_leases"`
+	Renewals int `json:"renewals"`
+	Grants   int `json:"fresh_grants"`
+}
+
+// HandoverStatus is the operator-facing progress view of a takeover.
+type HandoverStatus struct {
+	HandoverJournal
+	RemainingSeconds int64                    `json:"remaining_seconds,omitempty"`
+	Retryable        bool                     `json:"retryable"`
+	Evidence         map[string]ScopeEvidence `json:"evidence,omitempty"`
+	Missing          []string                 `json:"pending_verification,omitempty"`
+	HistoryCount     int                      `json:"history_count"`
 }
 
 type Handover struct {
 	Manager    *Manager
 	Legacy     LegacyAuthority
 	SaveConfig func(Config) error
+	// RequireEvidence is recorded in the journal by Begin.
+	RequireEvidence bool
+}
+
+var handoverHistoryBucket = []byte("handover-history-v1")
+
+// archive keeps a finished takeover (without the bulky snapshot) as audit
+// history; the mutable journal only ever describes the latest one.
+func (s *Store) archiveHandover(j HandoverJournal) error {
+	j.Snapshot = ""
+	j.Finished = s.now().Unix()
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b, e := tx.CreateBucketIfNotExists(handoverHistoryBucket)
+		if e != nil {
+			return e
+		}
+		id, e := b.NextSequence()
+		if e != nil {
+			return e
+		}
+		raw, e := json.Marshal(j)
+		if e != nil {
+			return e
+		}
+		var key [8]byte
+		binary.BigEndian.PutUint64(key[:], id)
+		return b.Put(key[:], raw)
+	})
+}
+
+// HandoverHistory lists finished takeovers, oldest first.
+func (s *Store) HandoverHistory() ([]HandoverJournal, error) {
+	var out []HandoverJournal
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(handoverHistoryBucket)
+		if b == nil {
+			return nil
+		}
+		return b.ForEach(func(_, v []byte) error {
+			var j HandoverJournal
+			if e := json.Unmarshal(v, &j); e != nil {
+				return e
+			}
+			out = append(out, j)
+			return nil
+		})
+	})
+	return out, err
+}
+
+// clientEvidence counts real client exchanges per enabled target scope after
+// the takeover began.
+func (s *Store) clientEvidence(j HandoverJournal) (map[string]ScopeEvidence, error) {
+	out := map[string]ScopeEvidence{}
+	for _, sc := range j.Target.Scopes {
+		if sc.Enabled {
+			out[sc.ID] = ScopeEvidence{Imported: j.ImportedLeases[sc.ID]}
+		}
+	}
+	after := uint64(j.Revision)
+	for {
+		events, e := s.Events(after, 1000)
+		if e != nil {
+			return nil, e
+		}
+		for _, ev := range events {
+			after = ev.ID
+			ce, ok := out[ev.Binding.Scope]
+			if !ok || !strings.HasPrefix(ev.Binding.Origin, "dhcp") {
+				continue
+			}
+			switch ev.Kind {
+			case "renew":
+				ce.Renewals++
+			case "grant":
+				ce.Grants++
+			}
+			out[ev.Binding.Scope] = ce
+		}
+		if len(events) < 1000 {
+			return out, nil
+		}
+	}
+}
+
+// missingEvidence lists what a confirmation would still want to see.
+func missingEvidence(ev map[string]ScopeEvidence) []string {
+	var missing []string
+	for id, e := range ev {
+		if e.Imported > 0 && e.Renewals == 0 {
+			missing = append(missing, fmt.Sprintf("scope %s: no client has renewed an inherited lease yet", id))
+		}
+		if e.Grants == 0 {
+			missing = append(missing, fmt.Sprintf("scope %s: no new client has been allocated an address yet", id))
+		}
+	}
+	sort.Strings(missing)
+	return missing
+}
+
+// Status reports progress, remaining time, retryability and, while pending,
+// the client evidence gathered so far.
+func (h Handover) Status() (HandoverStatus, error) {
+	j, e := h.Manager.Store.HandoverJournal()
+	if e != nil {
+		return HandoverStatus{}, e
+	}
+	st := HandoverStatus{HandoverJournal: j}
+	if hist, e := h.Manager.Store.HandoverHistory(); e == nil {
+		st.HistoryCount = len(hist)
+	}
+	if j.Deadline > 0 {
+		if left := j.Deadline - time.Now().Unix(); left > 0 {
+			st.RemainingSeconds = left
+		}
+	}
+	st.Retryable = j.Phase == "rolling-back" || (j.Phase == "pending" && j.NeedsRecovery())
+	if j.Phase == "pending" || j.Phase == "confirmed" {
+		if st.Evidence, e = h.Manager.Store.clientEvidence(j); e != nil {
+			return st, e
+		}
+		if j.Phase == "pending" {
+			st.Missing = missingEvidence(st.Evidence)
+		}
+	}
+	return st, nil
 }
 
 func (s *Store) HandoverJournal() (HandoverJournal, error) {
@@ -105,7 +261,7 @@ func (h Handover) Begin(target Config, spec LegacySpec, grace time.Duration) err
 	if e = h.Legacy.Validate(target); e != nil {
 		return e
 	}
-	j := HandoverJournal{Phase: "stopping", Deadline: time.Now().Add(grace).Unix(), Target: target, Previous: previous, Legacy: spec, Revision: h.Manager.Store.Revision()}
+	j := HandoverJournal{Phase: "stopping", Started: time.Now().Unix(), RequireEvidence: h.RequireEvidence, Deadline: time.Now().Add(grace).Unix(), Target: target, Previous: previous, Legacy: spec, Revision: h.Manager.Store.Revision()}
 	if e = h.Manager.Store.saveHandover(j); e != nil {
 		return e
 	}
@@ -139,6 +295,10 @@ func (h Handover) begin(j *HandoverJournal) error {
 	if e = h.Manager.Store.ImportDocument(disabled(j.Target), doc); e != nil {
 		return e
 	}
+	j.ImportedLeases = map[string]int{}
+	for _, l := range doc.Leases {
+		j.ImportedLeases[l.Scope]++
+	}
 	j.Activated = true
 	if e = h.Manager.Store.saveHandover(*j); e != nil {
 		return e
@@ -159,6 +319,15 @@ func (h Handover) Confirm() error {
 	}
 	if j.Phase != "pending" || time.Now().Unix() >= j.Deadline {
 		return fmt.Errorf("no live takeover to confirm")
+	}
+	if j.RequireEvidence {
+		ev, e := h.Manager.Store.clientEvidence(j)
+		if e != nil {
+			return e
+		}
+		if missing := missingEvidence(ev); len(missing) > 0 {
+			return fmt.Errorf("client verification incomplete: %s", strings.Join(missing, "; "))
+		}
 	}
 	// Re-prove authoritative DNS over both transports before cancelling recovery.
 	// Real DHCP renewal/new-client probes remain part of the isolated acceptance
@@ -182,7 +351,10 @@ func (h Handover) Confirm() error {
 	}
 	j.Phase = "confirmed"
 	j.Deadline = 0
-	return h.Manager.Store.saveHandover(j)
+	if e := h.Manager.Store.saveHandover(j); e != nil {
+		return e
+	}
+	return h.Manager.Store.archiveHandover(j)
 }
 func (h Handover) Rollback() error {
 	j, e := h.Manager.Store.HandoverJournal()
@@ -252,7 +424,10 @@ func (h Handover) Rollback() error {
 	}
 	j.Phase = "rolled-back"
 	j.Deadline = 0
-	return h.Manager.Store.saveHandover(j)
+	if e = h.Manager.Store.saveHandover(j); e != nil {
+		return e
+	}
+	return h.Manager.Store.archiveHandover(j)
 }
 
 // NeedsRecovery reports whether the journal records a takeover that must be

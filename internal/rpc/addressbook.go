@@ -192,11 +192,14 @@ func (s *Server) DHCPHandover(ctx context.Context, req *pb.RegistryDocument) (*p
 		Target  addressbook.Config     `json:"target"`
 		Legacy  addressbook.LegacySpec `json:"legacy"`
 		Seconds int                    `json:"seconds"`
+		// RequireEvidence makes confirmation wait for observed client
+		// renewal and fresh allocation in every enabled scope.
+		RequireEvidence bool `json:"require_evidence"`
 	}
 	if e := decodeDocument(req.GetJson(), &request); e != nil {
 		return nil, status.Error(codes.InvalidArgument, e.Error())
 	}
-	if e := s.registryAuth(ctx, request.Action != "status"); e != nil {
+	if e := s.registryAuth(ctx, request.Action != "status" && request.Action != "history"); e != nil {
 		return nil, e
 	}
 	unlock, e := s.store.Lock()
@@ -227,10 +230,20 @@ func (s *Server) DHCPHandover(ctx context.Context, req *pb.RegistryDocument) (*p
 			return e
 		}
 		return s.store.SaveExternallyManagedConfig(domainDHCP, addressbook.ConfigFile, raw)
-	}}
+	}, RequireEvidence: request.RequireEvidence}
 	switch request.Action {
 	case "status":
-		return document(j)
+		st, e := handover.Status()
+		if e != nil {
+			return nil, e
+		}
+		return document(st)
+	case "history":
+		history, e := s.DHCP.Store.HandoverHistory()
+		if e != nil {
+			return nil, e
+		}
+		return document(history)
 	case "begin":
 		e = handover.Begin(request.Target, spec, time.Duration(request.Seconds)*time.Second)
 	case "confirm":

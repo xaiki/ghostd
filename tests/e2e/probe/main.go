@@ -214,8 +214,19 @@ const firewallDoc = `{"zones":{"trusted":{"interfaces":["tailscale0"]},"lan":{"i
 func target(enabled bool) string {
 	return fmt.Sprintf(`{"scopes":[{"id":"lan","interface":"lab0","subnet":"10.77.0.0/24","server":"10.77.0.1","router":"10.77.0.1","start":"10.77.0.10","end":"10.77.0.30","zone":"lab.home.arpa","lease_seconds":600,"enabled":%t}],"devices":[]}`, enabled)
 }
-func beginReq(secs int) string {
-	return fmt.Sprintf(`{"action":"begin","seconds":%d,"target":%s,"legacy":{"unit":%q,"config_path":"/etc/dnsmasq-ghostd-lab.conf","lease_path":"/var/lib/misc/e2e.leases"}}`, secs, target(true), legacyUnit)
+// beginReq builds the handover request from the converter's own preview of the
+// legacy dnsmasq configuration, so the plan an operator would review is the plan
+// the lab takes over with.
+func beginReq(secs int, evidence bool) string {
+	raw, err := exec.Command("/opt/ghostd/ghostd", "--convert-dnsmasq=/etc/dnsmasq-ghostd-lab.conf", "--legacy-unit="+legacyUnit).Output() // stdout only: logs go to stderr
+	must(err, "ghostd --convert-dnsmasq")
+	out := string(raw)
+	var plan struct {
+		Target json.RawMessage `json:"target"`
+		Legacy json.RawMessage `json:"legacy"`
+	}
+	must(json.Unmarshal([]byte(out), &plan), "plan json")
+	return fmt.Sprintf(`{"action":"begin","seconds":%d,"require_evidence":%t,"target":%s,"legacy":%s}`, secs, evidence, plan.Target, plan.Legacy)
 }
 
 func pre() {
@@ -269,13 +280,23 @@ func pre() {
 	check(strings.HasPrefix(addr1, "10.77.0."), "dnsmasq leased %s to client1", addr1)
 	os.WriteFile("/var/lib/e2e.addr1", []byte(addr1), 0644)
 
+	step("takeover: the converter previews the legacy config as a plan")
+	prev, err := sh("/opt/ghostd/ghostd", "--convert-dnsmasq=/etc/dnsmasq-ghostd-lab.conf", "--legacy-unit="+legacyUnit)
+	check(err == nil && strings.Contains(prev, `"server": "10.77.0.1"`) && strings.Contains(prev, `"lease_seconds": 600`), "plan carries the scope, server and lifetime: %v", err)
+	check(func() bool { _, e := sh("/opt/ghostd/ghostd", "--convert-dnsmasq=/etc/hostname"); return e != nil }(), "a non-dnsmasq file is refused")
+
 	step("takeover: begin via RPC")
-	j, err := handover(beginReq(120))
+	j, err := handover(beginReq(120, true))
 	must(err, "begin")
 	check(phase() == "pending", "handover pending (%v)", j["Phase"])
 	active, masked := legacyState()
 	check(!active && masked, "dnsmasq stopped and persistently masked")
 	check(soa("udp") && soa("tcp"), "authoritative SOA over UDP and TCP")
+	hs, _ := handover(`{"action":"status"}`)
+	miss, _ := hs["pending_verification"].([]any)
+	check(len(miss) == 2 && hs["remaining_seconds"] != nil, "status lists what still needs client verification: %v", miss)
+	_, err = handover(`{"action":"confirm"}`)
+	check(err != nil && strings.Contains(err.Error(), "client verification incomplete"), "confirmation refused before any client has been seen (%v)", err)
 	check(dhcp("client1") == addr1, "client1 keeps %s (renewal served by ghostd)", addr1)
 	b := bindingFor(addr1)
 	check(b != nil, "registry holds the imported binding")
@@ -290,10 +311,17 @@ func pre() {
 	_, err = apply("dhcp-v1", target(true), 60)
 	check(err != nil, "ordinary DHCP apply refused during the takeover window")
 
-	step("takeover: confirm")
+	step("takeover: confirm once real clients have renewed and been allocated")
+	hs, _ = handover(`{"action":"status"}`)
+	miss, _ = hs["pending_verification"].([]any)
+	check(len(miss) == 0, "no verification outstanding: %v", hs["evidence"])
 	_, err = handover(`{"action":"confirm"}`)
 	must(err, "confirm handover")
 	check(phase() == "confirmed", "handover confirmed")
+	hist, err := rpc(func(ctx context.Context, c pb.HostStateClient) (*pb.RegistryResponse, error) {
+		return c.DHCPHandover(ctx, &pb.RegistryDocument{Json: `{"action":"history"}`})
+	})
+	check(err == nil && strings.Contains(hist.GetJson(), `"confirmed"`), "confirmed takeover is archived in history")
 }
 
 func post() {
@@ -325,7 +353,7 @@ func post() {
 func expiry() {
 	waitReady()
 	step("expiry: an unconfirmed takeover rolls back on its own")
-	_, err := handover(beginReq(30))
+	_, err := handover(beginReq(30, false))
 	must(err, "begin")
 	check(phase() == "pending", "pending")
 	eventually("watcher rollback at the deadline", 90*time.Second, func() bool { return phase() == "rolled-back" })
@@ -333,7 +361,7 @@ func expiry() {
 	check(active && !masked, "dnsmasq restored")
 
 	step("expiry: daemon down through the deadline -> boot recovery rolls back before serving")
-	_, err = handover(beginReq(30))
+	_, err = handover(beginReq(30, false))
 	must(err, "begin")
 	shOK("systemctl", "stop", "ghostd.service")
 	time.Sleep(35 * time.Second)

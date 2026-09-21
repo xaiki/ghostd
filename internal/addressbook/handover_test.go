@@ -293,3 +293,83 @@ func TestHandoverSurvivesKillAtEveryBoundary(t *testing.T) {
 		})
 	}
 }
+
+func TestHandoverStatusReportsClientEvidence(t *testing.T) {
+	s := openTest(t)
+	m := NewManager(s)
+	defer m.Close()
+	c := testConfig()
+	// Journal an enabled target directly: binding a real interface is the lab's job.
+	j := HandoverJournal{Phase: "pending", Deadline: time.Now().Add(time.Minute).Unix(), Target: c, Revision: s.Revision(), ImportedLeases: map[string]int{"lan": 1}, RequireEvidence: true}
+	if e := s.saveHandover(j); e != nil {
+		t.Fatal(e)
+	}
+	h := Handover{Manager: m}
+	st, e := h.Status()
+	if e != nil || len(st.Missing) != 2 || st.RemainingSeconds <= 0 || st.Retryable {
+		t.Fatal("nothing verified yet:", st, e)
+	}
+	// The inherited client renews (an import made it live first), then a stranger is allocated.
+	if e = s.Import(disabled(c), []ImportedLease{{Scope: "lan", Address: "10.0.0.6", MAC: "00:11:22:33:44:55", Expiry: time.Now().Add(time.Hour).Unix()}}); e != nil {
+		t.Fatal(e)
+	}
+	j.Revision = s.Revision() // evidence counts only what happens after activation
+	if e = s.saveHandover(j); e != nil {
+		t.Fatal(e)
+	}
+	if _, e = s.Allocate(c, "lan", "mac:00:11:22:33:44:55", "00:11:22:33:44:55", "", "10.0.0.6", true); e != nil {
+		t.Fatal(e)
+	}
+	st, _ = h.Status()
+	if len(st.Missing) != 1 || !strings.Contains(st.Missing[0], "no new client") || st.Evidence["lan"].Renewals != 1 {
+		t.Fatal("renewal not credited, or fresh grant not demanded:", st)
+	}
+	if _, e = s.Allocate(c, "lan", "mac:00:11:22:33:44:66", "00:11:22:33:44:66", "", "10.0.0.7", true); e != nil {
+		t.Fatal(e)
+	}
+	if st, _ = h.Status(); len(st.Missing) != 0 || st.Evidence["lan"].Grants != 1 {
+		t.Fatal(st)
+	}
+	// An expired takeover is retryable.
+	j.Deadline = time.Now().Unix() - 5
+	s.saveHandover(j)
+	if st, _ = h.Status(); !st.Retryable || st.RemainingSeconds != 0 {
+		t.Fatal(st)
+	}
+}
+
+func TestConfirmWaitsForClientEvidenceAndHistoryIsArchived(t *testing.T) {
+	s := openTest(t)
+	m := NewManager(s)
+	defer m.Close()
+	l := &memoryLegacy{running: true, leases: "0 00:11:22:33:44:55 10.0.0.6 old *\n"}
+	h := Handover{Manager: m, Legacy: l, SaveConfig: func(Config) error { return nil }}
+	if e := h.Begin(disabled(testConfig()), LegacySpec{}, time.Minute); e != nil {
+		t.Fatal(e)
+	}
+	// Require evidence for an enabled scope the way the daemon would; confirmation
+	// must then refuse until real clients have exercised it.
+	j, _ := s.HandoverJournal()
+	if j.ImportedLeases["lan"] != 1 || j.Started == 0 {
+		t.Fatal("journal lost the import count", j)
+	}
+	j.RequireEvidence = true
+	j.Target = testConfig()
+	s.saveHandover(j)
+	if e := h.Confirm(); e == nil || !strings.Contains(e.Error(), "client verification incomplete") {
+		t.Fatal("confirmed without client evidence:", e)
+	}
+	j.Target = disabled(testConfig())
+	j.RequireEvidence = false
+	s.saveHandover(j)
+	if e := h.Confirm(); e != nil {
+		t.Fatal(e)
+	}
+	if e := h.Rollback(); e != nil {
+		t.Fatal(e)
+	}
+	hist, e := s.HandoverHistory()
+	if e != nil || len(hist) != 2 || hist[0].Phase != "confirmed" || hist[1].Phase != "rolled-back" || hist[0].Snapshot != "" || hist[0].Finished == 0 {
+		t.Fatal("finished takeovers not archived:", hist, e)
+	}
+}
