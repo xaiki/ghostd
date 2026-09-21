@@ -93,7 +93,7 @@ detection.
 ## Running the validation
 
 ```sh
-tests/tags.sh                            # all feature combinations, incl. the core-only build
+tests/tags.sh                            # the whole tag matrix, incl. the core-only build
 go test -race -tags "tailscale dhcp dnsmasq mdns coredns" ./... && go vet -tags "tailscale dhcp dnsmasq mdns coredns" ./...
 GOOS=linux go vet -tags "tailscale dhcp dnsmasq mdns coredns" ./...   # the Linux-only tests compile
 tests/integration/run.sh                # privileged suites in a container

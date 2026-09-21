@@ -279,7 +279,8 @@ go test ./...                     # the core only; add -tags for optional featur
 go test -race -tags "tailscale dhcp dnsmasq mdns coredns" ./...
 go vet -tags "tailscale dhcp dnsmasq mdns coredns" ./...
 gofmt -l .
-tests/tags.sh                     # every supported tag combination, and the default build's dependency isolation
+tests/tags.sh                     # the whole tag matrix: every combination built and tested, or refused
+GHOSTD_TAGS_FAST=1 tests/tags.sh  # the same matrix, build outcomes only
 ```
 
 Unit tests use fake command runners and need no privileges. Privileged
@@ -318,7 +319,7 @@ Three container harnesses need Podman and never touch a real network:
 | --- | --- |
 | `tests/integration/run.sh` | The opt-in privileged suites above, plus the resolver ACL on loopback aliases |
 | `tests/dhcp-lab/run.sh` | The DHCP takeover, relay, RA/SLAAC, DHCPv6 timers and prefix delegation, against real dnsmasq and ISC clients (see [dhcp.md](dhcp.md)) |
-| `tests/tags.sh` | Every supported tag combination builds, vets and tests; the default build carries none of the optional dependencies; unsupported combinations do not compile |
+| `tests/tags.sh` | Every combination of the optional build tags builds, vets and tests, or fails to compile because it violates a dependency (`GHOSTD_TAGS_FAST=1` asserts the build outcomes only); the default build carries none of the optional dependencies |
 | `GHOSTD_TAGS=tailscale GHOSTD_E2E_MODE=minimal tests/e2e/run.sh` | The core-only binary under systemd: core domains work, optional domains/RPCs are refused, and no DNS/DHCP/mDNS socket is open |
 | `GHOSTD_E2E_MODE=standby tests/e2e/run.sh` | Two real daemons: a leader serving DHCP and a standby mirroring it; the leader is stopped, the standby promoted, and the clients renew the same addresses |
 | `GHOSTD_TAGS=headscale GHOSTD_E2E_MODE=headscale tests/e2e/run.sh` | The headscale provider against a daemon that grants a deploy capability and no tag: the capability is ignored, a listed `--deployer-user` login is authorized |

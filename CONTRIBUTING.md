@@ -3,7 +3,8 @@
 ## Build and test
 
 ```sh
-tests/tags.sh                                          # every supported feature combination
+tests/tags.sh                                          # the whole build-tag matrix: every combination
+GHOSTD_TAGS_FAST=1 tests/tags.sh                       # ...the build outcomes only: seconds, while iterating
 go vet -tags "tailscale dhcp dnsmasq mdns coredns" ./...
 gofmt -l .                                             # must print nothing
 go test -race -tags "tailscale dhcp dnsmasq mdns coredns" ./...
@@ -14,7 +15,9 @@ The overlay providers (`tailscale`, `headscale`) and optional features
 default build is the core only and must stay free of their dependencies. A new
 optional part lives behind its tag with a `!tag` stub only where the core needs a
 type to exist, registers itself from `init()` (`cmd/ghostd/feature.go`,
-`internal/rpc/features.go`), and gets a row in `tests/tags.sh`.
+`internal/rpc/features.go`), and is named in `tests/tags.sh`, whose matrix
+enumerates every combination — it refuses the ones that violate a dependency, and
+fails if a build constraint names a tag the matrix does not know about.
 
 Unit tests use fake command runners and need no privileges. Privileged
 integration tests are opt-in behind environment variables and belong in a

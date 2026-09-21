@@ -77,7 +77,8 @@ CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -tags "tailscale dhcp c
 ```
 
 Tests take the same tags (`go test -tags "tailscale dhcp dnsmasq mdns coredns" ./...`);
-`tests/tags.sh` builds, vets and tests every supported combination.
+`tests/tags.sh` builds, vets and tests every combination of them, and asserts
+that a combination violating a dependency does not compile.
 
 ## Install
 
