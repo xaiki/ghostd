@@ -178,6 +178,20 @@ func dhcp(ns string) string {
 	}
 	return m[len(m)-1][1]
 }
+// tftpGet fetches a file from the LAN's TFTP server as a client in a namespace.
+func tftpGet(ns, name string) ([]byte, error) {
+	dl := "/tmp/" + ns + ".tftp"
+	os.Remove(dl)
+	out, err := sh("nsenter", "--net=/run/netns/"+ns, "--", "busybox", "tftp", "-g", "-r", name, "-l", dl, "10.77.0.1")
+	if err != nil {
+		return nil, fmt.Errorf("%v: %s", err, out)
+	}
+	return os.ReadFile(dl)
+}
+func sameAsBootFile(got []byte) bool {
+	want, _ := os.ReadFile("/srv/tftp/pxe.bin")
+	return len(want) > 0 && string(got) == string(want)
+}
 func soa(network string) bool {
 	q := new(dns.Msg)
 	q.SetQuestion("lab.home.arpa.", dns.TypeSOA)
@@ -209,7 +223,7 @@ func bindingFor(address string) map[string]any {
 	return nil
 }
 
-const firewallDoc = `{"zones":{"trusted":{"interfaces":["tailscale0"]},"lan":{"interfaces":["lab0"],"services":["dns","dhcp","mdns"],"ports":[{"port":%d,"proto":"tcp"}]}}}`
+const firewallDoc = `{"zones":{"trusted":{"interfaces":["tailscale0"]},"lan":{"interfaces":["lab0"],"services":["dns","dhcp","mdns","tftp"],"ports":[{"port":%d,"proto":"tcp"}]}}}`
 
 func target(enabled bool) string {
 	return fmt.Sprintf(`{"scopes":[{"id":"lan","interface":"lab0","subnet":"10.77.0.0/24","server":"10.77.0.1","router":"10.77.0.1","start":"10.77.0.10","end":"10.77.0.30","zone":"lab.home.arpa","lease_seconds":600,"enabled":%t}],"devices":[]}`, enabled)
@@ -281,6 +295,10 @@ func pre() {
 	check(strings.HasPrefix(addr1, "10.77.0."), "dnsmasq leased %s to client1", addr1)
 	os.WriteFile("/var/lib/e2e.addr1", []byte(addr1), 0644)
 
+	step("PXE: legacy dnsmasq hands out the boot file and serves it over TFTP")
+	got, err := tftpGet("client1", "pxe.bin")
+	check(err == nil && sameAsBootFile(got), "dnsmasq serves pxe.bin over TFTP (%v)", err)
+
 	step("takeover: the converter previews the legacy config as a plan")
 	prev, err := sh("/opt/ghostd/ghostd", "--convert-dnsmasq=/etc/dnsmasq-ghostd-lab.conf", "--legacy-unit="+legacyUnit)
 	check(err == nil && strings.Contains(prev, `"server": "10.77.0.1"`) && strings.Contains(prev, `"lease_seconds": 600`), "plan carries the scope, server and lifetime: %v", err)
@@ -311,6 +329,16 @@ func pre() {
 	check(dhcp("client1") == addr1, "renewal still served")
 	_, err = apply("dhcp-v1", target(true), 60)
 	check(err != nil, "ordinary DHCP apply refused during the takeover window")
+
+	step("PXE: after the takeover ghostd serves the same boot file, and only that tree")
+	lease1, _ := os.ReadFile("/tmp/client1.leases")
+	check(strings.Contains(string(lease1), `filename "pxe.bin"`) && strings.Contains(string(lease1), `option tftp-server-name "10.77.0.1"`), "ghostd's lease carries siaddr and the boot file")
+	got, err = tftpGet("client1", "pxe.bin")
+	check(err == nil && sameAsBootFile(got), "ghostd serves pxe.bin over TFTP behind the firewall's conntrack helper (%v)", err)
+	for _, bad := range []string{"../../etc/e2e-secret", "/etc/e2e-secret", "../e2e-secret"} {
+		_, err = tftpGet("client1", bad)
+		check(err != nil, "%s is refused", bad)
+	}
 
 	step("takeover: confirm once real clients have renewed and been allocated")
 	hs, _ = handover(`{"action":"status"}`)

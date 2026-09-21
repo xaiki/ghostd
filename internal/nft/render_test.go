@@ -328,3 +328,23 @@ func TestMDNSServiceAlsoAdmitsUnicastReplies(t *testing.T) {
 		t.Fatal("mDNS admitted without the service")
 	}
 }
+
+func TestTFTPServiceAttachesConntrackHelper(t *testing.T) {
+	desired, err := ParseDesiredState(`{"zones":{"trusted":{"interfaces":["tailscale0"]},"lan":{"interfaces":["eth0"],"services":["tftp"]}}}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := Render(desired, ReachabilityGuard{TailscaleInterface: "tailscale0", Port: 7443})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`ct helper ghost_tftp {`, `type "tftp" protocol udp`, `iifname { "eth0" } udp dport 69 ct helper set "ghost_tftp"`, "udp dport 69 accept"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q in\n%s", want, out)
+		}
+	}
+	other, _ := ParseDesiredState(`{"zones":{"trusted":{"interfaces":["tailscale0"]},"lan":{"interfaces":["eth0"],"services":["dns"]}}}`)
+	if out, _ = Render(other, ReachabilityGuard{TailscaleInterface: "tailscale0", Port: 7443}); strings.Contains(out, "ghost_tftp") {
+		t.Fatal("helper attached without the service")
+	}
+}

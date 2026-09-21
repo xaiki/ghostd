@@ -179,6 +179,8 @@ func ValidateDNSmasqConfig(c Config, text, leasePath string) error {
 	domains := map[string]bool{}
 	scopedDomains := map[netip.Prefix]string{}
 	excluded := map[string]bool{}
+	var bootFile, bootNext, tftpRoot string
+	tftp := false
 	lease := false
 	ra := false
 	for _, line := range strings.Split(text, "\n") {
@@ -285,6 +287,28 @@ func ValidateDNSmasqConfig(c Config, text, leasePath string) error {
 			if !matched {
 				return fmt.Errorf("reservation is absent from target")
 			}
+		case "dhcp-boot":
+			f := strings.Split(value, ",")
+			if len(f) > 3 || f[0] == "" || strings.Contains(f[0], ":") && (strings.HasPrefix(f[0], "tag:") || strings.HasPrefix(f[0], "set:")) {
+				return fmt.Errorf("unsupported dhcp-boot form %q (tagged or multi-field boot needs manual conversion)", value)
+			}
+			bootFile = f[0]
+			if len(f) == 3 {
+				bootNext = f[2]
+			} else if len(f) == 2 {
+				if ip := net.ParseIP(f[1]); ip != nil && ip.To4() != nil {
+					bootNext = f[1]
+				} else {
+					return fmt.Errorf("dhcp-boot server name %q is not an address; only an address is supported", f[1])
+				}
+			}
+		case "enable-tftp":
+			if value != "" {
+				return fmt.Errorf("enable-tftp limited to interfaces is not supported")
+			}
+			tftp = true
+		case "tftp-root":
+			tftpRoot = value
 		case "enable-ra":
 			ra = true
 		case "bind-interfaces", "no-resolv", "no-hosts", "log-dhcp", "log-queries", "dhcp-authoritative":
@@ -295,6 +319,34 @@ func ValidateDNSmasqConfig(c Config, text, leasePath string) error {
 	}
 	if !lease {
 		return fmt.Errorf("explicit dhcp-leasefile required")
+	}
+	if tftp && tftpRoot == "" {
+		return fmt.Errorf("enable-tftp without tftp-root serves the whole filesystem; set tftp-root")
+	}
+	if tftp != (c.TFTP != nil) || (c.TFTP != nil && c.TFTP.Root != tftpRoot) {
+		return fmt.Errorf("target TFTP does not match the legacy enable-tftp/tftp-root")
+	}
+	for _, s := range c.Scopes {
+		if s.Is6() || !s.Enabled {
+			continue
+		}
+		want := bootFile != ""
+		if want != (s.Boot != nil) {
+			return fmt.Errorf("scope %s: network boot in the target does not match the legacy dhcp-boot", s.ID)
+		}
+		if s.Boot != nil {
+			next := s.Boot.NextServer
+			if next == "" {
+				next = s.Server
+			}
+			legacyNext := bootNext
+			if legacyNext == "" {
+				legacyNext = s.Server
+			}
+			if s.Boot.File != bootFile || next != legacyNext {
+				return fmt.Errorf("scope %s: boot file or next server differs from the legacy dhcp-boot", s.ID)
+			}
+		}
 	}
 	for _, s := range c.Scopes {
 		if s.Is6() && (s.RA != nil) != ra {

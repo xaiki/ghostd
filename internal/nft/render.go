@@ -35,6 +35,7 @@ var serviceReplyPorts = map[string][]PortRule{
 
 var builtinServices = map[string][]PortRule{
 	"mdns":          {{Port: 5353, Proto: "udp"}},
+	"tftp":          {{Port: 69, Proto: "udp"}},
 	"dns":           {{Port: 53, Proto: "tcp"}, {Port: 53, Proto: "udp"}},
 	"dhcp":          {{Port: 67, Proto: "udp"}},
 	"dhcpv6-client": {{Port: 546, Proto: "udp"}},
@@ -70,6 +71,7 @@ func Render(ds DesiredState, guard ReachabilityGuard) (string, error) {
 		return b.String(), nil
 	}
 
+	writeTFTPHelper(&b, ds, names)
 	writeInputChain(&b, ds, guard, names)
 	writeForwardChain(&b, ds, names)
 	writeOutputChain(&b, ds.Output)
@@ -327,4 +329,26 @@ func writeZoneChain(b *strings.Builder, name string, zone Zone) error {
 	}
 	b.WriteString("  }\n")
 	return nil
+}
+
+// writeTFTPHelper attaches the kernel's TFTP conntrack helper to inbound
+// requests on zones that open the tftp service. A TFTP server answers from a
+// fresh ephemeral port, so without the helper the client's ACKs to that port
+// would fall to the default-drop input policy: the helper is what turns them
+// into ct state related, which the input chain already accepts.
+func writeTFTPHelper(b *strings.Builder, ds DesiredState, names []string) {
+	var ifaces []string
+	for _, name := range names {
+		for _, svc := range ds.Zones[name].Services {
+			if svc == "tftp" {
+				ifaces = append(ifaces, ds.Zones[name].Interfaces...)
+			}
+		}
+	}
+	if len(ifaces) == 0 {
+		return
+	}
+	b.WriteString("  ct helper ghost_tftp {\n    type \"tftp\" protocol udp\n  }\n")
+	b.WriteString("  chain tftp_helper {\n    type filter hook prerouting priority -300; policy accept;\n")
+	fmt.Fprintf(b, "    iifname %s udp dport 69 ct helper set \"ghost_tftp\"\n  }\n", ifaceSet(ifaces))
 }

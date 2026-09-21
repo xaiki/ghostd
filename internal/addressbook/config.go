@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"path/filepath"
 	"regexp"
 	"strings"
 )
@@ -21,6 +22,20 @@ var interfacePattern = regexp.MustCompile(`^[a-zA-Z0-9_.:-]{1,15}$`)
 type Config struct {
 	Scopes  []Scope        `json:"scopes"`
 	Devices []DeviceConfig `json:"devices,omitempty"`
+	// TFTP serves a read-only tree on every enabled IPv4 scope's server address.
+	TFTP *TFTPConfig `json:"tftp,omitempty"`
+}
+
+// BootConfig is the network-boot hand-off (PXE) a scope gives its clients:
+// siaddr, the boot file name, and option 66.
+type BootConfig struct {
+	File string `json:"file"`
+	// NextServer defaults to the scope's own server address, where ghostd's TFTP
+	// (or another server) is expected.
+	NextServer string `json:"next_server,omitempty"`
+}
+type TFTPConfig struct {
+	Root string `json:"root"`
 }
 type Scope struct {
 	ID               string        `json:"id"`
@@ -37,6 +52,7 @@ type Scope struct {
 	PreferredSeconds int           `json:"preferred_seconds,omitempty"`
 	Relay            *RelayConfig  `json:"relay,omitempty"`
 	RA               *RAConfig     `json:"ra,omitempty"`
+	Boot             *BootConfig   `json:"boot,omitempty"`
 }
 type Reservation struct {
 	Client  string `json:"client"` // mac:aa:bb:... or id:<option-61 hex>
@@ -108,6 +124,9 @@ func (c Config) Validate() error {
 			nodes[nodeID] = true
 		}
 	}
+	if c.TFTP != nil && (!filepath.IsAbs(c.TFTP.Root) || filepath.Clean(c.TFTP.Root) != c.TFTP.Root || len(c.TFTP.Root) > 4096 || c.TFTP.Root == "/") {
+		return fmt.Errorf("tftp root must be an absolute, clean directory other than /")
+	}
 	ids, selectors, zones := map[string]bool{}, map[string]bool{}, map[string]bool{}
 	var prefixes []netip.Prefix
 	for _, s := range c.Scopes {
@@ -170,6 +189,19 @@ func (c Config) Validate() error {
 		if s.RA != nil {
 			if s.Relay != nil || p.Bits() != 64 || s.RA.Interval < 4 || s.RA.Interval > 600 || s.RA.RouterLifetime < 0 || s.RA.RouterLifetime > 9000 || (s.RA.RouterLifetime > 0 && s.RA.RouterLifetime < s.RA.Interval*3) {
 				return fmt.Errorf("RA needs a direct /64, interval 4..600 and router_lifetime 0 or 3*interval..9000")
+			}
+		}
+		if s.Boot != nil {
+			if s.Is6() {
+				return fmt.Errorf("network boot is IPv4 only (scope %s)", s.ID)
+			}
+			if s.Boot.File == "" || len(s.Boot.File) > 128 || strings.ContainsAny(s.Boot.File, "\x00\r\n") {
+				return fmt.Errorf("scope %s: boot file must be 1..128 printable characters", s.ID)
+			}
+			if s.Boot.NextServer != "" {
+				if a, e := netip.ParseAddr(s.Boot.NextServer); e != nil || !a.Is4() || a.IsUnspecified() || a.IsMulticast() {
+					return fmt.Errorf("scope %s: next_server must be a unicast IPv4 address", s.ID)
+				}
 			}
 		}
 		if !validZone(s.Zone) {
@@ -251,6 +283,10 @@ func (c Config) Device(id string) (DeviceConfig, bool) {
 
 func cloneConfig(c Config) Config {
 	out := Config{Scopes: append([]Scope(nil), c.Scopes...), Devices: append([]DeviceConfig(nil), c.Devices...)}
+	if c.TFTP != nil {
+		x := *c.TFTP
+		out.TFTP = &x
+	}
 	for i := range out.Devices {
 		out.Devices[i].NodeIDs = append([]string(nil), c.Devices[i].NodeIDs...)
 		out.Devices[i].Aliases = append([]string(nil), c.Devices[i].Aliases...)
@@ -264,6 +300,10 @@ func cloneConfig(c Config) Config {
 		if c.Scopes[i].RA != nil {
 			x := *c.Scopes[i].RA
 			out.Scopes[i].RA = &x
+		}
+		if c.Scopes[i].Boot != nil {
+			x := *c.Scopes[i].Boot
+			out.Scopes[i].Boot = &x
 		}
 	}
 	return out
@@ -293,3 +333,5 @@ func (d DeviceConfig) HasAlias(name string) bool {
 	}
 	return false
 }
+
+func jsonMarshal(v any) ([]byte, error) { return json.Marshal(v) }

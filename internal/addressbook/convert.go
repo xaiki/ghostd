@@ -170,7 +170,8 @@ func ConvertDNSmasq(path string, o ConvertOptions) (ConvertPlan, error) {
 	var interfaces []string
 	var ranges [][]string
 	var hosts [][]string
-	var globalZone, routerOpt string
+	var globalZone, routerOpt, bootFile, bootNext, tftpRoot string
+	tftp := false
 	zoneFor := map[string]string{}
 	ra := false
 	for n, line := range strings.Split(text, "\n") {
@@ -224,6 +225,24 @@ func ConvertDNSmasq(path string, o ConvertOptions) (ConvertPlan, error) {
 				return plan, bad("use MAC,address,name")
 			}
 			hosts = append(hosts, f)
+		case "dhcp-boot":
+			f := strings.Split(value, ",")
+			if len(f) > 3 || f[0] == "" || strings.HasPrefix(f[0], "tag:") || strings.HasPrefix(f[0], "set:") {
+				return plan, bad("tagged or multi-field boot needs manual conversion")
+			}
+			bootFile = f[0]
+			if len(f) == 3 {
+				bootNext = f[2]
+			} else if len(f) == 2 {
+				bootNext = f[1]
+			}
+		case "enable-tftp":
+			if value != "" {
+				return plan, bad("TFTP limited to interfaces is not supported")
+			}
+			tftp = true
+		case "tftp-root":
+			tftpRoot = value
 		case "enable-ra":
 			ra = true
 		case "bind-interfaces", "no-resolv", "no-hosts", "log-dhcp", "log-queries", "dhcp-authoritative", "pid-file", "user", "group":
@@ -299,6 +318,12 @@ func ConvertDNSmasq(path string, o ConvertOptions) (ConvertPlan, error) {
 		}
 		used[id] = true
 		s := Scope{ID: id, Interface: iface, Subnet: prefix.String(), Server: server.String(), Start: start.String(), End: end.String(), Zone: zone, LeaseSeconds: life, Enabled: true}
+		if start.Is4() && bootFile != "" {
+			s.Boot = &BootConfig{File: bootFile}
+			if bootNext != "" && bootNext != server.String() {
+				s.Boot.NextServer = bootNext
+			}
+		}
 		if start.Is4() {
 			s.Router = server.String() // dnsmasq's own default
 			if routerOpt != "" {
@@ -332,6 +357,12 @@ func ConvertDNSmasq(path string, o ConvertOptions) (ConvertPlan, error) {
 			s.Reservations = append(s.Reservations, Reservation{Client: "mac:" + mac.String(), Address: addr.String(), Device: h[2]})
 		}
 		plan.Target.Scopes = append(plan.Target.Scopes, s)
+	}
+	if tftp {
+		if tftpRoot == "" {
+			return plan, fmt.Errorf("enable-tftp without tftp-root serves the whole filesystem; set tftp-root")
+		}
+		plan.Target.TFTP = &TFTPConfig{Root: tftpRoot}
 	}
 	for _, h := range hosts {
 		addr, _ := netip.ParseAddr(h[1])

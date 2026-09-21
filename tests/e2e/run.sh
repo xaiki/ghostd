@@ -39,7 +39,7 @@ done
 # A packaged unit lives in the vendor directory, which is what lets systemctl mask it.
 podman cp tests/e2e/units/dnsmasq@ghostd-lab.service "$name:/usr/lib/systemd/system/dnsmasq@ghostd-lab.service"
 podman cp tests/e2e/dnsmasq-ghostd-lab.conf "$name:/etc/dnsmasq-ghostd-lab.conf"
-podman exec "$name" mkdir -p /etc/avahi/services /var/lib/ghostd/last-good
+podman exec "$name" sh -c "mkdir -p /etc/avahi/services /var/lib/ghostd/last-good /srv/tftp; head -c 70000 /dev/urandom > /srv/tftp/pxe.bin; echo secret > /etc/e2e-secret"
 podman cp tests/e2e/avahi/avahi-printer.conf "$name:/etc/avahi/avahi-printer.conf"
 podman cp tests/e2e/avahi/ipp.service "$name:/etc/avahi/services/ipp.service"
 podman cp tests/e2e/avahi/cast.service "$name:/etc/avahi/services/cast.service"

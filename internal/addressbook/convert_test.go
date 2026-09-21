@@ -100,7 +100,7 @@ func TestConvertRejectsWhatItCannotPreserve(t *testing.T) {
 	cases := map[string]struct {
 		conf, want string
 	}{
-		"unknown directive":   {baseConf + "dhcp-boot=pxelinux.0\n", "needs explicit conversion"},
+		"unknown directive":   {baseConf + "dhcp-vendorclass=set:pxe,PXEClient\n", "needs explicit conversion"},
 		"tagged range":        {strings.Replace(baseConf, "domain=home.arpa", "domain=home.arpa\ndhcp-range=set:guest,198.51.100.10,198.51.100.20,255.255.255.0,1h", 1), "explicit start,end"},
 		"scoped option":       {baseConf + "dhcp-option=tag:guest,option:router,198.51.100.1\n", "scoped in ways"},
 		"other option":        {baseConf + "dhcp-option=option:ntp-server,192.0.2.1\n", "only router and dns-server"},

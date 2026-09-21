@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"os"
 	"sync"
 
 	"github.com/coredns/coredns/plugin"
@@ -26,6 +27,7 @@ type Manager struct {
 	dhcp    map[string]*core.Servers
 	dns     map[string]*dnsPair
 	ra      map[string]*raListener
+	tftp    map[string]*tftpServer
 	peers   func(context.Context) ([]Peer, error)
 }
 type dnsPair struct {
@@ -35,13 +37,14 @@ type dnsPair struct {
 }
 
 func NewManager(s *Store) *Manager {
-	return &Manager{Store: s, Errors: make(chan error, 1), dhcp: map[string]*core.Servers{}, dns: map[string]*dnsPair{}, ra: map[string]*raListener{}}
+	return &Manager{Store: s, Errors: make(chan error, 1), dhcp: map[string]*core.Servers{}, dns: map[string]*dnsPair{}, ra: map[string]*raListener{}, tftp: map[string]*tftpServer{}}
 }
 func (m *Manager) Config() Config { m.mu.RLock(); defer m.mu.RUnlock(); return cloneConfig(m.config) }
 func (p *dnsPair) close()         { p.udp.PacketConn.Close(); p.tcp.Listener.Close() }
 func (m *Manager) Close() {
 	m.mu.Lock()
-	sockets, dnses, ras := m.dhcp, m.dns, m.ra
+	sockets, dnses, ras, tftps := m.dhcp, m.dns, m.ra, m.tftp
+	m.tftp = map[string]*tftpServer{}
 	m.dhcp = map[string]*core.Servers{}
 	m.dns = map[string]*dnsPair{}
 	m.ra = map[string]*raListener{}
@@ -56,6 +59,9 @@ func (m *Manager) Close() {
 	}
 	for _, r := range ras {
 		r.Close()
+	}
+	for _, t := range tftps {
+		t.close()
 	}
 }
 func (m *Manager) Apply(c Config, save func() error) error {
@@ -87,6 +93,8 @@ func (m *Manager) Apply(c Config, save func() error) error {
 	}
 	added := map[string]*core.Servers{}
 	addedDNS := map[string]*dnsPair{}
+	addedTFTP := map[string]*tftpServer{}
+	wantTFTP := map[string]string{} // server address -> root
 	addedRA := map[string]*raListener{}
 	cleanup := func() {
 		for _, s := range added {
@@ -94,6 +102,9 @@ func (m *Manager) Apply(c Config, save func() error) error {
 		}
 		for _, s := range addedDNS {
 			s.close()
+		}
+		for _, t := range addedTFTP {
+			t.close()
 		}
 		for _, r := range addedRA {
 			r.abort()
@@ -156,6 +167,27 @@ func (m *Manager) Apply(c Config, save func() error) error {
 			})
 			addedDNS[scope.Server] = &dnsPair{udp: &dns.Server{PacketConn: udp, Handler: handler}, tcp: &dns.Server{Listener: tcp, Handler: handler}}
 		}
+		if c.TFTP != nil && !scope.Is6() {
+			wantTFTP[scope.Server] = c.TFTP.Root
+			old := m.tftp[scope.Server]
+			if (old == nil || old.root != c.TFTP.Root) && addedTFTP[scope.Server] == nil {
+				if info, e := os.Stat(c.TFTP.Root); e != nil || !info.IsDir() {
+					cleanup()
+					return fmt.Errorf("tftp root %s is not a directory", c.TFTP.Root)
+				}
+				if old != nil {
+					// Root changed: the old socket must go before the new one binds.
+					old.close()
+					delete(m.tftp, scope.Server)
+				}
+				conn, e := net.ListenPacket("udp", net.JoinHostPort(scope.Server, "69"))
+				if e != nil {
+					cleanup()
+					return fmt.Errorf("TFTP bind %s: %w", scope.Server, e)
+				}
+				addedTFTP[scope.Server] = newTFTP(c.TFTP.Root, conn)
+			}
+		}
 		if scope.RA != nil {
 			if old, ok := m.config.Scope(scope.ID); ok && m.ra[scope.ID] != nil && (old.Interface != scope.Interface || old.Subnet != scope.Subnet || old.Server != scope.Server) {
 				cleanup()
@@ -190,6 +222,15 @@ func (m *Manager) Apply(c Config, save func() error) error {
 			s.Close()
 			delete(m.dhcp, k)
 		}
+	}
+	for k, t := range m.tftp {
+		if _, ok := wantTFTP[k]; !ok {
+			t.close()
+			delete(m.tftp, k)
+		}
+	}
+	for k, t := range addedTFTP {
+		m.tftp[k] = t
 	}
 	for k, s := range m.dns {
 		if !wantDNS[k] {
@@ -323,7 +364,20 @@ func (s *Store) Handle4(c Config, scope Scope, r *dhcpv4.DHCPv4) (*dhcpv4.DHCPv4
 			return nil, err
 		}
 		_, network, _ := net.ParseCIDR(scope.Subnet)
-		return dhcpv4.NewReplyFromRequest(r, dhcpv4.WithMessageType(replyType), dhcpv4.WithClientIP(r.ClientIPAddr), dhcpv4.WithYourIP(net.ParseIP(b.Address)), dhcpv4.WithOption(dhcpv4.OptServerIdentifier(server)), dhcpv4.WithNetmask(network.Mask), dhcpv4.WithRouter(net.ParseIP(scope.Router)), dhcpv4.WithOption(dhcpv4.OptDNS(server)), dhcpv4.WithLeaseTime(uint32(scope.LeaseSeconds)), dhcpv4.WithDomainSearchList(scope.Zone))
+		reply, err := dhcpv4.NewReplyFromRequest(r, dhcpv4.WithMessageType(replyType), dhcpv4.WithClientIP(r.ClientIPAddr), dhcpv4.WithYourIP(net.ParseIP(b.Address)), dhcpv4.WithOption(dhcpv4.OptServerIdentifier(server)), dhcpv4.WithNetmask(network.Mask), dhcpv4.WithRouter(net.ParseIP(scope.Router)), dhcpv4.WithOption(dhcpv4.OptDNS(server)), dhcpv4.WithLeaseTime(uint32(scope.LeaseSeconds)), dhcpv4.WithDomainSearchList(scope.Zone))
+		if err == nil && scope.Boot != nil {
+			// The network-boot hand-off, as dnsmasq's dhcp-boot gives it: siaddr, the
+			// file field, and options 66/67, whether or not the client asked.
+			next := server
+			if scope.Boot.NextServer != "" {
+				next = net.ParseIP(scope.Boot.NextServer)
+			}
+			reply.ServerIPAddr = next.To4()
+			reply.BootFileName = scope.Boot.File
+			reply.UpdateOption(dhcpv4.OptTFTPServerName(next.String()))
+			reply.UpdateOption(dhcpv4.OptBootFileName(scope.Boot.File))
+		}
+		return reply, err
 	case dhcpv4.MessageTypeRelease, dhcpv4.MessageTypeDecline:
 		return nil, s.Release(scope.ID, client, requested, kind == dhcpv4.MessageTypeDecline)
 	case dhcpv4.MessageTypeInform:
