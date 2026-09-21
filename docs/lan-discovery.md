@@ -1,6 +1,24 @@
 # LAN discovery on behalf of containers — design
 
-Status: **plan, not built.**
+Status: **built, except the multicast reflector — which the design rules out.** The
+decisions this document left open are settled in [What was decided and built](#what-was-decided-and-built)
+below; the analysis after it is kept because it is why those decisions were made.
+
+## What was decided and built
+
+| Question | Decision | Where |
+| --- | --- | --- |
+| Retiring avahi breaks `.local` | ghostd owns mDNS **queries** natively: legacy-unicast queries from an ephemeral port, so it never binds UDP 5353. `getent` remains only as a fallback when no interface can send. Lab: no avahi on the host, a third-party responder on the LAN, `.local` still resolves. | `internal/mdns/query.go`, `internal/resolver/resolver.go` |
+| Which ACL shape | **Authenticated unicast browsing.** The identity of a query is the resolver *listener* it arrived on, never a source address. Per-container networks and one shared permission were rejected: the first costs a network per permission set, the second is not an ACL. | `internal/resolver/acl.go` |
+| Reflector | **Not built, deliberately.** One multicast stream cannot carry one container's permission, so reflecting into a shared bridge would defeat the ACL. An application that can only speak mDNS itself still needs host networking (shape (a) stays as the escape hatch). | — |
+| Where the record set is declared | The `mdns-v1` domain: an explicit, reviewable list, riding the ordinary lease, confirmation and rollback. | `internal/mdns/advertise.go`, `internal/rpc/addressbook.go` |
+| Conflicts | Before advertising, ghostd **probes** each name; a name another host already owns refuses the apply and leaves the previous set running. Lab: avahi owns "Lobby Printer"; advertising over it is refused. | `internal/mdns/service.go` |
+| Records are captured, not recalled | Unchanged. ghostd ships **no** Time Machine record set: supply one captured from a known-good advertisement. | — |
+
+The ACL and the mDNS domain are described for operators in [dhcp.md](dhcp.md#per-container-dns-acl)
+and [operations.md](operations.md#mdns-advertisement).
+
+## Analysis (why)
 
 This is deliberately **not written as a feature of one application.** File sharing
 needs Time Machine and printer advertisement, printing needs printer browsing, and
@@ -185,7 +203,7 @@ ghostd-internal:
   preserve host NSS behaviour. That last part is the landmine above: it is a
   dependency to replace, not a design to keep.
 
-## Open questions
+## Open questions (now resolved above)
 
 - **Which of the three ACL shapes.** Authenticated unicast browsing, per-container
   networks, or one shared permission. This decides whether a reflector is in the

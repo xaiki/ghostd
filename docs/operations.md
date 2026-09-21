@@ -91,6 +91,10 @@ contains:
 | `firewall-transaction.json` | Confirmed ruleset and/or the pending firewall lease |
 | `netconfig-transaction.json` | Confirmed netconfig target and/or its pending lease |
 | `dhcp-v1-transaction.json` | Confirmed DHCP configuration and/or its pending lease |
+| `mdns-v1-transaction.json` | Confirmed mDNS advertisement and/or its pending lease |
+| `mdns-config.json`, `dhcp-config.json` | The live copies of those configurations, converged on by watchers |
+| `dns-acl.json` | Per-container DNS identities (read at start; see [dhcp.md](dhcp.md#per-container-dns-acl)) |
+| `replica-dhcp-config.json` | A warm standby's mirror of the leader's DHCP configuration |
 | `transaction.lock` | Process-shared lock serialising mutations and recovery |
 | `addressbook.db` | The durable DHCP lease, identity and event ledger |
 | `nft-ruleset.json`, `netconfig-state.json`, `dhcp-config.json` | Legacy blobs, read only when no transaction record exists for that domain |
@@ -146,12 +150,39 @@ binary until every pending lease has been confirmed or recovered.
 | `--observe-only` | false | Reject writes, skip boot restore; fresh hosts only |
 | `--render-firewall` | false | Render stdin JSON to nft syntax and exit |
 | `--report-to` | empty | Report this host's interfaces once to a DHCP authority, then exit |
+| `--convert-dnsmasq` | empty | Preview a dnsmasq config as a handover plan and exit; changes nothing |
+| `--legacy-unit` | `dnsmasq.service` | The unit `--convert-dnsmasq` records in the plan |
+| `--mdns-interfaces` | every up multicast interface | LAN interfaces the native mDNS client queries |
+| `--follow` | empty | Run as a warm standby of the authority at this host:port |
 | `--revert-lease`, `--revert-domain` | empty | Internal timer recovery command; not for interactive use |
 
 Use a systemd `ExecStart` override for different settings. Keep the daemon and
 render-only flag values consistent when reviewing the resulting rules — the
 reachability guard uses `--tailscale-interface` and `--port`, so a rendered file
 built with different values is not what the daemon would apply.
+
+## mDNS advertisement
+
+The `mdns-v1` domain rides the ordinary Apply/Confirm lease. Its target names the
+LAN interfaces, the `.local` host name (answered with the interface's addresses)
+and the DNS-SD instances to advertise:
+
+```json
+{"interfaces": ["eth0"], "host": "nas",
+ "records": [{"service": "_smb._tcp", "instance": "NAS", "port": 445},
+             {"service": "_ipp._tcp", "instance": "Queue", "port": 631,
+              "txt": ["rp=ipp/print"], "subtypes": ["_universal"]}]}
+```
+
+ghostd answers multicast and legacy-unicast queries, announces on start and sends
+goodbyes (TTL 0) on withdrawal. It binds UDP 5353 **exclusively**: with another
+mDNS daemon on the host the apply fails with the bind error rather than sharing the
+port. Before advertising it probes each name, and a name another host already
+advertises refuses the apply and leaves the previous set running. The record set is
+yours to supply; ghostd ships none (a Time Machine set must be captured from a
+known-good advertisement). An unconfirmed change reverts, and after a reboot the
+confirmed set is re-advertised by a watcher that also retries a start that failed
+because an interface was not up yet.
 
 ## Environment
 
@@ -203,8 +234,13 @@ foreign-table preservation, first-apply recovery, stale timer handling, durable
 boot recovery, timer cancellation and firing, and netconfig file restoration.
 None of it replaces a real-tailnet connectivity test before deployment.
 
-The DHCP takeover lab is a separate, heavier harness — see
-[dhcp.md](dhcp.md).
+Three container harnesses need Podman and never touch a real network:
+
+| Script | Covers |
+| --- | --- |
+| `tests/integration/run.sh` | The opt-in privileged suites above, plus the resolver ACL on loopback aliases |
+| `tests/dhcp-lab/run.sh` | The DHCP takeover, relay, RA/SLAAC, DHCPv6 timers and prefix delegation, against real dnsmasq and ISC clients (see [dhcp.md](dhcp.md)) |
+| `tests/e2e/run.sh` | The **real ghostd binary under real systemd** with a fake tailscaled: firewall/netconfig apply, confirm, timer revert and crash recovery; a dnsmasq takeover through the RPC with the daemon killed mid-window; PXE/TFTP; native mDNS and the DNS ACL with avahi and python-zeroconf as third parties; peer suggestions; switch evidence; mDNS advertisement; and a container reboot |
 
 ## Regenerating the proto bindings
 

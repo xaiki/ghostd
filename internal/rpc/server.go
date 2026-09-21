@@ -41,6 +41,8 @@ type Server struct {
 	// ObserveOnly rejects every mutation RPC, independently of authorization.
 	ObserveOnly bool
 	DHCP        *addressbook.Manager
+	// Standby, when set, makes this daemon a warm standby (internal/replica).
+	Standby StandbyControl
 	// MDNS advertises the mdns-v1 record set; nil disables the domain.
 	MDNS *mdns.Service
 	// Legacy builds the allocator being replaced by a handover; nil means the
@@ -395,4 +397,11 @@ func (s *Server) Confirm(ctx context.Context, req *pb.ConfirmRequest) (*pb.Confi
 		return &pb.ConfirmResponse{Ok: true}, nil
 	}
 	return nil, status.Error(codes.FailedPrecondition, "unknown or completed lease")
+}
+
+// StandbyControl is what the RPC layer needs from a warm standby.
+type StandbyControl interface {
+	LeaderAlive(ctx context.Context) bool
+	Promote(ctx context.Context) error
+	Status() any
 }

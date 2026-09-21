@@ -98,8 +98,10 @@ domain is rejected while a lease is pending. Confirmation is not idempotent, and
 any authorized deployer can confirm a known pending lease.
 
 A separate registry surface serves DHCP, DNS and device identity: `GetRegistry`,
-`ImportLeases`, `ReportHost`, `RepairIdentity` and `DHCPHandover`. See
-[docs/dhcp.md](docs/dhcp.md).
+`GetSuggestions`, `ImportLeases`, `ImportObservations`, `ReportHost`,
+`RepairIdentity` and `DHCPHandover` (takeover, verification, history, and warm
+standby promotion). See [docs/dhcp.md](docs/dhcp.md). Beyond `firewall` and
+`netconfig`, the optional `dhcp-v1` and `mdns-v1` domains ride the same lease.
 
 A worked `grpcurl`/`jq` example, including the fresh-connection rule for
 confirmation, is in [docs/operations.md](docs/operations.md).
@@ -194,7 +196,7 @@ To migrate a host, in order:
 | [docs/dhcp.md](docs/dhcp.md) | DHCP, authoritative DNS, device identity, dnsmasq takeover |
 | [docs/dhcp-dns-identity.md](docs/dhcp-dns-identity.md) | Design: registry, allocation and identity model |
 | [docs/dhcp-remaining.md](docs/dhcp-remaining.md) | Known gaps and remaining DHCP/DNS work |
-| [docs/lan-discovery.md](docs/lan-discovery.md) | Planned, not built: LAN DNS-SD on behalf of containers |
+| [docs/lan-discovery.md](docs/lan-discovery.md) | LAN DNS-SD on behalf of containers: what was decided and built |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Build, test, lint and proto-generation workflow |
 
 ## License

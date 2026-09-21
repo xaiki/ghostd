@@ -30,6 +30,7 @@ type Manager struct {
 	tftp    map[string]*tftpServer
 	routes  RouteRunner
 	routeMu sync.Mutex
+	standby bool
 	peers   func(context.Context) ([]Peer, error)
 }
 type dnsPair struct {
@@ -72,6 +73,14 @@ func (m *Manager) Apply(c Config, save func() error) error {
 		return e
 	}
 	m.mu.Lock()
+	if m.standby {
+		for _, sc := range c.Scopes {
+			if sc.Enabled {
+				m.mu.Unlock()
+				return fmt.Errorf("this authority is a warm standby; promote it before enabling scope %s", sc.ID)
+			}
+		}
+	}
 	var retiredRA []*raListener
 	defer func() {
 		m.mu.Unlock()

@@ -85,8 +85,18 @@ in the [netconfig](netconfig.md) domain, not a firewall feature.
 
 ### Services
 
-Legacy `services` names are `mdns`, `dns`, `dhcp`, `dhcpv6-client`, `http` and
-`https`. `nfs: {"exports": ["10.0.0.0/24"]}` permits TCP 111, 2049 and 20048 from
+Legacy `services` names are `mdns`, `tftp`, `dns`, `dhcp`, `dhcpv6-client`, `http`
+and `https`. Two of them open more than their own port:
+
+- `mdns` opens UDP 5353 **and** admits UDP source port 5353 to unprivileged
+  destination ports. mDNS responders answer a legacy-unicast query straight to the
+  asker's ephemeral port, which conntrack does not associate with the multicast
+  question; without this, ghostd's own native `.local` resolution is silent behind a
+  default-drop input policy.
+- `tftp` opens UDP 69 and attaches the kernel TFTP conntrack helper (a
+  `ct helper` object and a prerouting rule) so a TFTP server's replies from an
+  ephemeral port, and the client's ACKs to it, are `ct state related`. Load the
+  `nf_conntrack_tftp` module on hosts where it is not autoloaded. `nfs: {"exports": ["10.0.0.0/24"]}` permits TCP 111, 2049 and 20048 from
 those IPv4 CIDRs. For anything else, supply explicit `ports`.
 
 ### Ingress

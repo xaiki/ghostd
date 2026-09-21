@@ -10,7 +10,7 @@
 | [dhcp.md](dhcp.md) | DHCP, authoritative DNS, device identity, dnsmasq takeover |
 | [dhcp-dns-identity.md](dhcp-dns-identity.md) | Design: registry, allocation and identity model |
 | [dhcp-remaining.md](dhcp-remaining.md) | Known gaps and remaining DHCP/DNS work |
-| [lan-discovery.md](lan-discovery.md) | Planned, not built: LAN DNS-SD on behalf of containers |
+| [lan-discovery.md](lan-discovery.md) | LAN DNS-SD on behalf of containers: what was decided and built |
 
 Start with the [top-level README](../README.md) for requirements, build and
 install.

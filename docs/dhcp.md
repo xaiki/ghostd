@@ -332,17 +332,170 @@ and the remote control API, still require it.
 
 The daemon separately runs a container resolver on port 53 **of its own tailnet
 address**, described in [operations.md](operations.md). It never binds a public
-wildcard and never rewrites the host's `/etc/resolv.conf`. `.local` A/AAAA queries
-go through the host's NSS resolver via bounded `getent` calls, which preserves
-Avahi behaviour in a static, cgo-free binary; other queries go to Quad100 and are
-cached for at most 30 seconds.
+wildcard and never rewrites the host's `/etc/resolv.conf`. `.local` names are
+resolved natively: ghostd multicasts a legacy-unicast query (RFC 6762 6.7) from an
+ephemeral port on the LAN interfaces (`--mdns-interfaces`, default every up
+multicast interface), collects answers for 700 ms and returns them with a TTL of at
+most 30 seconds. It never binds UDP 5353, so no mDNS daemon has to be running on the
+host; only if no interface can send does it fall back to the host's NSS via
+`getent`. DNS-SD questions (PTR/SRV/TXT for `_type._proto.local`) are answered the
+same way, with the instance's SRV/TXT/address records attached. Other queries go to
+Quad100 and are cached for at most 30 seconds.
 
-Per-container DNS ACLs are not enforced. Aardvark and NAT can hide the original
-container identity, so policy must not infer identity from a forwarded source
-address. Any policy check must also run before the shared cache, or one
-container's cached answer becomes another container's visible data. See
-[lan-discovery.md](lan-discovery.md) for the identity this shares with the planned
-LAN discovery domain.
+An mDNS query must be able to come back: `mdns` in a firewall zone's `services` also
+admits UDP source port 5353 to unprivileged destination ports (see
+[firewall.md](firewall.md)).
+
+### Per-container DNS ACL
+
+A source address behind a shared forwarder is not a credential, so the identity of
+a query is the **resolver listener it arrived on**. Declare identities in
+`dns-acl.json` in the store directory:
+
+```json
+{"identities": [
+  {"name": "printing", "listen": "100.64.0.21",
+   "allow_services": ["_ipp._tcp"], "allow_names": ["printers.home.arpa"]},
+  {"name": "music", "listen": "100.64.0.22", "allow_services": ["_googlecast._tcp"]}
+]}
+```
+
+Each identity gets its own listener address, its own server block and therefore its
+own cache, and per-identity `dns-<name>.env` and `resolv-<name>.conf` in the runtime
+directory to hand to that container alone. The check runs **before** lease answers
+and the cache, so one container's cached answer is never another's visible data. An
+identity resolves only what it lists: `allow_names` (a name and everything beneath
+it; `*` means every ordinary name, never `.local`) and `allow_services` (DNS-SD
+classes it may browse). Anything else is `REFUSED`. A `.local` host name is
+resolvable for an identity only after a browse **that identity was allowed** named
+it as a service target, and only for that identity, for two minutes. The base
+resolver address stays unrestricted.
+
+What this does and does not give you: the identity is a property of the network
+path. Give each container only its own resolver address and let host firewall
+policy admit only that container's source to it; ghostd cannot verify who is
+holding an address. Changing the set of listener addresses needs a restart.
+
+## Verifying a takeover with real clients
+
+`begin` accepts `"require_evidence": true`. Confirmation then refuses until the
+ledger has seen, per enabled scope since the takeover began, a client **renewal of
+an inherited lease** (when the legacy pool held any) and a **fresh allocation** —
+counted from the DHCP path's own `renew` and `grant` events, which only a real
+client exchange writes. `status` reports what is still missing:
+
+```sh
+grpcurl ... -d '{"action":"status"}' 100.64.0.10:7443 ghostd.HostState/DHCPHandover
+# {"phase":"pending","remaining_seconds":412,"retryable":false,
+#  "evidence":{"lan":{"imported_leases":9,"renewals":0,"fresh_grants":0}},
+#  "pending_verification":["scope lan: no client has renewed an inherited lease yet", ...],
+#  "history_count":2}
+```
+
+Finished takeovers are archived (without the lease snapshot) and listed by
+`{"action":"history"}`. The verification is evidence the ledger saw traffic, not
+proof of routing or DNS reachability from a given client: still test those.
+
+## Converting a dnsmasq configuration
+
+```sh
+ghostd --convert-dnsmasq=/etc/dnsmasq.conf --legacy-unit=dnsmasq.service
+```
+
+prints a handover plan (`target`, `legacy`, `warnings`) and changes nothing. It
+follows `conf-file=` and `conf-dir=` (skipping dotfiles, `~` backups and listed
+suffixes), determines each scope's interface and server address from the host,
+takes the router option or dnsmasq's own default, and carries ranges, lifetimes,
+domains (global or per subnet), `dhcp-host` reservations, `enable-ra`, `dhcp-boot`
+and `enable-tftp`/`tftp-root`. It **refuses**, with the offending directive,
+everything it cannot preserve: tagged or interface-limited ranges, tagged options,
+options other than router and DNS server, infinite leases, unknown directives, a
+missing domain or lease file, two ranges for one interface and family, and a
+reservation outside every range. A plan is only printed if the same validator that
+guards `begin` accepts it, so a plan that previews cleanly will also begin. The
+validator follows the same includes, so a legacy configuration split over files is
+no longer refused for that alone.
+
+## Network boot (PXE/TFTP)
+
+```json
+{"scopes": [{"id": "lan", ..., "boot": {"file": "pxelinux.0", "next_server": "192.0.2.1"}}],
+ "tftp": {"root": "/srv/tftp"}}
+```
+
+`boot` gives IPv4 clients siaddr, the file field and options 66/67, in offers and
+acks. `tftp` runs a **read-only** TFTP server on every enabled IPv4 scope's server
+address: writes are refused, names cannot leave the root (lexically or through a
+symlink that resolves outside it), and only regular files up to 256 MiB are served.
+Open UDP 69 with the firewall zone service `tftp`, which also attaches the kernel
+TFTP conntrack helper — the server answers from an ephemeral port, which a
+default-drop input policy would otherwise discard.
+
+## Prefix delegation
+
+```json
+{"id": "lan6", "interface": "eth0", "subnet": "2001:db8:1::/64", "server": "2001:db8:1::1",
+ ..., "pd": {"prefix": "2001:db8:100::/48", "length": 56, "route": true}}
+```
+
+Routers on the link can request IA_PD prefixes of `length` (32..64, at most 16 bits
+below the pool, so at most 65536 delegations) from the pool, with Solicit, Request,
+Renew, Rebind and Release, a hint honoured when the prefix is free, `NoPrefixAvail`
+when exhausted, and T1/T2 and lifetimes as for addresses. A delegation is a ledger
+binding (origin `dhcpv6-pd`, address `2001:db8:100::/56`), so its history is
+queryable like a lease's, and it is attributed to the device that already holds the
+same DUID's address. It never appears in DNS or a dnsmasq lease file, and a
+takeover refuses a target that carries `pd`: add it with an ordinary apply after.
+
+With `"route": true` ghostd installs `ip -6 route ... via <router link-local> proto 250`
+for every live delegation (the link-local comes from the transport, or from the
+relay's peer-address for a relayed request) and removes it on release or expiry. It
+reconciles on each grant and periodically, which also restores routes after a
+reboot, and it touches only routes carrying its own protocol number.
+
+## Switch evidence and peer suggestions
+
+`ImportObservations` (deployer) records DHCP-snooping / MAC-table evidence from a
+switch as observations with their own `origin` (`switch-snooping`), `detail` (for
+example a port) and `ttl_seconds` (10..3600, default 300). Like a kernel neighbour
+sighting it corroborates an authenticated self-report and is history-tracked, and it
+is never a grant:
+
+```json
+{"ttl_seconds": 600, "observations": [{"scope": "lan", "address": "192.0.2.50",
+  "mac": "02:00:5e:10:00:07", "detail": "sw1 Gi1/0/7"}]}
+```
+
+The authority polls its own tailscaled for the peer inventory. `GetSuggestions`
+(read-only) lists reviewable proposals linking live, unassociated bindings to
+peers: **`endpoint`** strength when tailscaled reaches the peer directly at the very
+LAN address the binding holds, **`hostname`** (marked weak) when only the name
+matches. Suggestions are flagged `ambiguous` when several peers fit and with a
+`conflict` when the peer already belongs to another device, they never self-apply,
+and each carries a ready `repair` for `RepairIdentity`.
+
+## Warm standby
+
+```sh
+ghostd --follow=100.64.0.10:7443     # on the standby
+```
+
+The standby mirrors the authority's ledger (bindings, quarantines, observations,
+durable associations, tailnet nodes, the server DUID) and its confirmed DHCP
+configuration, keeps every scope disabled and refuses ledger writes. If the
+authority is lost:
+
+```sh
+grpcurl ... -d '{"action":"promote"}' standby:7443 ghostd.HostState/DHCPHandover
+```
+
+Promotion refuses while the leader still answers (`"force": true` overrides — you
+are asserting it is fenced), starts the mirrored configuration, and fails cleanly,
+staying a standby, if it cannot bind. `standby-status` shows the cursor and sync
+age. **There is no automatic failover and no multi-master allocation, by design:**
+two authorities that decide independently hand out the same address, and a standby
+cannot tell a dead leader from a partition. Fence the old authority, promote, and
+restart the old host with `--follow` pointing at the new one.
 
 ## Verification
 
@@ -368,12 +521,23 @@ repeats the checks against a real systemd-managed service, including persistent
 masking and rollback startup verification. Keep `--network none`; never attach
 this lab to a real LAN.
 
-The lab does not exercise physical LAN broadcast delivery, client diversity, or
-real firewall policy. Do those checks on a test VLAN before a production cutover.
+On top of the takeover, the lab covers an unrequested OFFER and a DECLINE left
+outstanding across rollback to real dnsmasq (and a second takeover from that
+export), real timer-driven DHCPv6 Renew and Rebind, and prefix delegation to
+`dhclient -6 -P` with its route.
+
+`tests/e2e/run.sh` is the end-to-end lab: the **real ghostd binary under real
+systemd** with a fake tailscaled, real nft, a real dnsmasq unit, ISC clients, avahi
+and python-zeroconf as third-party mDNS peers and busybox tftp — including a
+container reboot. `tests/integration/run.sh` runs the opt-in privileged Go suites.
+Both use a disposable privileged container with no external network.
+
+The labs do not exercise physical LAN broadcast delivery, client diversity, or a
+real tailnet. Do those checks on a test VLAN before a production cutover.
 
 ## Current limits
 
-Prefix delegation, multi-authority high availability, and authenticated
-per-container DNS ACLs are separate increments, not gaps in the implemented
-single-authority behaviour. Known defects and unverified paths in what has already
+Multi-master allocation and automatic failover are not built and are excluded by
+design (see [Warm standby](#warm-standby)); the multicast reflector is excluded by
+the ACL design ([lan-discovery.md](lan-discovery.md)). Known gaps in what has
 landed are listed in [dhcp-remaining.md](dhcp-remaining.md).

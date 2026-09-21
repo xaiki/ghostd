@@ -33,6 +33,7 @@ import (
 	"github.com/xaiki/ghostd/internal/mdns"
 	"github.com/xaiki/ghostd/internal/netconfig"
 	"github.com/xaiki/ghostd/internal/nft"
+	"github.com/xaiki/ghostd/internal/replica"
 	"github.com/xaiki/ghostd/internal/resolver"
 	"github.com/xaiki/ghostd/internal/rpc"
 	"github.com/xaiki/ghostd/internal/sdnotify"
@@ -67,8 +68,12 @@ func main() {
 	reportTo := flag.String("report-to", "", "report this host interfaces once to a tailnet DHCP authority and exit")
 	convertDNSmasq := flag.String("convert-dnsmasq", "", "preview: convert this dnsmasq config (following includes) to a dhcp-v1 handover plan and exit; touches nothing")
 	legacyUnit := flag.String("legacy-unit", "dnsmasq.service", "the dnsmasq unit --convert-dnsmasq records in the plan")
+	follow := flag.String("follow", "", "run as a warm standby of the ghostd authority at this tailnet host:port: mirror its ledger, serve nothing until promoted (DHCPHandover action \"promote\")")
 	mdnsInterfaces := flag.String("mdns-interfaces", "", "comma-separated LAN interfaces the native mDNS client queries (default: every up multicast interface)")
 	flag.Parse()
+	if *follow != "" {
+		standbyMode, followAddr = true, *follow
+	}
 	if *mdnsInterfaces != "" {
 		for _, name := range strings.Split(*mdnsInterfaces, ",") {
 			if name = strings.TrimSpace(name); name != "" {
@@ -200,6 +205,9 @@ func runRevert(store *state.Store, leaseID, domain string) error {
 // mdnsIfaces is set from --mdns-interfaces before the daemon starts.
 var mdnsIfaces []string
 
+// followAddr is the leader a warm standby mirrors (--follow).
+var followAddr string
+
 func runDaemon(store *state.Store, port int, deployerTag string, tailscaleIface string, watchdogSec int) error {
 	return runDaemonMode(store, port, deployerTag, tailscaleIface, watchdogSec, false)
 }
@@ -292,6 +300,12 @@ func runDaemonMode(store *state.Store, port int, deployerTag string, tailscaleIf
 
 	server.ObserveOnly = observeOnly
 	server.DHCP = manager
+	if standbyMode && !observeOnly {
+		follower := &replica.Follower{Store: store, Manager: manager, Leader: followAddr}
+		server.Standby = follower
+		go follower.Run(ctx)
+		log.Printf("ghostd: warm standby of %s; serving nothing until promoted", followAddr)
+	}
 	if !observeOnly {
 		advertiser := mdns.NewService()
 		defer advertiser.Close()

@@ -64,9 +64,10 @@ after restart, invalidate affected cache entries on updates, and bound TTL by th
 remaining lease lifetime. Cache entries and packets already held by clients cannot
 be recalled: do not claim instantaneous fleet-wide DNS changes.
 
-Delegated prefixes are deliberately not modelled. They are a separate increment,
-because pretending every downstream address was individually leased would be
-wrong.
+Delegated prefixes are modelled as what they are: ledger bindings of origin
+`dhcpv6-pd` whose address is a prefix, never as individually leased addresses.
+They are attributed to the device that holds the same DUID's address, kept out of
+DNS and the dnsmasq export, and (optionally) routed to the requesting router.
 
 ## Joining LAN and tailnet identities
 
@@ -150,7 +151,7 @@ still open:
    renew/rebind/release/decline and DNS options, with RA and SLAAC managed
    explicitly. SLAAC and privacy addresses are observed bindings, not DHCP-issued
    leases, and a complete list of every address a client creates cannot be
-   promised. *Landed. Prefix delegation remains a separate increment.*
+   promised. *Landed, including prefix delegation (IA_PD).*
 5. **Production cutover.** Import active leases and reservations, validate pools
    and exclusions, stop the old authority, then start ghostd on that scope. Never
    run independent allocators against the same pool. Verify real renewal, fresh
@@ -208,6 +209,6 @@ legacy configuration subset are documented in [dhcp.md](dhcp.md).
 
 The Podman lab uses real dnsmasq, ISC clients and Linux network namespaces. It
 checks lease preservation, DNS, restart recovery, rollback and relay admission. No
-production authority has been replaced. Multi-authority high availability,
-delegated prefixes, and per-container authenticated DNS ACLs remain explicitly
-separate work.
+production authority has been replaced. Multi-master allocation and automatic
+failover remain explicitly not built (see the warm standby in [dhcp.md](dhcp.md#warm-standby)),
+because two authorities that each decide alone can hand out the same address.

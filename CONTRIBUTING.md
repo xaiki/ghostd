@@ -14,6 +14,13 @@ integration tests are opt-in behind environment variables and belong in a
 disposable Linux VM; see [docs/operations.md](docs/operations.md#testing) and
 [docs/dhcp.md](docs/dhcp.md#verification) for the DHCP takeover lab.
 
+The container labs (Podman, disposable and network-less) validate what unit tests
+cannot: `tests/integration/run.sh`, `tests/dhcp-lab/run.sh` and
+`tests/e2e/run.sh` (the real daemon under systemd, including a reboot). Run the
+lab that covers what you changed; new behaviour that touches the network or the
+boot path needs a lab step, not only a unit test. `GHOSTD_E2E_KEEP=1` leaves the
+e2e container running for inspection.
+
 The daemon is CGO-free and cross-compiles:
 
 ```sh

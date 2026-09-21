@@ -28,8 +28,8 @@ Three authorization levels exist:
 
 | Level | Method(s) | Requirement |
 | --- | --- | --- |
-| Read | `GetState`, `GetRegistry` | Any recognised tailnet peer |
-| Mutate | `Apply`, `Confirm`, `ImportLeases`, `RepairIdentity`, `DHCPHandover` | Deployer tag or deploy capability |
+| Read | `GetState`, `GetRegistry`, `GetSuggestions` | Any recognised tailnet peer |
+| Mutate | `Apply`, `Confirm`, `ImportLeases`, `ImportObservations`, `RepairIdentity`, `DHCPHandover` | Deployer tag or deploy capability |
 | Report | `ReportHost` | Report capability |
 
 ## The deploy capability
@@ -158,3 +158,21 @@ to:
   "app": {"ghostd.local/cap/report": [{"report": true}]}
 }]}
 ```
+
+## Additional surfaces
+
+- **`ImportObservations`** (switch evidence) and `RepairIdentity`, `ImportLeases`,
+  `DHCPHandover` (including `promote`) are deployer calls. A **warm standby**
+  refuses every registry write until promoted, and refuses `ReportHost`.
+- **The per-container DNS ACL** (see [dhcp.md](dhcp.md#per-container-dns-acl))
+  identifies a container by the resolver listener address it uses. That is a
+  property of the network path, not a credential: ghostd cannot verify who holds an
+  address, so pair each identity with host firewall policy admitting only that
+  container to its own address. A missing or unparsable policy makes the listener
+  refuse everything rather than fall back to open access.
+- **`mdns-v1`** advertises only what the operator declares, on named interfaces, and
+  refuses to advertise over a name another host already owns. Deployer access lets
+  a caller advertise any record set on the LAN: treat it like the other domains.
+- **The TFTP server** is read-only and confined to its root, but it is
+  unauthenticated by nature; serve only files that may be world-readable on the
+  LAN.

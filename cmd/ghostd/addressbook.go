@@ -49,6 +49,9 @@ func recoverHandover(store *state.Store, manager *addressbook.Manager, force boo
 	return handover.Recover()
 }
 
+// standbyMode is set from --follow before the daemon starts.
+var standbyMode bool
+
 func startAddressbook(store *state.Store, observeOnly bool) (*addressbook.Manager, func(), error) {
 	db, err := addressbook.Open(filepath.Join(store.Dir(), "addressbook.db"))
 	if err != nil {
@@ -68,6 +71,11 @@ func startAddressbook(store *state.Store, observeOnly bool) (*addressbook.Manage
 	}
 	if observeOnly {
 		config = addressbook.Config{}
+	}
+	if standbyMode {
+		// A warm standby keeps its configuration but serves nothing until promoted.
+		manager.SetStandby(true)
+		config = addressbook.Disabled(config)
 	}
 	// An interrupted or expired takeover is rolled back before anything binds,
 	// and a pending one whose target cannot start is rolled back rather than

@@ -60,6 +60,16 @@ func (s *Server) restoreDHCP(raw []byte) error {
 	return s.DHCP.Apply(config, func() error { return s.store.Save(addressbook.ConfigFile, raw) })
 }
 func (s *Server) registryAuth(ctx context.Context, write bool) error {
+	return s.registryAuthMode(ctx, write, false)
+}
+
+// registryAuthMode is registryAuth; a warm standby refuses every registry write
+// (its ledger belongs to the leader it mirrors) unless the call is the
+// promotion machinery itself.
+func (s *Server) registryAuthMode(ctx context.Context, write, allowStandby bool) error {
+	if write && !allowStandby && s.DHCP != nil && s.DHCP.Standby() {
+		return status.Error(codes.FailedPrecondition, "this daemon is a warm standby; its ledger belongs to the leader it mirrors until it is promoted")
+	}
 	addr, err := peerAddr(ctx)
 	if err != nil {
 		return err
@@ -140,6 +150,9 @@ func (s *Server) ReportHost(ctx context.Context, req *pb.RegistryDocument) (*pb.
 	if s.ObserveOnly {
 		return nil, status.Error(codes.FailedPrecondition, "observation-only")
 	}
+	if s.DHCP != nil && s.DHCP.Standby() {
+		return nil, status.Error(codes.FailedPrecondition, "warm standby: report to the authority")
+	}
 	addr, err := peerAddr(ctx)
 	if err != nil {
 		return nil, err
@@ -197,11 +210,14 @@ func (s *Server) DHCPHandover(ctx context.Context, req *pb.RegistryDocument) (*p
 		// RequireEvidence makes confirmation wait for observed client
 		// renewal and fresh allocation in every enabled scope.
 		RequireEvidence bool `json:"require_evidence"`
+		// Force promotes a standby although the leader still answers.
+		Force bool `json:"force"`
 	}
 	if e := decodeDocument(req.GetJson(), &request); e != nil {
 		return nil, status.Error(codes.InvalidArgument, e.Error())
 	}
-	if e := s.registryAuth(ctx, request.Action != "status" && request.Action != "history"); e != nil {
+	standbyAction := request.Action == "promote" || request.Action == "standby-status"
+	if e := s.registryAuthMode(ctx, request.Action != "status" && request.Action != "history" && request.Action != "standby-status", standbyAction); e != nil {
 		return nil, e
 	}
 	unlock, e := s.store.Lock()
@@ -213,6 +229,27 @@ func (s *Server) DHCPHandover(ctx context.Context, req *pb.RegistryDocument) (*p
 		if e = s.recoverExpired(ctx, domainDHCP); e != nil {
 			return nil, e
 		}
+	}
+	switch request.Action {
+	case "standby-status":
+		if s.Standby == nil {
+			return nil, status.Error(codes.FailedPrecondition, "this daemon is not a standby")
+		}
+		return document(s.Standby.Status())
+	case "promote":
+		if s.Standby == nil {
+			return nil, status.Error(codes.FailedPrecondition, "this daemon is not a standby")
+		}
+		if !s.DHCP.Standby() {
+			return nil, status.Error(codes.FailedPrecondition, "already promoted")
+		}
+		if !request.Force && s.Standby.LeaderAlive(ctx) {
+			return nil, status.Error(codes.FailedPrecondition, "the leader still answers: stop or fence it first (two authorities would hand out the same addresses), or promote with force")
+		}
+		if e := s.Standby.Promote(ctx); e != nil {
+			return nil, status.Error(codes.FailedPrecondition, e.Error())
+		}
+		return document(map[string]bool{"promoted": true})
 	}
 	j, e := s.DHCP.Store.HandoverJournal()
 	if e != nil {
