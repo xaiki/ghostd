@@ -35,7 +35,7 @@ wait_systemd() {
 	done
 }
 wait_systemd
-for u in lab-fixtures.service fakets.service ghostd.service avahi-printer.service; do
+for u in lab-fixtures.service fakets.service ghostd.service avahi-printer.service fakets2.service ghostd-standby.service; do
 	podman cp "tests/e2e/units/$u" "$name:/etc/systemd/system/$u"
 done
 # A packaged unit lives in the vendor directory, which is what lets systemctl mask it.
@@ -64,6 +64,14 @@ podman exec "$name" sh -c 'systemctl disable --now dnsmasq.service avahi-daemon.
 # checks that a host gets only the core: no DHCP, DNS or mDNS anywhere.
 run() { podman exec "$name" /opt/ghostd/probe "$1"; }
 fail() { podman exec "$name" journalctl -u ghostd.service -n 60 --no-pager >&2 || true; exit 1; }
+if [ "${GHOSTD_E2E_MODE:-full}" = standby ]; then
+	# Two real daemons: the leader serves DHCP, the standby (its own store, node and
+	# runtime directory) mirrors it; the leader is stopped and the standby promoted.
+	podman exec "$name" sh -c 'systemctl enable --now fakets2.service' 
+	run standby || fail
+	echo; echo "e2e standby check passed"
+	exit 0
+fi
 if [ "${GHOSTD_E2E_MODE:-full}" = headscale ]; then
 	run headscale || fail
 	echo; echo "e2e headscale check passed"

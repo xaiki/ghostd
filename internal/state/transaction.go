@@ -111,5 +111,6 @@ func (s *Store) SaveExternallyManagedConfig(domain, legacyName string, raw []byt
 	if err = s.SaveDomain(domain, d); err != nil {
 		return err
 	}
+	crashPoint("between-domain-and-legacy")
 	return s.Save(legacyName, raw)
 }

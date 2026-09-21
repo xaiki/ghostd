@@ -1,0 +1,11 @@
+[Unit]
+Description=ghostd warm standby (e2e lab)
+After=fakets2.service lab-fixtures.service ghostd.service
+Wants=fakets2.service
+
+[Service]
+Type=notify
+ExecStart=/opt/ghostd/ghostd --watchdog-sec=30 --store-dir=/var/lib/ghostd-standby/last-good --overlay-socket=/run/tailscale2/tailscaled.sock --runtime-dir=/run/ghostd-standby --follow=100.64.0.1:7443
+Restart=always
+RestartSec=2
+WatchdogSec=30

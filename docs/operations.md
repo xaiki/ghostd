@@ -149,6 +149,7 @@ binary until every pending lease has been confirmed or recovered.
 | `--watchdog-sec` | `0` | Watchdog interval; match systemd `WatchdogSec` |
 | `--observe-only` | false | Reject writes, skip boot restore; fresh hosts only |
 | `--render-firewall` | false | Render stdin JSON to nft syntax and exit |
+| `--runtime-dir` | `/run/ghostd` | Where runtime files are published; one per daemon when several share a host |
 | `--overlay` | the only provider built in, else `tailscale` | Overlay provider for caller identity and the listen address |
 | `--overlay-socket` | provider default | Override the provider's local client API socket |
 | `--deployer-user` | empty | Comma-separated logins that may deploy, in addition to the tag and capability paths |
@@ -297,6 +298,7 @@ Three container harnesses need Podman and never touch a real network:
 | `tests/dhcp-lab/run.sh` | The DHCP takeover, relay, RA/SLAAC, DHCPv6 timers and prefix delegation, against real dnsmasq and ISC clients (see [dhcp.md](dhcp.md)) |
 | `tests/tags.sh` | Every supported tag combination builds, vets and tests; the default build carries none of the optional dependencies; unsupported combinations do not compile |
 | `GHOSTD_TAGS=tailscale GHOSTD_E2E_MODE=minimal tests/e2e/run.sh` | The core-only binary under systemd: core domains work, optional domains/RPCs are refused, and no DNS/DHCP/mDNS socket is open |
+| `GHOSTD_E2E_MODE=standby tests/e2e/run.sh` | Two real daemons: a leader serving DHCP and a standby mirroring it; the leader is stopped, the standby promoted, and the clients renew the same addresses |
 | `GHOSTD_TAGS=headscale GHOSTD_E2E_MODE=headscale tests/e2e/run.sh` | The headscale provider against a daemon that grants a deploy capability and no tag: the capability is ignored, a listed `--deployer-user` login is authorized |
 | `tests/e2e/run.sh` | The **real ghostd binary under real systemd** with a fake tailscaled: firewall/netconfig apply, confirm, timer revert and crash recovery; a dnsmasq takeover through the RPC with the daemon killed mid-window; PXE/TFTP; native mDNS and the DNS ACL with avahi and python-zeroconf as third parties; peer suggestions; switch evidence; mDNS advertisement; and a container reboot |
 

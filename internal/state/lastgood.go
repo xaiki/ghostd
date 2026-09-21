@@ -42,6 +42,7 @@ func (s *Store) Save(name string, data []byte) error {
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return fmt.Errorf("state: write %s: %w", tmp, err)
 	}
+	crashPoint("after-tmp-write")
 	f, err := os.OpenFile(tmp, os.O_RDWR, 0)
 	if err != nil {
 		return err
@@ -51,9 +52,11 @@ func (s *Store) Save(name string, data []byte) error {
 	if err != nil {
 		return err
 	}
+	crashPoint("after-sync")
 	if err := os.Rename(tmp, target); err != nil {
 		return fmt.Errorf("state: commit %s: %w", target, err)
 	}
+	crashPoint("after-rename")
 	dir, err := os.Open(s.dir)
 	if err != nil {
 		return err
@@ -74,4 +77,14 @@ func (s *Store) Load(name string) ([]byte, error) {
 		return nil, fmt.Errorf("state: read %s: %w", s.path(name), err)
 	}
 	return data, nil
+}
+
+// crashPoint is a test seam: the crash tests kill the process at named steps of
+// a save. It is nil, and free, in the daemon.
+var crashHook func(point string)
+
+func crashPoint(point string) {
+	if crashHook != nil {
+		crashHook(point)
+	}
 }

@@ -30,7 +30,7 @@ func init() {
 			for _, o := range resolverOptions {
 				opts = append(opts, o())
 			}
-			stop, err := resolver.Start(env.dnsAddress, resolver.RuntimeDir, opts...)
+			stop, err := resolver.Start(env.dnsAddress, runtimeDirectory, opts...)
 			if err != nil {
 				return nil, fmt.Errorf("start container DNS: %w", err)
 			}

@@ -24,7 +24,7 @@ for name in client1 client2; do
 done
 
 # Extra tailnet-side addresses: one resolver identity per container.
-for a in 100.64.0.21 100.64.0.22; do ip addr replace "$a/32" dev tailscale0; done
+for a in 100.64.0.2 100.64.0.21 100.64.0.22; do ip addr replace "$a/32" dev tailscale0; done
 
 # A LAN printer with a static address, advertised by avahi (a third-party mDNS
 # responder) inside its own namespace.

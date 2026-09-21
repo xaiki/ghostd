@@ -1,0 +1,8 @@
+[Unit]
+Description=ghostd e2e lab: a second fake tailscaled (the standby's node)
+Before=ghostd-standby.service
+
+[Service]
+RuntimeDirectory=tailscale2
+ExecStart=/opt/ghostd/fakets --socket=/run/tailscale2/tailscaled.sock --ip=100.64.0.2
+Restart=always

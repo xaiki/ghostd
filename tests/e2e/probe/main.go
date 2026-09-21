@@ -26,7 +26,8 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-const addr = "100.64.0.1:7443"
+// addr is the daemon the helpers talk to; the standby phase points it at the second daemon.
+var addr = "100.64.0.1:7443"
 
 var failures int
 
@@ -586,6 +587,38 @@ func post() {
 	}
 	check(found && bindingFor("10.77.0.99") == nil, "switch sighting recorded without a binding")
 
+	step("hard failures: ghostd is SIGKILLed repeatedly while clients renew")
+	want1, want2 := strings.TrimSpace(string(addr1)), strings.TrimSpace(string(addr2))
+	for round := 0; round < 5; round++ {
+		done := make(chan string, 2)
+		go func() { done <- dhcp("client1") }()
+		go func() { time.Sleep(200 * time.Millisecond); done <- dhcp("client2") }()
+		time.Sleep(time.Duration(300+round*250) * time.Millisecond)
+		shOK("systemctl", "kill", "-s", "KILL", "ghostd.service")
+		<-done
+		<-done
+		waitReady()
+	}
+	reg := registry()
+	held := map[string]string{}
+	dup := false
+	if bs, ok := reg["bindings"].([]any); ok {
+		for _, x := range bs {
+			m := x.(map[string]any)
+			if m["state"] == "active" {
+				a, _ := m["address"].(string)
+				c, _ := m["client"].(string)
+				if other, seen := held[a]; seen && other != c {
+					dup = true
+				}
+				held[a] = c
+			}
+		}
+	}
+	check(!dup, "no address is held by two clients after five kills")
+	check(dhcp("client1") == want1 && dhcp("client2") == want2, "both clients still hold the addresses they had before the kills")
+	check(phase() == "confirmed", "the confirmed takeover is intact")
+
 	step("mDNS advertisement survives the reboot")
 	eventually("confirmed advertisement to be answering again", 40*time.Second, func() bool {
 		return strings.Contains(zc("info", "_smb._tcp.local.", "NAS Share._smb._tcp.local."), "port=445")
@@ -704,6 +737,69 @@ func headscalePhase() {
 	}
 }
 
+// standbyPhase runs two real ghostd processes under systemd: a leader serving DHCP
+// on lab0 and a warm standby mirroring it. The leader is stopped and the standby
+// promoted; the clients keep their addresses.
+func standbyPhase() {
+	const leader, standby = "100.64.0.1:7443", "100.64.0.2:7443"
+	waitReady()
+	step("standby: the leader serves DHCP on lab0 under its own confirmed configuration")
+	fw, err := apply("firewall", fmt.Sprintf(firewallDoc, 8080), 60)
+	must(err, "apply firewall")
+	must(confirm(fw), "confirm firewall")
+	dh, err := apply("dhcp-v1", target(true), 60)
+	must(err, "apply dhcp")
+	must(confirm(dh), "confirm dhcp")
+	addr1, addr2 := dhcp("client1"), dhcp("client2")
+	check(strings.HasPrefix(addr1, "10.77.0.") && strings.HasPrefix(addr2, "10.77.0.") && addr1 != addr2, "the leader leased %s and %s", addr1, addr2)
+	check(soa("udp") && soa("tcp"), "and answers authoritative DNS")
+
+	step("standby: a second daemon starts as a warm standby and mirrors the leader")
+	shOK("systemctl", "start", "ghostd-standby.service")
+	addr = standby
+	waitReady()
+	var st map[string]any
+	eventually("the standby to complete a sync", 40*time.Second, func() bool {
+		var e error
+		st, e = handover(`{"action":"standby-status"}`)
+		return e == nil && st["cursor"] != nil && st["cursor"].(float64) > 0 && st["seconds_since_sync"].(float64) >= 0 && st["seconds_since_sync"].(float64) < 10
+	})
+	mirrored := func(a string) bool { return bindingFor(a) != nil }
+	eventually("both leases to be mirrored", 30*time.Second, func() bool { return mirrored(addr1) && mirrored(addr2) })
+	check(mirrored(addr1) && mirrored(addr2), "the standby's ledger holds both leases (%s, %s)", addr1, addr2)
+	pid, _ := sh("systemctl", "show", "-p", "MainPID", "--value", "ghostd-standby.service")
+	sockets, _ := sh("ss", "-lunpH")
+	serving := false
+	for _, line := range strings.Split(sockets, "\n") {
+		if strings.Contains(line, "pid="+pid+",") && (strings.Contains(line, ":67 ") || strings.Contains(line, "10.77.0.1:53 ")) {
+			serving = true
+		}
+	}
+	check(!serving, "the standby holds no DHCP or LAN DNS socket while it mirrors")
+	_, err = rpc(func(ctx context.Context, c pb.HostStateClient) (*pb.RegistryResponse, error) {
+		return c.ImportLeases(ctx, &pb.RegistryDocument{Json: `[]`})
+	})
+	check(err != nil && strings.Contains(err.Error(), "warm standby"), "the standby refuses ledger writes (%v)", err)
+	_, err = handover(`{"action":"promote"}`)
+	check(err != nil && strings.Contains(err.Error(), "leader still answers"), "and refuses promotion while the leader answers (%v)", err)
+
+	step("standby: the leader is lost; the standby is promoted and continues from the mirror")
+	addr = leader
+	shOK("systemctl", "stop", "ghostd.service")
+	addr = standby
+	_, err = handover(`{"action":"promote"}`)
+	must(err, "promote")
+	st, _ = handover(`{"action":"standby-status"}`)
+	check(st["promoted"] == true, "the standby reports itself promoted")
+	check(soa("udp") && soa("tcp"), "it now answers authoritative DNS on the LAN address")
+	check(dhcp("client1") == addr1 && dhcp("client2") == addr2, "both clients renew the addresses the old leader gave them")
+	_, err = rpc(func(ctx context.Context, c pb.HostStateClient) (*pb.RegistryResponse, error) {
+		return c.ImportLeases(ctx, &pb.RegistryDocument{Json: `[]`})
+	})
+	check(err == nil, "and it accepts ledger writes again (%v)", err)
+	addr = leader
+}
+
 func main() {
 	_ = net.IPv4len
 	if len(os.Args) < 2 {
@@ -723,6 +819,8 @@ func main() {
 		minimalPhase()
 	case "headscale":
 		headscalePhase()
+	case "standby":
+		standbyPhase()
 	case "apply": // debugging aid: probe apply <domain> <seconds> <file>
 		raw, err := os.ReadFile(os.Args[4])
 		must(err, "read target")

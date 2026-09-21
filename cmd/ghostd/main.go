@@ -59,6 +59,7 @@ func main() {
 		"the interface name Apply's reachability guard always keeps open to this daemon's own port (nft.ReachabilityGuard)")
 	watchdogSec := flag.Int("watchdog-sec", 0, "systemd WatchdogSec= value, in seconds (0 disables watchdog pinging)")
 	overlayName := flag.String("overlay", "", "network provider to authenticate callers and bind listeners through ("+strings.Join(overlay.Names(), ", ")+" built in; default: the only one built in, else tailscale)")
+	flag.StringVar(&runtimeDirectory, "runtime-dir", "/run/ghostd", "where the daemon publishes runtime files (container resolver environment); one per daemon when several share a host")
 	overlaySocket := flag.String("overlay-socket", "", "override the provider's local client API socket")
 	deployerUsers := flag.String("deployer-user", "", "comma-separated logins that may deploy in addition to the tag and capability paths (for control planes without application capabilities, such as headscale)")
 	showFeatures := flag.Bool("features", false, "list the optional features compiled into this binary and exit")
@@ -183,6 +184,9 @@ func runRevert(store *state.Store, leaseID, domain string) error {
 	defer unlock()
 	return recoverDomain(store, domain, leaseID)
 }
+
+// runtimeDirectory is --runtime-dir.
+var runtimeDirectory = "/run/ghostd"
 
 // daemonOverlay is the overlay provider selection from the command line.
 type daemonOverlay struct{ name, socket, users string }

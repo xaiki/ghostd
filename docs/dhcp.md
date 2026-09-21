@@ -385,7 +385,8 @@ holding an address. Changing the set of listener addresses needs a restart.
 
 ## Verifying a takeover with real clients
 
-`begin` accepts `"require_evidence": true`. Confirmation then refuses until the
+`begin` accepts `"probes"`, active checks that must pass at confirmation, and
+`"require_evidence": true`. Confirmation then refuses until the
 ledger has seen, per enabled scope since the takeover began, a client **renewal of
 an inherited lease** (when the legacy pool held any) and a **fresh allocation** —
 counted from the DHCP path's own `renew` and `grant` events, which only a real
@@ -400,8 +401,28 @@ grpcurl ... -d '{"action":"status"}' 100.64.0.10:7443 ghostd.HostState/DHCPHando
 ```
 
 Finished takeovers are archived (without the lease snapshot) and listed by
-`{"action":"history"}`. The verification is evidence the ledger saw traffic, not
-proof of routing or DNS reachability from a given client: still test those.
+`{"action":"history"}`. Evidence proves the ledger saw traffic. **Probes** go further and do what a client
+does, from this host, over the real network path:
+
+```json
+"probes": [{"kind": "dhcp", "scope": "lan"},
+           {"kind": "dns", "scope": "lan", "name": "nas.home.arpa", "expect": "192.0.2.20"},
+           {"kind": "tcp", "addr": "192.0.2.1:443"}]
+```
+
+`dhcp` is a complete DORA on the scope's interface as a synthetic client, then a
+check that the lease's router and DNS options are the scope's and that the scope's
+DNS resolves the leased name and address back (UDP and TCP), then a Release. A host
+does not hear its own frames on the interface its listener is bound to, so on a
+bridge the probe client gets a veth end of its own; on a physical interface the
+probe fails and says to probe from another host. `dns` resolves a name through the
+scope's server over both transports; `tcp` connects from the host (a router, a
+service that must stay reachable). The `probe` action runs them without confirming,
+`status` lists those that have not passed, and confirmation refuses while any fails,
+leaving the takeover pending with its results. Probe clients carry a fixed MAC prefix
+and never count as real-client evidence. A probe from another host's vantage point
+(a client VLAN you are not on) is still yours to arrange: test that from a real
+client before a production cutover.
 
 ## Converting a dnsmasq configuration
 
@@ -418,7 +439,14 @@ and `enable-tftp`/`tftp-root`. It **refuses**, with the offending directive,
 everything it cannot preserve: tagged or interface-limited ranges, tagged options,
 options other than router and DNS server, infinite leases, unknown directives, a
 missing domain or lease file, two ranges for one interface and family, and a
-reservation outside every range. A plan is only printed if the same validator that
+reservation outside every range.
+
+Conversion also carries **tags** (`dhcp-range=set:guest,...` with
+`dhcp-option=tag:guest,...`), multi-value `dns-server` (scope `dns_servers`), generic
+options by name or number (`ntp-server`, `time-server`, `log-server`, `lpr-server`,
+`netbios-ns`, `mtu`; scope `options`), and interface-limited
+`enable-tftp=eth0,eth1` (tftp `interfaces`). Ranges that match on tags, interfaces or
+vendor classes, other options and unknown directives are still refused. A plan is only printed if the same validator that
 guards `begin` accepts it, so a plan that previews cleanly will also begin. The
 validator follows the same includes, so a legacy configuration split over files is
 no longer refused for that alone.
@@ -430,8 +458,10 @@ no longer refused for that alone.
  "tftp": {"root": "/srv/tftp"}}
 ```
 
-`boot` gives IPv4 clients siaddr, the file field and options 66/67, in offers and
-acks. `tftp` runs a **read-only** TFTP server on every enabled IPv4 scope's server
+`boot` gives IPv4 clients siaddr, the file field and options 66/67 in offers and
+acks — **only to clients that ask**, as dnsmasq does: a parameter request for option
+66 or 67, a `PXEClient` vendor class, or a plain BOOTP request (`"always": true`
+forces them on everyone). `tftp` runs a **read-only** TFTP server on every enabled IPv4 scope's server
 address: writes are refused, names cannot leave the root (lexically or through a
 symlink that resolves outside it), and only regular files up to 256 MiB are served.
 Open UDP 69 with the firewall zone service `tftp`, which also attaches the kernel
@@ -452,7 +482,11 @@ when exhausted, and T1/T2 and lifetimes as for addresses. A delegation is a ledg
 binding (origin `dhcpv6-pd`, address `2001:db8:100::/56`), so its history is
 queryable like a lease's, and it is attributed to the device that already holds the
 same DUID's address. It never appears in DNS or a dnsmasq lease file, and a
-takeover refuses a target that carries `pd`: add it with an ordinary apply after.
+takeover refuses a target that carries `pd` unless the request says `"allow_pd": true`:
+dnsmasq's lease file cannot hold delegations, so a rollback **ends** them (recorded in the
+journal as `abandoned_delegations`, with the ledger keeping the history). Without
+consent, add prefix delegation with an ordinary apply after the takeover. Scopes behind a
+relay may delegate too; the route's next hop is then the relay agent.
 
 With `"route": true` ghostd installs `ip -6 route ... via <router link-local> proto 250`
 for every live delegation (the link-local comes from the transport, or from the

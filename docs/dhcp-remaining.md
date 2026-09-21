@@ -49,37 +49,44 @@ ephemeral-port replies (fixed in the firewall renderer), and instance names with
 spaces arrive escaped (`\032`), which broke direct instance matching and conflict
 detection.
 
+## Since the last checkpoint
+
+| Was open | Now | Verified by |
+| --- | --- | --- |
+| Container advertisements not visible on the LAN | mDNS NAT: re-advertised at ghostd's address and a pooled port, DNAT into the container | unit; e2e |
+| Lookup scans | Indexes over live bindings (client, MAC, name, address); hot paths make no full scan and decode a bounded number of bindings against 20000 historical ones | unit |
+| Two-daemon standby | Leader and standby as two systemd services: mirror, refused writes, refused promotion, leader stopped, promotion, clients keep their addresses | e2e (`GHOSTD_E2E_MODE=standby`) |
+| Relayed prefix delegation | Scopes behind a relay delegate; route via the relay agent | dhcp-lab (Solicit/Advertise/Request/Reply through a relay, ledger and kernel route) |
+| PD in a takeover | `allow_pd`; rollback abandons delegations and records it | unit |
+| Reachability before confirmation | Active probes: real DORA (veth on a bridge) with router/DNS/name checks, DNS, TCP | unit; e2e (a takeover confirmed only after the probes pass) |
+| Wider dnsmasq conversion | Tags, multi-value DNS, generic options, interface-limited TFTP; boot fields only to clients that ask | unit; e2e |
+| Hard failures | SIGKILL at every step of a state save and of the two-file config update; the ledger SIGKILLed 15 times under load with bindings, indexes and event log verified after each; ghostd SIGKILLed five times under client load in the lab | unit; e2e |
+
 ## Still open
 
-- **Multi-master allocation and automatic failover.** Excluded by design, not
-  forgotten: two authorities that decide independently hand out the same address,
-  and a standby cannot tell a dead leader from a partition. What exists is a warm
-  standby with fenced, manual promotion. Not covered: a lab with two real daemons
-  (the standby is tested over real gRPC between two ledgers, not two systemd
-  services), and restarting a demoted leader as a follower is an operator step.
-- **Reflector and NAT limits.** Per container network by design (the network
-  carries the permission). The NAT maps IPv4 only, does not conflict-probe the
-  instance names it re-advertises on the LAN, and learns from what a container
-  announces (a container that never announces is never mapped). IPv6 reflection is
-  implemented but lab-tested on IPv4 only.
-- **DHCPv6 PD is not part of a dnsmasq takeover**, because dnsmasq's lease file
-  cannot carry it; delegations are added with an ordinary apply afterwards. Relayed
-  requests route via the relay's recorded peer-address, but that path is
-  unit-tested, not lab-tested.
-- **DNS ACL identity is a network-path property.** Enforcing that only one
-  container can reach its resolver address is host firewall work; ghostd cannot
-  verify it. Changing the set of listeners needs a restart.
-- **Client verification is evidence of traffic, not of reachability.** It proves the
-  ledger saw a renewal and a fresh grant, not that a client can route or resolve.
-- **General dnsmasq replacement remains a subset.** Tagged ranges/options,
-  interface-limited TFTP, and arbitrary options are refused, not translated.
-  dnsmasq only sends boot fields when the client asks for them; ghostd always does.
-- **Bound the remaining lookup scans.** Pool scans, `Report` and name-collision
-  checks still read all bindings; index them before retained history grows large.
-- **Kills inside the state store's own persistence step, and a hard power-off,** are
-  not simulated (the container reboot is orderly).
-- **Physical LAN broadcast delivery, client diversity and a real tailnet** are not
-  exercised: test on a VLAN before a production cutover.
+- **Multi-master allocation and automatic failover.** Excluded by design: two
+  authorities that decide independently hand out the same address, and a standby cannot
+  tell a dead leader from a partition. What exists is a warm standby with fenced, manual
+  promotion (lab-tested as two real daemons). Restarting a demoted leader as a follower
+  is an operator step.
+- **Probes see the network from the host.** A DORA probe needs a bridge (or another
+  host); nothing here can prove a client VLAN you are not on can route. Test that from a
+  real client.
+- **A real power cut.** Durability across power loss rests on fsync of each state file
+  and of every bolt transaction; it is verified by killing the process (SIGKILL), not by
+  cutting power or dropping the disk cache.
+- **NAT and reflector limits.** Per container network by design. The NAT maps IPv4
+  only, does not conflict-probe the names it re-advertises, and learns from what a
+  container announces. IPv6 reflection is implemented but lab-tested on IPv4 only.
+- **DNS ACL identity is a network-path property.** Enforcing that only one container
+  can reach its resolver address is host firewall work.
+- **General dnsmasq replacement remains a subset.** Ranges that match on tags,
+  interfaces or vendor classes, options beyond the named table, and unknown directives
+  are refused, not translated.
+- **The pool search** for a free address is a linear point-read walk over the pool
+  (at most 65536 entries), independent of history; a very full large pool pays for it.
+- **A physical LAN, client diversity and a real tailnet** are not exercised: test on a
+  VLAN before a production cutover.
 
 ## Running the validation
 
