@@ -214,6 +214,7 @@ const firewallDoc = `{"zones":{"trusted":{"interfaces":["tailscale0"]},"lan":{"i
 func target(enabled bool) string {
 	return fmt.Sprintf(`{"scopes":[{"id":"lan","interface":"lab0","subnet":"10.77.0.0/24","server":"10.77.0.1","router":"10.77.0.1","start":"10.77.0.10","end":"10.77.0.30","zone":"lab.home.arpa","lease_seconds":600,"enabled":%t}],"devices":[]}`, enabled)
 }
+
 // beginReq builds the handover request from the converter's own preview of the
 // legacy dnsmasq configuration, so the plan an operator would review is the plan
 // the lab takes over with.
