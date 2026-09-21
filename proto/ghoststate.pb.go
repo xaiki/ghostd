@@ -245,8 +245,12 @@ type State struct {
 	NetconfigJson        string `protobuf:"bytes,2,opt,name=netconfig_json,json=netconfigJson,proto3" json:"netconfig_json,omitempty"`
 	AdoptionEvidenceJson string `protobuf:"bytes,3,opt,name=adoption_evidence_json,json=adoptionEvidenceJson,proto3" json:"adoption_evidence_json,omitempty"`
 	DhcpConfigJson       string `protobuf:"bytes,4,opt,name=dhcp_config_json,json=dhcpConfigJson,proto3" json:"dhcp_config_json,omitempty"`
-	unknownFields        protoimpl.UnknownFields
-	sizeCache            protoimpl.SizeCache
+	// The mdns-v1 domain's current advertised set, empty when the mdns
+	// feature is not built in or nothing is configured. See
+	// internal/mdns.Config for the shape.
+	MdnsConfigJson string `protobuf:"bytes,5,opt,name=mdns_config_json,json=mdnsConfigJson,proto3" json:"mdns_config_json,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *State) Reset() {
@@ -303,6 +307,13 @@ func (x *State) GetAdoptionEvidenceJson() string {
 func (x *State) GetDhcpConfigJson() string {
 	if x != nil {
 		return x.DhcpConfigJson
+	}
+	return ""
+}
+
+func (x *State) GetMdnsConfigJson() string {
+	if x != nil {
+		return x.MdnsConfigJson
 	}
 	return ""
 }
@@ -525,12 +536,13 @@ const file_ghoststate_proto_rawDesc = "" +
 	"\x10RegistryResponse\x12\x12\n" +
 	"\x04json\x18\x01 \x01(\tR\x04json\"M\n" +
 	"\x0fGetStateRequest\x12:\n" +
-	"\x19include_adoption_evidence\x18\x01 \x01(\bR\x17includeAdoptionEvidence\"\xb8\x01\n" +
+	"\x19include_adoption_evidence\x18\x01 \x01(\bR\x17includeAdoptionEvidence\"\xe2\x01\n" +
 	"\x05State\x12(\n" +
 	"\x10nft_ruleset_json\x18\x01 \x01(\tR\x0enftRulesetJson\x12%\n" +
 	"\x0enetconfig_json\x18\x02 \x01(\tR\rnetconfigJson\x124\n" +
 	"\x16adoption_evidence_json\x18\x03 \x01(\tR\x14adoptionEvidenceJson\x12(\n" +
-	"\x10dhcp_config_json\x18\x04 \x01(\tR\x0edhcpConfigJson\"\x8b\x01\n" +
+	"\x10dhcp_config_json\x18\x04 \x01(\tR\x0edhcpConfigJson\x12(\n" +
+	"\x10mdns_config_json\x18\x05 \x01(\tR\x0emdnsConfigJson\"\x8b\x01\n" +
 	"\fApplyRequest\x12,\n" +
 	"\x12desired_state_json\x18\x01 \x01(\tR\x10desiredStateJson\x125\n" +
 	"\x17dead_man_switch_seconds\x18\x02 \x01(\x05R\x14deadManSwitchSeconds\x12\x16\n" +

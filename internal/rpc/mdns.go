@@ -27,6 +27,17 @@ func init() {
 		apply:     (*Server).applyMDNS,
 		restore:   (*Server).restoreMDNS,
 	})
+	registerStateExtender(func(s *Server, out *pb.State) error {
+		if s.MDNS == nil {
+			return nil
+		}
+		raw, err := json.Marshal(s.MDNS.Config())
+		if err != nil {
+			return err
+		}
+		out.MdnsConfigJson = string(raw)
+		return nil
+	})
 }
 
 // applyMDNS moves the advertised record set behind the ordinary lease: a bad
