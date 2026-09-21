@@ -1,8 +1,7 @@
 # DHCP, DNS, and device identity — proposed implementation
 
 Status: implementation in progress with isolated acceptance tests; see the
-[remaining code/features](../ops/ghostd-dhcp-implementation-remaining.md) and
-[remaining validation](../ops/ghostd-dhcp-validation-remaining.md). Scope: one authoritative DHCP server per
+[remaining DHCP/DNS work](dhcp-remaining.md). Scope: one authoritative DHCP server per
 network scope, integrated into ghostd. No active/active allocation or automatic
 failover in the first version. Example addresses below are illustrative only.
 
@@ -105,7 +104,7 @@ Per-container DNS ACL identity remains a separate prerequisite; lease names or
 source addresses behind a shared forwarder are not sufficient credentials.
 
 **This identity now has a second consumer, so design it for both at once.**
-`docs/arch/ghostd-lan-discovery.md` advertises and browses DNS-SD on behalf of
+`ghostd/docs/lan-discovery.md` advertises and browses DNS-SD on behalf of
 containers, and it must show each container only the service *classes* it is
 allowed to see (`_ipp._tcp`, `_googlecast._tcp`, `_adisk._tcp`, …). That allowlist
 has the same principal as this one — an authenticated per-container identity,
@@ -196,7 +195,7 @@ own ghostleases/ghostlocal plugins backed by the same registry. IPv4 and DHCPv6
 IA_NA, persistent identity, A/AAAA/PTR, declared relays, RA/SLAAC observation,
 authenticated reports, explicit identity repair, and transactional dnsmasq
 handover/rollback are implemented. Operator commands and supported legacy config
-subset are documented in [the operator guide](../ops/ghostd-dhcp.md).
+subset are documented in [the operator guide](dhcp.md).
 
 The Podman lab uses real dnsmasq, ISC clients and Linux namespaces. It checks
 lease preservation, DNS, restart recovery, rollback and relay admission. No

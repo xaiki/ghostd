@@ -2,7 +2,7 @@
 
 Ghostd embeds CoreDHCP for IPv4/IPv6 and CoreDNS for authoritative lease DNS and
 local-name resolution. Both use upstream plugin APIs; see the
-[plugin extension guide](../../ghostd/internal/resolver/PLUGINS.md).
+[plugin extension guide](../internal/resolver/PLUGINS.md).
 The durable bbolt ledger is shared by those plugins. It is never reverted with
 configuration and has no automatic history deletion.
 

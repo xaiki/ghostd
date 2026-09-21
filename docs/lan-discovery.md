@@ -90,7 +90,7 @@ share the DNS vocabulary rather than being a second permission language.
 grepping ghostd finds no ACL of any kind — no allow-list, no permit, no client
 filtering; the only "client" in the resolver is the `dns.Client` that talks to
 MagicDNS upstream. What exists is the intent, recorded twice in
-`docs/arch/dhcp-dns-identity-plan.md`:
+`ghostd/docs/dhcp-dns-identity.md`:
 
 > Per-container DNS ACL identity remains a separate prerequisite; lease names or
 > source addresses behind a shared forwarder are not sufficient credentials.
@@ -138,13 +138,13 @@ Shape surgery on ghostd (there is **no capability registry**; a new domain is a
 hand-written cross-language chain). The machinery — the domain wiring, the
 privilege situation, the library choice, the wire-versioning discipline and the
 reconciler shape — is specified in the daemon's own documentation,
-[`ghostd/README.md`'s LAN discovery section](../../ghostd/README.md), so it lives with
+[`ghostd/README.md`'s LAN discovery section](../README.md), so it lives with
 the code it describes and does not drift from a copy here.
 
 Two things about cost belong in *this* doc, because they are not ghostd-internal:
 
 - **The ACL identity first, and it is the largest piece.** It is a prerequisite
-  shared with the deferred DNS work (`docs/arch/dhcp-dns-identity-plan.md:104`,
+  shared with the deferred DNS work (`ghostd/docs/dhcp-dns-identity.md:104`,
   `:184`), where an authenticated per-container identity is explicitly separate
   work. So this plane's critical path runs through something another plan already
   owes — which is an argument for building the identity once, against both
@@ -168,7 +168,7 @@ Two things about cost belong in *this* doc, because they are not ghostd-internal
 
 ## Decisions this must respect
 
-- `docs/arch/dhcp-dns-identity-plan.md:90` — *"keep `.local` as mDNS discovery"*,
+- `ghostd/docs/dhcp-dns-identity.md:90` — *"keep `.local` as mDNS discovery"*,
   publishing A/AAAA and scoped PTR only for eligible bindings.
 - `docs/arch/access-links.md` — *"mDNS `.local` does not resolve over the tailnet"*,
   no relay. So this plane is **LAN-only**, which is exactly where Time Machine,
