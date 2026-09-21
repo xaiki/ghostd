@@ -53,6 +53,17 @@ type Scope struct {
 	Relay            *RelayConfig  `json:"relay,omitempty"`
 	RA               *RAConfig     `json:"ra,omitempty"`
 	Boot             *BootConfig   `json:"boot,omitempty"`
+	// PD delegates prefixes (IA_PD) from a pool to routers on this IPv6 link.
+	PD *PDConfig `json:"pd,omitempty"`
+}
+
+// PDConfig is a DHCPv6 prefix-delegation pool. Every delegated prefix has the
+// same Length; Route installs a kernel route to each one via the requesting
+// router's link-local address, and removes it when the delegation ends.
+type PDConfig struct {
+	Prefix string `json:"prefix"`
+	Length int    `json:"length"`
+	Route  bool   `json:"route,omitempty"`
 }
 type Reservation struct {
 	Client  string `json:"client"` // mac:aa:bb:... or id:<option-61 hex>
@@ -127,6 +138,7 @@ func (c Config) Validate() error {
 	if c.TFTP != nil && (!filepath.IsAbs(c.TFTP.Root) || filepath.Clean(c.TFTP.Root) != c.TFTP.Root || len(c.TFTP.Root) > 4096 || c.TFTP.Root == "/") {
 		return fmt.Errorf("tftp root must be an absolute, clean directory other than /")
 	}
+	pdPools := map[netip.Prefix]string{}
 	ids, selectors, zones := map[string]bool{}, map[string]bool{}, map[string]bool{}
 	var prefixes []netip.Prefix
 	for _, s := range c.Scopes {
@@ -190,6 +202,32 @@ func (c Config) Validate() error {
 			if s.Relay != nil || p.Bits() != 64 || s.RA.Interval < 4 || s.RA.Interval > 600 || s.RA.RouterLifetime < 0 || s.RA.RouterLifetime > 9000 || (s.RA.RouterLifetime > 0 && s.RA.RouterLifetime < s.RA.Interval*3) {
 				return fmt.Errorf("RA needs a direct /64, interval 4..600 and router_lifetime 0 or 3*interval..9000")
 			}
+		}
+		if s.PD != nil {
+			if !s.Is6() || s.Relay != nil {
+				return fmt.Errorf("scope %s: prefix delegation needs a direct IPv6 scope", s.ID)
+			}
+			pool, e := netip.ParsePrefix(s.PD.Prefix)
+			if e != nil || pool != pool.Masked() || !pool.Addr().Is6() || pool.Addr().Is4In6() {
+				return fmt.Errorf("scope %s: pd prefix must be a canonical IPv6 prefix", s.ID)
+			}
+			if s.PD.Length <= pool.Bits() || s.PD.Length > 64 || s.PD.Length-pool.Bits() > 16 || s.PD.Length < 32 {
+				return fmt.Errorf("scope %s: pd length must be 32..64, longer than the pool prefix, at most 16 bits deeper (65536 delegations)", s.ID)
+			}
+			if pool.Overlaps(p) {
+				return fmt.Errorf("scope %s: the pd pool overlaps the scope's own subnet", s.ID)
+			}
+			for _, other := range prefixes[:len(prefixes)-1] {
+				if pool.Overlaps(other) {
+					return fmt.Errorf("scope %s: the pd pool overlaps another scope", s.ID)
+				}
+			}
+			for prior, existing := range pdPools {
+				if pool.Overlaps(prior) {
+					return fmt.Errorf("scope %s: the pd pool overlaps scope %s's pool", s.ID, existing)
+				}
+			}
+			pdPools[pool] = s.ID
 		}
 		if s.Boot != nil {
 			if s.Is6() {
@@ -304,6 +342,10 @@ func cloneConfig(c Config) Config {
 		if c.Scopes[i].Boot != nil {
 			x := *c.Scopes[i].Boot
 			out.Scopes[i].Boot = &x
+		}
+		if c.Scopes[i].PD != nil {
+			x := *c.Scopes[i].PD
+			out.Scopes[i].PD = &x
 		}
 	}
 	return out

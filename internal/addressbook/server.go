@@ -28,6 +28,8 @@ type Manager struct {
 	dns     map[string]*dnsPair
 	ra      map[string]*raListener
 	tftp    map[string]*tftpServer
+	routes  RouteRunner
+	routeMu sync.Mutex
 	peers   func(context.Context) ([]Peer, error)
 }
 type dnsPair struct {
@@ -82,7 +84,7 @@ func (m *Manager) Apply(c Config, save func() error) error {
 		return e
 	}
 	for _, b := range snapshot.Bindings {
-		if b.State != "active" && b.State != "offered" && b.State != "declined" {
+		if (b.State != "active" && b.State != "offered" && b.State != "declined") || b.Origin == originPD {
 			continue
 		}
 		for _, s := range c.Scopes {

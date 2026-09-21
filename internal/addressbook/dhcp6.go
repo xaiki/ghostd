@@ -63,7 +63,7 @@ func (s *Store) currentClient(scope, client string) (Binding, bool, error) {
 			if e := json.Unmarshal(raw, &b); e != nil {
 				return e
 			}
-			if b.Scope == scope && b.Client == client && b.State == "active" && b.End > s.now().Unix() {
+			if b.Scope == scope && b.Client == client && b.Origin != originPD && b.State == "active" && b.End > s.now().Unix() {
 				found = b
 			}
 			return nil
@@ -75,6 +75,12 @@ func status6(code iana.StatusCode, message string) *dhcpv6.OptStatusCode {
 	return &dhcpv6.OptStatusCode{StatusCode: code, StatusMessage: message}
 }
 func (s *Store) Handle6(c Config, scope Scope, packet dhcpv6.DHCPv6) (dhcpv6.DHCPv6, error) {
+	return s.Handle6Via(c, scope, packet, nil)
+}
+
+// Handle6Via is Handle6 with the requester's link-local address, which a
+// delegation is routed to. It is nil for callers that cannot know it.
+func (s *Store) Handle6Via(c Config, scope Scope, packet dhcpv6.DHCPv6, via net.IP) (dhcpv6.DHCPv6, error) {
 	r, e := packet.GetInnerMessage()
 	if e != nil {
 		return nil, nil
@@ -213,9 +219,15 @@ func (s *Store) Handle6(c Config, scope Scope, packet dhcpv6.DHCPv6) (dhcpv6.DHC
 		out.T2 = time.Duration(scope.LeaseSeconds*4/5) * time.Second
 		out.Options.Add(&dhcpv6.OptIAAddress{IPv6Addr: net.ParseIP(b.Address), PreferredLifetime: time.Duration(scope.PreferredSeconds) * time.Second, ValidLifetime: time.Duration(scope.LeaseSeconds) * time.Second})
 	}
-	for _, pd := range r.Options.IAPD() {
-		out := &dhcpv6.OptIAPD{IaId: pd.IaId}
-		out.Options.Add(status6(iana.StatusNoPrefixAvail, "prefix delegation not configured"))
+	pds := r.Options.IAPD()
+	if len(pds) > 16 {
+		return nil, nil
+	}
+	for _, pd := range pds {
+		out, e := s.handlePD(scope, kind, cid, pd, via)
+		if e != nil {
+			return nil, e
+		}
 		reply.AddOption(out)
 	}
 	return reply, nil

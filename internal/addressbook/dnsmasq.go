@@ -83,8 +83,8 @@ func ExportDNSmasq(snapshot Snapshot) (string, error) {
 		if b.State != "active" && b.State != "offered" && b.State != "declined" {
 			continue
 		}
-		if b.Origin == "neighbor-report" {
-			continue
+		if b.Origin == "neighbor-report" || b.Origin == originPD {
+			continue // no legacy lease-file form: a delegation cannot be handed back to dnsmasq
 		}
 		expiry := b.End
 		if expiry == 253402300799 {

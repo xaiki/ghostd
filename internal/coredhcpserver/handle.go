@@ -17,6 +17,20 @@ import (
 	"github.com/insomniacslk/dhcp/dhcpv6"
 )
 
+var peers sync.Map // dhcpv6.DHCPv6 (as handed to plugin handlers) -> *net.UDPAddr
+
+// PeerOf returns the transport peer of a DHCPv6 message currently being
+// handled. Upstream plugin handlers are not given the peer, but a delegating
+// router needs it: the delegated prefix is routed via the requester's
+// link-local address.
+func PeerOf(m dhcpv6.DHCPv6) (*net.UDPAddr, bool) {
+	v, ok := peers.Load(m)
+	if !ok {
+		return nil, false
+	}
+	return v.(*net.UDPAddr), true
+}
+
 // HandleMsg6 runs for every received DHCPv6 packet. It will run every
 // registered handler in sequence, and reply with the resulting response.
 // It will not reply if the resulting response is `nil`.
@@ -35,6 +49,9 @@ func (l *listener6) HandleMsg6(buf []byte, oob *ipv6.ControlMessage, peer *net.U
 		}
 		defer release()
 	}
+
+	peers.Store(d, peer)
+	defer peers.Delete(d)
 
 	// decapsulate the relay message
 	msg, err := d.GetInnerMessage()

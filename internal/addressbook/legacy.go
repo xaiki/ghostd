@@ -327,6 +327,9 @@ func ValidateDNSmasqConfig(c Config, text, leasePath string) error {
 		return fmt.Errorf("target TFTP does not match the legacy enable-tftp/tftp-root")
 	}
 	for _, s := range c.Scopes {
+		if s.PD != nil {
+			return fmt.Errorf("scope %s: prefix delegation cannot be taken over from dnsmasq's lease file; add it with an ordinary apply afterwards", s.ID)
+		}
 		if s.Is6() || !s.Enabled {
 			continue
 		}

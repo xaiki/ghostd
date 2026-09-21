@@ -72,7 +72,7 @@ func (s *Store) Allocate(c Config, scopeID, client, mac, claimed, requested stri
 				if e := json.Unmarshal(raw, &b); e != nil {
 					return e
 				}
-				if b.Scope == scopeID && b.Client == client && b.End > now && (b.State == "active" || b.State == "offered") && allowed(scope, client, mac, b.Address) {
+				if b.Scope == scopeID && b.Client == client && b.Origin != originPD && b.End > now && (b.State == "active" || b.State == "offered") && allowed(scope, client, mac, b.Address) {
 					candidate = b.Address
 				}
 				return nil

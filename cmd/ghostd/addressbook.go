@@ -159,6 +159,9 @@ func startAddressbook(store *state.Store, observeOnly bool) (*addressbook.Manage
 					if err := manager.CollectNeighbors(ctx); err != nil {
 						log.Printf("ghostd neighbor observation: %v", err)
 					}
+					if err := manager.ReconcileRoutes(ctx); err != nil {
+						log.Printf("ghostd delegated-prefix routes: %v", err)
+					}
 					if err := manager.CollectPeers(ctx); err != nil {
 						log.Printf("ghostd peer inventory: %v", err)
 					}

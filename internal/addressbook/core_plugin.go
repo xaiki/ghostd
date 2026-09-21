@@ -1,6 +1,7 @@
 package addressbook
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net"
@@ -60,10 +61,22 @@ func init() {
 				}
 				link := relayLink(r)
 				if (s.Relay == nil && !r.IsRelay()) || (s.Relay != nil && link.Equal(net.ParseIP(s.Relay.Link))) {
-					reply, e := m.Store.Handle6(m.config, s, r)
+					var via net.IP
+					if peer, ok := core.PeerOf(r); ok {
+						via = clientLinkLocal(r, peer)
+					}
+					reply, e := m.Store.Handle6Via(m.config, s, r, via)
 					if e != nil {
 						log.Printf("ghostleases %s: %v", s.ID, e)
 						return nil, true
+					}
+					if reply != nil && s.PD != nil && s.PD.Route {
+						// Route the delegation now, not at the next periodic pass.
+						go func() {
+							if err := m.ReconcileRoutes(context.Background()); err != nil {
+								log.Printf("ghostleases %s: delegated routes: %v", s.ID, err)
+							}
+						}()
 					}
 					return reply, reply == nil
 				}
@@ -84,6 +97,30 @@ func loadInstance(args []string) (pluginInstance, error) {
 		return pluginInstance{}, fmt.Errorf("unknown ghostleases registry")
 	}
 	return v.(pluginInstance), nil
+}
+
+// clientLinkLocal is the address a delegation is routed to: the requester's own
+// link-local address, straight from the transport for a direct request, or the
+// peer-address a relay recorded for it.
+func clientLinkLocal(r dhcpv6.DHCPv6, peer *net.UDPAddr) net.IP {
+	for n := 0; r.IsRelay() && n < 32; n++ {
+		relay, ok := r.(*dhcpv6.RelayMessage)
+		if !ok {
+			return nil
+		}
+		inner := relay.Options.RelayMessage()
+		if inner == nil {
+			return nil
+		}
+		if !inner.IsRelay() {
+			return relay.PeerAddr
+		}
+		r = inner
+	}
+	if peer != nil && peer.IP.IsLinkLocalUnicast() {
+		return peer.IP
+	}
+	return nil
 }
 func relayLink(r dhcpv6.DHCPv6) net.IP {
 	for n := 0; r.IsRelay() && n < 32; n++ {

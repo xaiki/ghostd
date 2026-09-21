@@ -42,7 +42,14 @@ type Binding struct {
 	End          int64  `json:"end"`
 	NodeID       string `json:"tailnet_node_id,omitempty"`
 	Evidence     string `json:"evidence,omitempty"`
+	// Via is, for a delegated prefix, the requesting router's link-local
+	// address the prefix is routed to.
+	Via string `json:"via,omitempty"`
 }
+
+// originPD marks a delegated-prefix binding: its Address is a prefix, not a host.
+const originPD = "dhcpv6-pd"
+
 type Event struct {
 	Message string  `json:"message,omitempty"`
 	ID      uint64  `json:"id"`
@@ -171,7 +178,7 @@ func (s *Store) save(tx *bolt.Tx, b Binding, kind string) error {
 			return err
 		}
 	}
-	if b.State == "active" {
+	if b.State == "active" && b.Origin != originPD {
 		if err := tx.Bucket(dnsBucket).Put(dnsKey(b), bindingKey(b.Scope, b.Address)); err != nil {
 			return err
 		}

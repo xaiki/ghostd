@@ -369,6 +369,51 @@ func TestDNSmasqTakeoverLab(t *testing.T) {
 		t.Fatalf("SLAAC observation mistaken for grant: %+v %v", observed, e)
 	}
 
+	// Prefix delegation to a real router-style client (ISC dhclient -6 -P): the
+	// prefix is granted, attributed, routed via the client's link-local address,
+	// and the route disappears when the client releases it.
+	cfg.Scopes[1].PD = &PDConfig{Prefix: "fd78::/48", Length: 56, Route: true}
+	if e = manager.Apply(cfg, func() error { return nil }); e != nil {
+		t.Fatal(e)
+	}
+	pdLease, pdPid := filepath.Join(dir, "pd.leases"), filepath.Join(dir, "pd.pid")
+	out := command("ip", "netns", "exec", "client2", "dhclient", "-6", "-P", "-1", "-v", "-lf", pdLease, "-pf", pdPid, "client2p")
+	t.Log(out)
+	var delegated Binding
+	for _, b := range func() []Binding { snap, _ := store.Snapshot("lan6", "", 0); return snap.Bindings }() {
+		if b.Origin == originPD && b.State == "active" {
+			delegated = b
+		}
+	}
+	if delegated.Address == "" || !strings.HasSuffix(delegated.Address, "/56") || !strings.HasPrefix(delegated.Address, "fd78:") || !strings.HasPrefix(delegated.Via, "fe80:") {
+		t.Fatalf("no delegated prefix in the ledger: %+v\n%s", delegated, out)
+	}
+	routeVia := func() string {
+		return command("ip", "-6", "route", "show", "proto", routeProto)
+	}
+	for end := time.Now().Add(10 * time.Second); !strings.Contains(routeVia(), delegated.Address) && time.Now().Before(end); time.Sleep(200 * time.Millisecond) {
+	}
+	if got := routeVia(); !strings.Contains(got, delegated.Address) || !strings.Contains(got, "via "+delegated.Via) || !strings.Contains(got, "dev lab0") {
+		t.Fatalf("delegated prefix %s not routed via %s:\n%s", delegated.Address, delegated.Via, got)
+	}
+	t.Log(command("ip", "netns", "exec", "client2", "dhclient", "-6", "-P", "-r", "-v", "-lf", pdLease, "-pf", pdPid, "client2p"))
+	// dhclient does not wait for the server to process its Release.
+	for end := time.Now().Add(10 * time.Second); time.Now().Before(end); time.Sleep(200 * time.Millisecond) {
+		if after, _ := store.Snapshot("lan6", delegated.Address, 0); len(after.Bindings) == 1 && after.Bindings[0].State == "released" {
+			break
+		}
+	}
+	if e = manager.ReconcileRoutes(context.Background()); e != nil {
+		t.Fatal(e)
+	}
+	if got := routeVia(); strings.Contains(got, delegated.Address) {
+		t.Fatalf("route survived the release:\n%s", got)
+	}
+	cfg.Scopes[1].PD = nil
+	if e = manager.Apply(cfg, func() error { return nil }); e != nil {
+		t.Fatal(e)
+	}
+
 	// Real, timer-driven DHCPv6 Renew and Rebind. Shorten the lease so T1 is 30s
 	// and T2 is 48s, run ISC dhclient -6 in the foreground as a real client, let it
 	// renew by itself, then drop its Renews until it falls back to Rebind.
