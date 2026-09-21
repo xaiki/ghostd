@@ -9,6 +9,11 @@ set -eu
 cd "$(dirname "$0")/../.."
 arch=${GHOSTD_LAB_ARCH:-arm64}
 case "$arch" in arm64|amd64) ;; *) echo 'GHOSTD_LAB_ARCH must be arm64 or amd64' >&2; exit 2;; esac
+# What the lab's ghostd is stamped with, the way the deployment tooling stamps a
+# host's binary. The probe asserts --version reports this exact value, so a
+# stamped daemon names its own build; keep the two literals in step
+# (tests/e2e/probe/main.go's labBuildID).
+build_id=lab-e2e
 bin=$(mktemp -d "${TMPDIR:-/tmp}/ghostd-e2e.XXXXXX")
 name=ghostd-e2e-lab
 cleanup() {
@@ -19,7 +24,8 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 for cmd in ghostd:./cmd/ghostd fakets:./tests/e2e/fakets probe:./tests/e2e/probe; do
-	GOOS=linux GOARCH="$arch" CGO_ENABLED=0 go build -trimpath -tags "${GHOSTD_TAGS-tailscale dhcp dnsmasq mdns coredns}" -o "$bin/${cmd%%:*}" "${cmd#*:}"
+	# Only ghostd carries the stamped symbol; the linker ignores -X for the rest.
+	GOOS=linux GOARCH="$arch" CGO_ENABLED=0 go build -trimpath -ldflags "-X main.buildID=$build_id" -tags "${GHOSTD_TAGS-tailscale dhcp dnsmasq mdns coredns}" -o "$bin/${cmd%%:*}" "${cmd#*:}"
 done
 cp tests/e2e/fixtures.sh tests/e2e/zc.py tests/e2e/zcadv.py "$bin/"
 podman build -q -t localhost/ghostd-dhcp-lab -f tests/dhcp-lab/Containerfile tests/dhcp-lab >/dev/null

@@ -63,12 +63,17 @@ func main() {
 	overlaySocket := flag.String("overlay-socket", "", "override the provider's local client API socket")
 	deployerUsers := flag.String("deployer-user", "", "comma-separated logins that may deploy in addition to the tag and capability paths (for control planes without application capabilities, such as headscale)")
 	showFeatures := flag.Bool("features", false, "list the optional features compiled into this binary and exit")
+	showVersion := flag.Bool("version", false, "print the build this binary was stamped with and exit")
 	for _, f := range features {
 		if f.flags != nil {
 			f.flags()
 		}
 	}
 	flag.Parse()
+	if *showVersion {
+		fmt.Println(buildID)
+		return
+	}
 	if *showFeatures {
 		fmt.Println("core: firewall, netconfig")
 		if names := overlay.Names(); len(names) > 0 {
@@ -187,6 +192,14 @@ func runRevert(store *state.Store, leaseID, domain string) error {
 
 // runtimeDirectory is --runtime-dir.
 var runtimeDirectory = "/run/ghostd"
+
+// buildID is the daemon's own identity, stamped into the binary at build time by
+// whoever builds it for a host (`-ldflags "-X main.buildID=<version>"`) and
+// printed by --version. Deployment tooling's version is a digest of the source
+// tree plus the feature tags, so it names the artifact rather than describing it.
+// A binary nobody stamped says "dev" here instead of claiming a build it was not
+// made from.
+var buildID = "dev"
 
 // daemonOverlay is the overlay provider selection from the command line.
 type daemonOverlay struct{ name, socket, users string }

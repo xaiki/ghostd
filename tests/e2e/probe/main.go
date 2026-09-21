@@ -254,7 +254,22 @@ func beginReq(secs int, evidence bool) string {
 	return fmt.Sprintf(`{"action":"begin","seconds":%d,"require_evidence":%t%s,"target":%s,"legacy":%s}`, secs, evidence, probes, plan.Target, plan.Legacy)
 }
 
+// labBuildID is the stamp run.sh builds the lab's ghostd with, and what the
+// binary must report back: a stamped daemon names its own build, so a host can be
+// asked what it runs instead of trusting whatever sits beside the binary. Keep in
+// step with tests/e2e/run.sh's build_id.
+const labBuildID = "lab-e2e"
+
 func pre() {
+	step("the installed binary names the build it was stamped with")
+	// The last line, not the whole output: a coredns build logs its plugin
+	// registrations to stderr while initializing, and sh() reads both streams.
+	// The value itself is alone on stdout, which is what a caller reads.
+	reported, err := sh("/opt/ghostd/ghostd", "--version")
+	if i := strings.LastIndex(reported, "\n"); i >= 0 {
+		reported = reported[i+1:]
+	}
+	check(err == nil && reported == labBuildID, "--version reports %q, got %q (%v)", labBuildID, reported, err)
 	step("daemon boots under systemd with no policy and serves GetState")
 	waitReady()
 	st, err := rpc(func(ctx context.Context, c pb.HostStateClient) (*pb.State, error) {

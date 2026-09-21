@@ -51,14 +51,15 @@ go build -trimpath -tags "tailscale coredns mdns" -o bin/ghostd ./cmd/ghostd    
 go build -trimpath -tags "tailscale dhcp coredns" -o bin/ghostd ./cmd/ghostd          # + a DHCP/DNS authority
 go build -trimpath -tags "tailscale dhcp dnsmasq mdns coredns" -o bin/ghostd ./cmd/ghostd   # everything
 bin/ghostd --features                                                                 # what this binary contains
+bin/ghostd --version                                                                  # which build it is (stamped at build time)
 ```
 
 The **overlay** (the private network ghostd authenticates callers over and binds
 its listeners to) is a provider behind `internal/overlay`, chosen by tag at build
 time and by `--overlay` at run time; a binary needs at least one to serve, but
-`--render-firewall`, `--revert-lease` and `--features` work without. Headscale
-hosts run the same `tailscaled` client, so the two providers share one local-API
-client and differ only in what they trust it to say: **Headscale has no
+`--render-firewall`, `--revert-lease`, `--features` and `--version` work without.
+Headscale hosts run the same `tailscaled` client, so the two providers share one
+local-API client and differ only in what they trust it to say: **Headscale has no
 application-capability grants**, so the headscale provider ignores any capability
 the client reports and authorizes by node tag (`--deployer-tag`) or owner login
 (`--deployer-user`). See [docs/security.md](docs/security.md#choosing-an-overlay).

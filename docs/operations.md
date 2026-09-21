@@ -154,6 +154,7 @@ binary until every pending lease has been confirmed or recovered.
 | `--overlay-socket` | provider default | Override the provider's local client API socket |
 | `--deployer-user` | empty | Comma-separated logins that may deploy, in addition to the tag and capability paths |
 | `--features` | false | List the optional features compiled into this binary and exit |
+| `--version` | false | Print the build this binary was stamped with, alone on stdout, and exit (`dev` when nobody stamped it) |
 | `--report-to` (`dhcp`) | empty | Report this host's interfaces once to a DHCP authority, then exit |
 | `--convert-dnsmasq` (`dnsmasq`) | empty | Preview a dnsmasq config as a handover plan and exit; changes nothing |
 | `--legacy-unit` (`dnsmasq`) | `dnsmasq.service` | The unit `--convert-dnsmasq` records in the plan |
