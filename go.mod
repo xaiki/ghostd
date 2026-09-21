@@ -11,6 +11,7 @@ require (
 	github.com/insomniacslk/dhcp v0.0.0-20260901064844-234b97448fae
 	github.com/mdlayher/ndp v1.1.0
 	github.com/miekg/dns v1.1.72
+	github.com/pin/tftp/v3 v3.2.0
 	go.etcd.io/bbolt v1.4.3
 	golang.org/x/net v0.58.0
 	golang.org/x/sys v0.47.0
@@ -41,11 +42,13 @@ require (
 	github.com/grpc-ecosystem/grpc-opentracing v0.0.0-20180507213350-8e809c8a8645 // indirect
 	github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect
 	github.com/hdevalence/ed25519consensus v0.2.0 // indirect
+	github.com/josharian/native v1.1.0 // indirect
 	github.com/jpillora/backoff v1.0.0 // indirect
 	github.com/jsimonetti/rtnetlink v1.4.1 // indirect
 	github.com/mattn/go-colorable v0.1.15 // indirect
 	github.com/mattn/go-isatty v0.0.23 // indirect
 	github.com/mdlayher/netlink v1.7.3-0.20250113171957-fbb4dce95f42 // indirect
+	github.com/mdlayher/packet v1.1.2 // indirect
 	github.com/mdlayher/socket v0.6.0 // indirect
 	github.com/mdlayher/vsock v1.3.0 // indirect
 	github.com/mgutz/ansi v0.0.0-20200706080929-d51e80ef957d // indirect
@@ -56,7 +59,6 @@ require (
 	github.com/opentracing/opentracing-go v1.2.0 // indirect
 	github.com/pelletier/go-toml/v2 v2.2.4 // indirect
 	github.com/pierrec/lz4/v4 v4.1.26 // indirect
-	github.com/pin/tftp/v3 v3.2.0 // indirect
 	github.com/pires/go-proxyproto v0.15.0 // indirect
 	github.com/prometheus/client_golang v1.24.1 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect

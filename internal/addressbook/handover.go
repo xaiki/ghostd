@@ -3,6 +3,7 @@
 package addressbook
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -46,6 +47,9 @@ type HandoverJournal struct {
 	ImportedLeases map[string]int `json:"imported_leases,omitempty"`
 	// RequireEvidence makes Confirm demand observed client behaviour (below).
 	RequireEvidence bool `json:"require_evidence,omitempty"`
+	// Probes and their latest results.
+	Probes       []Probe       `json:"probes,omitempty"`
+	ProbeResults []ProbeResult `json:"probe_results,omitempty"`
 	// AbandonedDelegations counts prefix delegations a rollback had to end.
 	AbandonedDelegations int `json:"abandoned_delegations,omitempty"`
 }
@@ -66,7 +70,9 @@ type HandoverStatus struct {
 	Retryable        bool                     `json:"retryable"`
 	Evidence         map[string]ScopeEvidence `json:"evidence,omitempty"`
 	Missing          []string                 `json:"pending_verification,omitempty"`
-	HistoryCount     int                      `json:"history_count"`
+	// ProbesPending lists probes that have not passed yet.
+	ProbesPending []string `json:"probes_pending,omitempty"`
+	HistoryCount  int      `json:"history_count"`
 }
 
 type Handover struct {
@@ -75,6 +81,10 @@ type Handover struct {
 	SaveConfig func(Config) error
 	// RequireEvidence is recorded in the journal by Begin.
 	RequireEvidence bool
+	// Probes are active checks run, and required to pass, at confirmation.
+	Probes []Probe
+	// ProbeRunner runs one probe; nil means RunProbe. Tests substitute it.
+	ProbeRunner func(context.Context, Probe, Config) ProbeResult
 	// AllowPD lets the target carry prefix delegation. dnsmasq's lease file cannot
 	// hold delegations, so rolling back abandons them: the operator must accept
 	// that in advance.
@@ -145,7 +155,7 @@ func (s *Store) clientEvidence(j HandoverJournal) (map[string]ScopeEvidence, err
 		for _, ev := range events {
 			after = ev.ID
 			ce, ok := out[ev.Binding.Scope]
-			if !ok || !strings.HasPrefix(ev.Binding.Origin, "dhcp") {
+			if !ok || !strings.HasPrefix(ev.Binding.Origin, "dhcp") || isProbeMAC(ev.Binding.MAC) {
 				continue
 			}
 			switch ev.Kind {
@@ -200,6 +210,17 @@ func (h Handover) Status() (HandoverStatus, error) {
 		}
 		if j.Phase == "pending" {
 			st.Missing = missingEvidence(st.Evidence)
+			passed := map[string]bool{}
+			for _, r := range j.ProbeResults {
+				if r.OK {
+					passed[fmt.Sprintf("%+v", r.Probe)] = true
+				}
+			}
+			for _, p := range j.Probes {
+				if !passed[fmt.Sprintf("%+v", p)] {
+					st.ProbesPending = append(st.ProbesPending, p.Kind+" probe "+p.Scope+p.Addr+p.Name)
+				}
+			}
 		}
 	}
 	return st, nil
@@ -251,6 +272,11 @@ func (h Handover) Begin(target Config, spec LegacySpec, grace time.Duration) err
 			return fmt.Errorf("scope %s delegates prefixes, which dnsmasq's lease file cannot carry: a rollback would abandon them. Repeat the request with allow_pd to accept that, or add prefix delegation with an ordinary apply after the takeover", sc.ID)
 		}
 	}
+	for _, p := range h.Probes {
+		if err := p.validate(target); err != nil {
+			return err
+		}
+	}
 	previous := h.Manager.Config()
 	for _, s := range previous.Scopes {
 		if s.Enabled {
@@ -267,7 +293,7 @@ func (h Handover) Begin(target Config, spec LegacySpec, grace time.Duration) err
 	if e = h.Legacy.Validate(target); e != nil {
 		return e
 	}
-	j := HandoverJournal{Phase: "stopping", Started: time.Now().Unix(), RequireEvidence: h.RequireEvidence, Deadline: time.Now().Add(grace).Unix(), Target: target, Previous: previous, Legacy: spec, Revision: h.Manager.Store.Revision()}
+	j := HandoverJournal{Phase: "stopping", Started: time.Now().Unix(), RequireEvidence: h.RequireEvidence, Probes: h.Probes, Deadline: time.Now().Add(grace).Unix(), Target: target, Previous: previous, Legacy: spec, Revision: h.Manager.Store.Revision()}
 	if e = h.Manager.Store.saveHandover(j); e != nil {
 		return e
 	}
@@ -352,6 +378,22 @@ func (h Handover) Confirm() error {
 		}
 	}
 
+	if len(j.Probes) > 0 {
+		results := h.RunProbes(context.Background(), j)
+		j.ProbeResults = results
+		if e := h.Manager.Store.saveHandover(j); e != nil {
+			return e
+		}
+		var failed []string
+		for _, r := range results {
+			if !r.OK {
+				failed = append(failed, fmt.Sprintf("%s probe: %s", r.Probe.Kind, r.Detail))
+			}
+		}
+		if len(failed) > 0 {
+			return fmt.Errorf("active verification failed: %s", strings.Join(failed, "; "))
+		}
+	}
 	if time.Now().Unix() >= j.Deadline {
 		return fmt.Errorf("takeover expired during verification")
 	}
@@ -507,4 +549,35 @@ func (s *Store) abandonDelegations(target Config) (int, error) {
 		return nil
 	})
 	return count, err
+}
+
+// RunProbes runs every probe the takeover carries against the target the daemon
+// is serving now.
+func (h Handover) RunProbes(ctx context.Context, j HandoverJournal) []ProbeResult {
+	run := h.ProbeRunner
+	if run == nil {
+		run = RunProbe
+	}
+	var out []ProbeResult
+	for _, p := range j.Probes {
+		out = append(out, run(ctx, p, j.Target))
+	}
+	return out
+}
+
+// Probe runs the journaled probes now and records what they found, without
+// confirming.
+func (h Handover) Probe(ctx context.Context) ([]ProbeResult, error) {
+	j, e := h.Manager.Store.HandoverJournal()
+	if e != nil {
+		return nil, e
+	}
+	if j.Phase != "pending" {
+		return nil, fmt.Errorf("probes run during a pending takeover")
+	}
+	if len(j.Probes) == 0 {
+		return nil, fmt.Errorf("this takeover carries no probes")
+	}
+	j.ProbeResults = h.RunProbes(ctx, j)
+	return j.ProbeResults, h.Manager.Store.saveHandover(j)
 }

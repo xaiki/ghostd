@@ -3,8 +3,10 @@
 package addressbook
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -468,5 +470,89 @@ func TestTakeoverWithPrefixDelegationNeedsConsentAndRollbackAbandonsIt(t *testin
 	j, _ := s.HandoverJournal()
 	if j.AbandonedDelegations != 1 || j.Phase != "rolled-back" {
 		t.Fatal(j)
+	}
+}
+
+func TestConfirmRunsActiveProbesAndRefusesOnFailure(t *testing.T) {
+	s := openTest(t)
+	m := NewManager(s)
+	defer m.Close()
+	l := &memoryLegacy{running: true}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go func() {
+		for {
+			c, e := listener.Accept()
+			if e != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+	up := Probe{Kind: "tcp", Addr: listener.Addr().String()}
+	down := Probe{Kind: "tcp", Addr: "127.0.0.1:1"}
+	h := Handover{Manager: m, Legacy: l, SaveConfig: func(Config) error { return nil }, Probes: []Probe{up, down}}
+	if e := h.Begin(disabled(testConfig()), LegacySpec{}, time.Minute); e != nil {
+		t.Fatal(e)
+	}
+	st, _ := h.Status()
+	if len(st.ProbesPending) != 2 {
+		t.Fatal("nothing has run yet:", st.ProbesPending)
+	}
+	results, e := h.Probe(context.Background())
+	if e != nil || len(results) != 2 || !results[0].OK || results[1].OK {
+		t.Fatal(results, e)
+	}
+	if st, _ = h.Status(); len(st.ProbesPending) != 1 || !strings.Contains(st.ProbesPending[0], "127.0.0.1:1") {
+		t.Fatal("status must list only the probe that has not passed:", st.ProbesPending)
+	}
+	if e = h.Confirm(); e == nil || !strings.Contains(e.Error(), "active verification failed") {
+		t.Fatal("confirmed although a probe fails:", e)
+	}
+	if j, _ := s.HandoverJournal(); j.Phase != "pending" || len(j.ProbeResults) != 2 {
+		t.Fatal("a failed confirmation must leave the takeover pending with its results:", j.Phase, j.ProbeResults)
+	}
+	// The failing check is fixed (here: the journal's probe list is amended to the
+	// one that passes); confirmation now succeeds.
+	j, _ := s.HandoverJournal()
+	j.Probes = []Probe{up}
+	s.saveHandover(j)
+	if e = h.Confirm(); e != nil {
+		t.Fatal(e)
+	}
+}
+
+func TestProbeValidationAndSyntheticClientsNeverCountAsEvidence(t *testing.T) {
+	c := testConfig()
+	for name, p := range map[string]Probe{
+		"dhcp on an unknown scope": {Kind: "dhcp", Scope: "nope"},
+		"dhcp on a v6 scope":       {Kind: "dhcp", Scope: "v6"},
+		"dns without a name":       {Kind: "dns", Scope: "lan", Expect: "10.0.0.6"},
+		"dns bad expectation":      {Kind: "dns", Scope: "lan", Name: "a.home.arpa", Expect: "x"},
+		"tcp without a port":       {Kind: "tcp", Addr: "10.0.0.1"},
+		"unknown kind":             {Kind: "ping"},
+	} {
+		if err := p.validate(c); err == nil {
+			t.Errorf("%s accepted", name)
+		}
+	}
+	if err := (Probe{Kind: "dhcp", Scope: "lan"}).validate(c); err != nil {
+		t.Fatal(err)
+	}
+	if !isProbeMAC("02:67:68:6f:73:aa") || isProbeMAC("02:00:00:00:00:01") {
+		t.Fatal("probe MAC recognition")
+	}
+	// A probe client's grant does not satisfy the fresh-grant requirement.
+	s := openTest(t)
+	j := HandoverJournal{Phase: "pending", Deadline: time.Now().Add(time.Minute).Unix(), Target: c, Revision: s.Revision(), RequireEvidence: true}
+	if _, e := s.Allocate(c, "lan", "mac:02:67:68:6f:73:01", "02:67:68:6f:73:01", "ghostd-probe", "10.0.0.6", true); e != nil {
+		t.Fatal(e)
+	}
+	ev, _ := s.clientEvidence(j)
+	if ev["lan"].Grants != 0 {
+		t.Fatal("a synthetic probe client counted as real-client evidence:", ev)
 	}
 }

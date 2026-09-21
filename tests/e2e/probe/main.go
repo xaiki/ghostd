@@ -242,7 +242,14 @@ func beginReq(secs int, evidence bool) string {
 		Legacy json.RawMessage `json:"legacy"`
 	}
 	must(json.Unmarshal([]byte(out), &plan), "plan json")
-	return fmt.Sprintf(`{"action":"begin","seconds":%d,"require_evidence":%t,"target":%s,"legacy":%s}`, secs, evidence, plan.Target, plan.Legacy)
+	probes := ""
+	if evidence {
+		// Active verification: a real DORA on the LAN as a synthetic client (router,
+		// DNS and the leased name checked, then released), and a TCP connection to
+		// the authority's own DNS port.
+		probes = `,"probes":[{"kind":"dhcp","scope":"lab0"},{"kind":"tcp","addr":"10.77.0.1:53"}]`
+	}
+	return fmt.Sprintf(`{"action":"begin","seconds":%d,"require_evidence":%t%s,"target":%s,"legacy":%s}`, secs, evidence, probes, plan.Target, plan.Legacy)
 }
 
 func pre() {
@@ -342,6 +349,17 @@ func pre() {
 		_, err = tftpGet("client1", bad)
 		check(err != nil, "%s is refused", bad)
 	}
+
+	step("takeover: active probes prove the wire path before confirmation")
+	pr, err := rpc(func(ctx context.Context, c pb.HostStateClient) (*pb.RegistryResponse, error) {
+		return c.DHCPHandover(ctx, &pb.RegistryDocument{Json: `{"action":"probe"}`})
+	})
+	must(err, "probe action")
+	results := []byte(pr.GetJson())
+	check(!strings.Contains(string(results), `"ok":false`) && strings.Count(string(results), `"ok":true`) == 2, "the DORA and TCP probes both pass: %s", results)
+	check(strings.Contains(string(results), "resolves both ways"), "the leased name resolved through the authority's DNS both ways")
+	hs, _ = handover(`{"action":"status"}`)
+	check(hs["probes_pending"] == nil, "status has no probe outstanding")
 
 	step("takeover: confirm once real clients have renewed and been allocated")
 	hs, _ = handover(`{"action":"status"}`)

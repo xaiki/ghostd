@@ -30,6 +30,8 @@ func (s *Server) handoverAction(ctx context.Context, req *pb.RegistryDocument) (
 		// RequireEvidence makes confirmation wait for observed client
 		// renewal and fresh allocation in every enabled scope.
 		RequireEvidence bool `json:"require_evidence"`
+		// Probes are active checks confirmation requires to pass.
+		Probes []addressbook.Probe `json:"probes"`
 		// AllowPD accepts that a rollback abandons prefix delegations.
 		AllowPD bool `json:"allow_pd"`
 	}
@@ -67,7 +69,7 @@ func (s *Server) handoverAction(ctx context.Context, req *pb.RegistryDocument) (
 			return e
 		}
 		return s.store.SaveExternallyManagedConfig(domainDHCP, addressbook.ConfigFile, raw)
-	}, RequireEvidence: request.RequireEvidence, AllowPD: request.AllowPD}
+	}, RequireEvidence: request.RequireEvidence, AllowPD: request.AllowPD, Probes: request.Probes}
 	switch request.Action {
 	case "status":
 		st, e := handover.Status()
@@ -75,6 +77,12 @@ func (s *Server) handoverAction(ctx context.Context, req *pb.RegistryDocument) (
 			return nil, e
 		}
 		return document(st)
+	case "probe":
+		results, e := handover.Probe(ctx)
+		if e != nil {
+			return nil, status.Error(codes.FailedPrecondition, e.Error())
+		}
+		return document(results)
 	case "history":
 		history, e := s.DHCP.Store.HandoverHistory()
 		if e != nil {
