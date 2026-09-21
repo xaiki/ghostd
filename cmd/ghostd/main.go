@@ -25,9 +25,11 @@ import (
 
 	"google.golang.org/grpc"
 
+	"smarthome/ghostd/internal/addressbook"
 	"smarthome/ghostd/internal/auth"
 	"smarthome/ghostd/internal/netconfig"
 	"smarthome/ghostd/internal/nft"
+	"smarthome/ghostd/internal/resolver"
 	"smarthome/ghostd/internal/rpc"
 	"smarthome/ghostd/internal/sdnotify"
 	"smarthome/ghostd/internal/state"
@@ -45,6 +47,9 @@ const (
 )
 
 func main() {
+	// CoreDNS metrics transitively registers CLI flags in this release. Keep
+	// the daemon's command line separate; never invoke CoreDNS's main loop.
+	flag.CommandLine = flag.NewFlagSet("ghostd", flag.ExitOnError)
 	observeOnly := flag.Bool("observe-only", false, "observe live configuration; reject writes and skip boot restore (fresh hosts only)")
 	renderFirewall := flag.Bool("render-firewall", false, "render desired firewall JSON from stdin without touching the host")
 	revertLease := flag.String("revert-lease", "", "restore the pre-apply snapshot and exit (the dead-man's-switch's own command; not for interactive use)")
@@ -55,7 +60,18 @@ func main() {
 	tailscaleIface := flag.String("tailscale-interface", defaultTailscaleIface,
 		"the interface name Apply's reachability guard always keeps open to this daemon's own port (nft.ReachabilityGuard)")
 	watchdogSec := flag.Int("watchdog-sec", 0, "systemd WatchdogSec= value, in seconds (0 disables watchdog pinging)")
+	reportTo := flag.String("report-to", "", "report this host interfaces once to a tailnet DHCP authority and exit")
 	flag.Parse()
+	if *reportTo != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		reply, err := reportHost(ctx, *reportTo)
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println(reply)
+		return
+	}
 	if *observeOnly && *revertLease != "" {
 		log.Fatal("--observe-only cannot be combined with --revert-lease")
 	}
@@ -106,6 +122,8 @@ func recoverDomain(store *state.Store, domain, leaseID string) error {
 	key := rpc.NftRuleset
 	if domain == "netconfig" {
 		key = rpc.NetconfigState
+	} else if domain == "dhcp-v1" {
+		key = addressbook.ConfigFile
 	} else if domain != "firewall" {
 		return fmt.Errorf("unknown domain %q", domain)
 	}
@@ -117,6 +135,8 @@ func recoverDomain(store *state.Store, domain, leaseID string) error {
 	if d.Pending != nil && (leaseID == "" || d.Pending.ID == leaseID) {
 		if domain == "firewall" {
 			err = nft.Restore(ctx, nft.ExecRunner{}, d.Pending.Snapshot)
+		} else if domain == "dhcp-v1" {
+			err = restoreDHCPConfig(store, d.Pending.Snapshot)
 		} else {
 			err = netconfig.Rollback(ctx, netconfig.ExecRunner{}, d.Pending.Snapshot)
 		}
@@ -131,6 +151,9 @@ func recoverDomain(store *state.Store, domain, leaseID string) error {
 	}
 	if domain == "firewall" {
 		return nft.Restore(ctx, nft.ExecRunner{}, d.Confirmed)
+	}
+	if domain == "dhcp-v1" {
+		return restoreDHCPConfig(store, d.Confirmed)
 	}
 	return netconfig.Restore(ctx, netconfig.ExecRunner{}, d.Confirmed)
 }
@@ -149,13 +172,17 @@ func runDaemon(store *state.Store, port int, deployerTag string, tailscaleIface 
 }
 
 func runDaemonMode(store *state.Store, port int, deployerTag string, tailscaleIface string, watchdogSec int, observeOnly bool) error {
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if authority := os.Getenv("GHOSTD_IDENTITY_AUTHORITY"); authority != "" && !observeOnly {
+		go runReports(ctx, authority)
+	}
 
 	unlock, err := store.Lock()
 	if err != nil {
 		return err
 	}
-	for _, domain := range []string{"firewall", "netconfig"} {
+	for _, domain := range []string{"firewall", "netconfig", "dhcp-v1"} {
 		if err := prepareDomain(store, domain, observeOnly); err != nil {
 			unlock()
 			return fmt.Errorf("boot restore %s: %w", domain, err)
@@ -163,16 +190,51 @@ func runDaemonMode(store *state.Store, port int, deployerTag string, tailscaleIf
 	}
 	unlock()
 
-	tsLocal := &tsclient.Client{}
-	listenAddr, err := tailnetListenAddress(ctx, tsLocal, port)
+	manager, stopRegistry, err := startAddressbook(store, observeOnly)
 	if err != nil {
-		return fmt.Errorf("resolve tailnet listen address: %w", err)
+		return fmt.Errorf("start address registry: %w", err)
+	}
+	defer stopRegistry()
+	tsLocal := &tsclient.Client{}
+	// DHCP and authoritative LAN DNS stay available even if tailscaled is
+	// unavailable at boot. RPC/container DNS begin once its address is known.
+	if watchdogSec > 0 {
+		go petWatchdog(time.Duration(watchdogSec) * time.Second / watchdogFraction)
+	}
+	if err := sdnotify.Ready(); err != nil {
+		log.Printf("ghostd: sd_notify READY: %v", err)
+	}
+	var listenAddr string
+	for {
+		attempt, cancel := context.WithTimeout(ctx, 5*time.Second)
+		listenAddr, err = tailnetListenAddress(attempt, tsLocal, port)
+		cancel()
+		if err == nil {
+			break
+		}
+		log.Printf("ghostd: waiting for tailnet control transport; local DHCP/DNS remains available: %v", err)
+		select {
+		case e := <-manager.Errors:
+			return fmt.Errorf("DHCP/DNS listener failed: %w", e)
+		case <-time.After(5 * time.Second):
+		}
 	}
 	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", listenAddr, err)
 	}
 	log.Printf("ghostd: listening on %s (tailnet-only)", listenAddr)
+	defer listener.Close()
+	dnsAddress, _, err := net.SplitHostPort(listenAddr)
+	if err != nil {
+		return err
+	}
+	stopDNS, err := resolver.Start(dnsAddress, resolver.RuntimeDir)
+	if err != nil {
+		return fmt.Errorf("start container DNS: %w", err)
+	}
+	defer stopDNS()
+	log.Printf("ghostd: container DNS listening on %s:53 (tailnet-only)", dnsAddress)
 
 	exePath, err := os.Executable()
 	if err != nil {
@@ -184,17 +246,19 @@ func runDaemonMode(store *state.Store, port int, deployerTag string, tailscaleIf
 	server := rpc.NewServer(authenticator, store, leases, nft.ExecRunner{}, netconfig.ExecRunner{}, guard)
 
 	server.ObserveOnly = observeOnly
+	server.DHCP = manager
 	grpcServer := grpc.NewServer()
 	pb.RegisterHostStateServer(grpcServer, server)
 
-	if watchdogSec > 0 {
-		go petWatchdog(time.Duration(watchdogSec) * time.Second / watchdogFraction)
+	serving := make(chan error, 1)
+	go func() { serving <- grpcServer.Serve(listener) }()
+	defer grpcServer.Stop()
+	select {
+	case err := <-serving:
+		return err
+	case err := <-manager.Errors:
+		return fmt.Errorf("DHCP/DNS listener failed: %w", err)
 	}
-	if err := sdnotify.Ready(); err != nil {
-		log.Printf("ghostd: sd_notify READY failed (non-fatal): %v", err)
-	}
-
-	return grpcServer.Serve(listener)
 }
 
 func petWatchdog(interval time.Duration) {
@@ -233,6 +297,8 @@ func prepareDomain(store *state.Store, domain string, observeOnly bool) error {
 	key := rpc.NftRuleset
 	if domain == "netconfig" {
 		key = rpc.NetconfigState
+	} else if domain == "dhcp-v1" {
+		key = addressbook.ConfigFile
 	}
 	d, err := store.Domain(domain, key)
 	if err != nil {

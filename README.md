@@ -141,6 +141,15 @@ removing an opening does not immediately terminate established connections.
 - Optional `ingress: {"interfaces": ["eth0"], "http_port": 18080}` redirects
   host-destined TCP 80 to that port and TCP 443 to **8443**, and admits those
   destination ports. Forwarded traffic to other hosts is not redirected.
+- A zone can declare `redirects: [{"port": 514, "to_port": 15514, "proto": "udp"}]`.
+  This redirects incoming host-destined traffic on that zone's interfaces and
+  admits only the translated flow to the backend port. It does not open the
+  backend directly (trusted/ACCEPT zones retain their existing broad access).
+  TCP and UDP, IPv4 and IPv6 are supported; locally originated traffic is not
+  redirected. Removing the declaration removes the redirect on the next apply.
+  This lets rootless Wazuh publish `15514:514/udp` without lowering
+  `net.ipv4.ip_unprivileged_port_start`. Update ghostd before applying policies
+  with this field; older daemons reject unknown fields without applying them.
 - Legacy `services` names are `mdns`, `dns`, `dhcp`, `dhcpv6-client`, `http`, and
   `https`. `nfs: {"exports": ["10.0.0.0/24"]}` permits TCP 111, 2049, and 20048
   from those IPv4 CIDRs. For other services, supply explicit `ports`.
@@ -332,3 +341,84 @@ protoc -I proto --go_out=proto --go_opt=paths=source_relative \
 ghostd is licensed under **GNU GPL version 2 only** (`GPL-2.0-only`), without
 warranty. See [LICENSE](LICENSE). Third-party dependencies retain their respective
 licenses; this notice covers ghostd's own source.
+
+### Redirect-only adoption
+
+`redirect_only: true` with interface-scoped zones and `redirects` manages only
+NAT in the owned table, preserving existing host filtering. Filtering fields in
+this mode are rejected; it cannot replace an existing ghostd filter table.
+The client uses `firewall-redirect-v1` so older daemons reject the request rather
+than silently installing a full filtering policy. Leases, rollback and fresh
+connection confirmation use the existing firewall transaction domain.
+
+### Container DNS
+
+The daemon embeds CoreDNS (bind, cache, forward, and a small `ghostlocal`
+plugin) on TCP/UDP port 53 of its own tailnet address. It never binds a public
+wildcard or rewrites the host's resolver. `.local` A/AAAA queries use the host's
+NSS resolver through bounded `getent` calls, preserving Avahi support even in
+our static, cgo-free binary. Other queries go to Tailscale's Quad100 resolver;
+answers are cached for at most 30 seconds. A failed host lookup returns SERVFAIL,
+not a fabricated address; missing names return NXDOMAIN.
+
+After binding successfully, ghostd atomically publishes
+`/run/smarthome-ghostd/dns.env` and `resolv.conf`. Systemd owns this runtime
+directory. Generated bridged Quadlets on ghostd-enabled hosts read `dns.env`
+into the service environment and pass its address as Podman's upstream DNS.
+Aardvark continues answering container aliases. The resolver file is available
+for clients without Podman discovery; mounting it over a Podman container's
+resolver would bypass that discovery and is not the default.
+
+Apply ghostd before restarting generated containers; move also prepares it on
+the destination and dependent hosts. Existing containers pick up DNS changes
+when recreated. DNS bind conflicts fail daemon startup with an explicit error.
+The firewall permits DNS input from standard Podman bridge interfaces; custom
+bridge interface names need their corresponding DNS permission in the declared
+firewall zone.
+
+Per-container DNS ACLs are not enforced by this first resolver integration.
+Aardvark/NAT can hide the original container identity, so policy must not infer
+identity from the forwarded source address. An authenticated or isolated
+per-container query path is needed before allowlists can provide isolation.
+Any policy check must run before the shared cache, and network access still
+requires firewall enforcement independently of DNS visibility.
+
+
+### DHCP and device identity
+
+The optional `dhcp-v1` domain serves explicitly declared IPv4/IPv6
+scopes with authoritative DNS and a durable lease/event ledger. Configuration
+rollback never rewinds leases. `GetRegistry`, `ImportLeases` and `ReportHost`
+provide attribution and controlled adoption; reporters use their authenticated
+Tailscale stable node identity and a separate report capability. See
+[configuration, handover and verification](docs/dhcp.md).
+DHCPv6 IA_NA, RA, relay admission and transactional dnsmasq takeover/rollback
+are included. Prefix delegation and multi-authority HA are separate increments.
+
+### LAN discovery
+
+Planned, not implemented. The domain advertises and browses DNS-SD on behalf of
+containers, which sit on a Podman bridge that mDNS multicast does not cross — so a
+containerized app can neither advertise itself nor see a LAN service, and we will
+not install Avahi to close that instead. Reasoning, consumers, the airgap with host
+Avahi and the open questions live in [docs/lan-discovery.md](docs/lan-discovery.md).
+
+Wiring follows the newest domain (`dhcp-v1`) rather than inventing a shape:
+`rpc/server.go` (domain constant, `Apply` case, `legacyName`, the `Confirm` loop,
+`GetState`, the server field), `state/transaction.go`'s domain allowlist,
+`cmd/ghostd/main.go` (`prepareDomain`/`recoverDomain`/`--revert-domain`),
+`proto/ghoststate.proto` with regenerated Go, and `state/lease.go`. The reconciler
+imitates `addressbook.Manager.Apply` — desired set in, live listeners out, close
+what is no longer wanted — and rollback rides the existing lease/revert timer.
+Wire structs parse with `DisallowUnknownFields`, so the daemon must be upgraded
+before a new field arrives; use a versioned domain so an older daemon rejects the
+request instead of mis-rendering it. DNS-SD is plain DNS and `miekg/dns` is already
+a dependency; the binary is cgo-free, so there is no `libavahi` binding to reach
+for.
+
+Two obligations this domain owns before it is worth anything, both argued in the
+design doc rather than restated here: **resolution must be answered here before any
+host Avahi is retired** (context `.local` lookups currently end in `getent`), and a
+per-container class allowlist needs an identity, because a reflected multicast
+stream carries none and a packet cannot be filtered per container on a shared
+bridge.

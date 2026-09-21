@@ -15,6 +15,7 @@ import (
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 
+	"smarthome/ghostd/internal/addressbook"
 	"smarthome/ghostd/internal/auth"
 	"smarthome/ghostd/internal/netconfig"
 	"smarthome/ghostd/internal/nft"
@@ -39,6 +40,7 @@ const (
 type Server struct {
 	// ObserveOnly rejects every mutation RPC, independently of authorization.
 	ObserveOnly bool
+	DHCP        *addressbook.Manager
 	pb.UnimplementedHostStateServer
 
 	authenticator   *auth.Authenticator
@@ -87,6 +89,13 @@ func (s *Server) GetState(ctx context.Context, req *pb.GetStateRequest) (*pb.Sta
 		return nil, status.Errorf(codes.Internal, "%v", err)
 	}
 	response := &pb.State{NftRulesetJson: ruleset, NetconfigJson: netconfigJSON}
+	if s.DHCP != nil {
+		raw, err := json.Marshal(s.DHCP.Config())
+		if err != nil {
+			return nil, err
+		}
+		response.DhcpConfigJson = string(raw)
+	}
 	if req.GetIncludeAdoptionEvidence() {
 		evidence := observation.Capture(ctx, s.netconfigRunner)
 		raw, err := json.Marshal(evidence)
@@ -130,18 +139,20 @@ func (s *Server) Apply(ctx context.Context, req *pb.ApplyRequest) (*pb.ApplyResp
 	}
 	defer unlock()
 	switch req.GetDomain() {
-	case "firewall-output-v1":
+	case "firewall-output-v1", "firewall-redirect-v1":
 		// Normalize only after accepting the versioned request. Leases and rollback
 		// remain in the existing firewall domain and include the entire table.
 		normalized := &pb.ApplyRequest{Domain: domainFirewall, DesiredStateJson: req.GetDesiredStateJson(), DeadManSwitchSeconds: req.GetDeadManSwitchSeconds()}
 		return s.applyFirewall(ctx, normalized)
 	case domainFirewall:
 		return s.applyFirewall(ctx, req)
+	case domainDHCP:
+		return s.applyDHCP(ctx, req)
 	case domainNetconfig:
 		return s.applyNetconfig(ctx, req)
 	default:
 		return nil, status.Errorf(codes.InvalidArgument,
-			"rpc: domain must be %q or %q, got %q", domainFirewall, domainNetconfig, req.GetDomain())
+			"rpc: domain must be %q, %q or %q, got %q", domainFirewall, domainNetconfig, domainDHCP, req.GetDomain())
 	}
 }
 
@@ -164,6 +175,11 @@ func (s *Server) applyFirewall(ctx context.Context, req *pb.ApplyRequest) (*pb.A
 	raw, err := nft.ReadRulesetJSON(ctx, s.nftRunner)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "snapshot: %v", err)
+	}
+	if desired.RedirectOnly {
+		if err := nft.ValidateRedirectCoexistence([]byte(raw)); err != nil {
+			return nil, status.Errorf(codes.FailedPrecondition, "rpc: %v", err)
+		}
 	}
 	snapshot, err := nft.OwnedRuleset([]byte(raw))
 	if err != nil {
@@ -229,6 +245,9 @@ func (s *Server) finishApply(ctx context.Context, domain, id string) (*pb.ApplyR
 }
 
 func legacyName(domain string) string {
+	if domain == domainDHCP {
+		return addressbook.ConfigFile
+	}
 	if domain == domainFirewall {
 		return NftRuleset
 	}
@@ -257,6 +276,8 @@ func (s *Server) recoverExpired(ctx context.Context, domain string) error {
 	}
 	if domain == domainFirewall {
 		err = nft.Restore(ctx, s.nftRunner, d.Pending.Snapshot)
+	} else if domain == domainDHCP {
+		err = s.restoreDHCP(d.Pending.Snapshot)
 	} else {
 		err = netconfig.Rollback(ctx, s.netconfigRunner, d.Pending.Snapshot)
 	}
@@ -317,7 +338,7 @@ func (s *Server) Confirm(ctx context.Context, req *pb.ConfirmRequest) (*pb.Confi
 		return nil, status.Errorf(codes.Internal, "%v", err)
 	}
 	defer unlock()
-	for _, domain := range []string{domainFirewall, domainNetconfig} {
+	for _, domain := range []string{domainFirewall, domainNetconfig, domainDHCP} {
 		d, err := s.store.Domain(domain, legacyName(domain))
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "%v", err)

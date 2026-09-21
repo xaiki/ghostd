@@ -42,7 +42,7 @@ func (s *Store) Lock() (func(), error) {
 }
 
 func domainFile(domain string) (string, error) {
-	if domain != "firewall" && domain != "netconfig" {
+	if domain != "firewall" && domain != "netconfig" && domain != "dhcp-v1" {
 		return "", fmt.Errorf("unknown domain %q", domain)
 	}
 	return domain + "-transaction.json", nil
@@ -76,4 +76,22 @@ func (s *Store) SaveDomain(domain string, d DomainState) error {
 		return err
 	}
 	return s.Save(name, data)
+}
+
+// SaveExternallyManagedConfig updates both boot restore state and the live
+// config file when another durable transaction (DHCP handover) owns recovery.
+// It must not race an ordinary Apply/Confirm lease; caller holds the store lock.
+func (s *Store) SaveExternallyManagedConfig(domain, legacyName string, raw []byte) error {
+	d, err := s.Domain(domain, legacyName)
+	if err != nil {
+		return err
+	}
+	if d.Pending != nil {
+		return fmt.Errorf("finish pending %s configuration lease first", domain)
+	}
+	d.Confirmed = raw
+	if err = s.SaveDomain(domain, d); err != nil {
+		return err
+	}
+	return s.Save(legacyName, raw)
 }

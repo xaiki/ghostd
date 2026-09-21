@@ -2,8 +2,8 @@
 [Unit]
 Description=smarthome-ghostd — tailnet-authenticated firewall/netconfig/ingress daemon
 # tailscaled.service: ghostd binds its RPC listener to the tailnet address
-# alone and refuses to start without one (cmd/ghostd/main.go) — no point
-# starting before tailscaled has a chance to be up. network-pre.target:
+# alone, waiting for it while configured LAN DHCP/DNS remains available.
+# Start after tailscaled has a chance to be up. network-pre.target:
 # same reasoning one layer down, for whatever brings the interface
 # tailscaled itself rides up. Neither is a hard Requires=: a host whose
 # tailscaled is flapping should not take ghostd down with it — the boot-time
@@ -14,6 +14,8 @@ Wants=network-pre.target tailscaled.service
 
 [Service]
 Type=notify
+RuntimeDirectory=smarthome-ghostd
+RuntimeDirectoryMode=0755
 ExecStart=/opt/smarthome/ghostd/ghostd --watchdog-sec=30
 Restart=always
 RestartSec=5

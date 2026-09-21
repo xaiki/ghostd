@@ -55,6 +55,12 @@ func Render(ds DesiredState, guard ReachabilityGuard) (string, error) {
 	fmt.Fprintf(&b, "add table inet %s\ndelete table inet %s\n", tableName, tableName)
 	fmt.Fprintf(&b, "table inet %s {\n", tableName)
 
+	if ds.RedirectOnly {
+		writePreroutingChain(&b, ds)
+		b.WriteString("}\n")
+		return b.String(), nil
+	}
+
 	writeInputChain(&b, ds, guard, names)
 	writeForwardChain(&b, ds, names)
 	writeOutputChain(&b, ds.Output)
@@ -79,6 +85,9 @@ func validInterface(name string) bool {
 func validPort(port int) bool { return port >= 1 && port <= 65535 }
 
 func validate(ds DesiredState) error {
+	if ds.RedirectOnly && (ds.Output != nil || ds.Ingress != nil) {
+		return fmt.Errorf("nft: redirect-only policy cannot contain output or ingress policy")
+	}
 	if err := validateOutput(ds.Output); err != nil {
 		return err
 	}
@@ -98,6 +107,9 @@ func validate(ds DesiredState) error {
 	assigned := map[string]string{}
 	hasReachableZone := false
 	for name, zone := range ds.Zones {
+		if ds.RedirectOnly && (zone.SSH != nil || zone.NFS != nil || len(zone.Services) > 0 || len(zone.Ports) > 0 || len(zone.Forward) > 0 || zone.Masquerade || (zone.Target != "" && zone.Target != "DROP")) {
+			return fmt.Errorf("nft: redirect-only zone cannot contain filtering or forwarding policy")
+		}
 		if !zoneName.MatchString(name) {
 			return fmt.Errorf("nft: invalid zone name %q", name)
 		}
@@ -120,6 +132,14 @@ func validate(ds DesiredState) error {
 			if !validPort(rule.Port) || (rule.Proto != "tcp" && rule.Proto != "udp") {
 				return fmt.Errorf("nft: invalid port rule %+v", rule)
 			}
+		}
+		seenRedirects := map[string]bool{}
+		for _, rule := range zone.Redirects {
+			key := fmt.Sprintf("%s/%d", rule.Proto, rule.Port)
+			if !validPort(rule.Port) || !validPort(rule.ToPort) || rule.Port == rule.ToPort || (rule.Proto != "tcp" && rule.Proto != "udp") || seenRedirects[key] {
+				return fmt.Errorf("nft: invalid or duplicate redirect %+v", rule)
+			}
+			seenRedirects[key] = true
 		}
 		if zone.NFS != nil {
 			for _, source := range zone.NFS.Exports {
@@ -148,7 +168,7 @@ func validate(ds DesiredState) error {
 			return fmt.Errorf("nft: zone %q declares no interfaces", name)
 		}
 	}
-	if !hasReachableZone {
+	if !hasReachableZone && !ds.RedirectOnly {
 		return fmt.Errorf("nft: no zone declares ssh (and no zone is named \"trusted\") — this host would be unreachable")
 	}
 	return nil
@@ -182,6 +202,11 @@ func writeInputChain(b *strings.Builder, ds DesiredState, guard ReachabilityGuar
 	b.WriteString("    type filter hook input priority 0; policy drop;\n")
 	b.WriteString("    ct state established,related accept\n")
 	b.WriteString("    iifname \"lo\" accept\n")
+	// Rootful Podman bridges reach the host resolver through input; rootless
+	// forwarding originates on the host and uses the loopback rule above.
+	// ghostd binds DNS only to its tailnet address, never the public address.
+	b.WriteString("    iifname \"podman*\" udp dport 53 accept\n")
+	b.WriteString("    iifname \"podman*\" tcp dport 53 accept\n")
 	// IPv6 addressing needs NDP/RA even when no application service is open.
 	// Neighbor/router discovery is link-local in scope (hop limit 255); ICMP
 	// errors are required for path MTU discovery and transport correctness.
@@ -221,6 +246,14 @@ func writeForwardChain(b *strings.Builder, ds DesiredState, names []string) {
 func writePreroutingChain(b *strings.Builder, ds DesiredState) {
 	b.WriteString("  chain prerouting {\n")
 	b.WriteString("    type nat hook prerouting priority -100;\n")
+	for _, name := range sortedZoneNames(ds.Zones) {
+		zone := ds.Zones[name]
+		for _, iface := range sortedStrings(zone.Interfaces) {
+			for _, rule := range zone.Redirects {
+				fmt.Fprintf(b, "    iifname %q fib daddr type local %s dport %d redirect to :%d\n", iface, rule.Proto, rule.Port, rule.ToPort)
+			}
+		}
+	}
 	if ds.Ingress != nil {
 		for _, iface := range sortedStrings(ds.Ingress.Interfaces) {
 			fmt.Fprintf(b, "    iifname %q fib daddr type local tcp dport 80 dnat to :%d\n", iface, ds.Ingress.HTTPPort)
@@ -256,6 +289,9 @@ func writeZoneChain(b *strings.Builder, name string, zone Zone) error {
 	}
 	if zone.SSH != nil {
 		fmt.Fprintf(b, "    tcp dport %d accept\n", zone.SSH.Port)
+	}
+	for _, rule := range zone.Redirects {
+		fmt.Fprintf(b, "    ct status dnat meta l4proto %s ct original proto-dst %d %s dport %d accept\n", rule.Proto, rule.Port, rule.Proto, rule.ToPort)
 	}
 	if zone.NFS != nil {
 		for _, export := range sortedStrings(zone.NFS.Exports) {

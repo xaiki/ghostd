@@ -28,6 +28,10 @@ type Identity struct {
 	Login     string
 	Tags      []string
 	CanDeploy bool
+	CanReport bool
+	NodeID    string
+	DNSName   string
+	Addresses []string
 }
 
 func (id Identity) HasTag(tag string) bool {
@@ -79,7 +83,33 @@ func (a *Authenticator) Identify(ctx context.Context, remoteAddr string) (Identi
 			canDeploy = true
 		}
 	}
-	return Identity{Login: login, Tags: resp.Node.Tags, CanDeploy: canDeploy}, nil
+	identity := Identity{Login: login, Tags: resp.Node.Tags, CanDeploy: canDeploy,
+		NodeID: string(resp.Node.StableID), DNSName: resp.Node.Name}
+	for _, address := range resp.Node.Addresses {
+		if address.IsSingleIP() {
+			identity.Addresses = append(identity.Addresses, address.Addr().String())
+		}
+	}
+	for _, raw := range resp.CapMap[tailcfg.PeerCapability("ghostd.local/cap/report")] {
+		var permission struct {
+			Report bool `json:"report"`
+		}
+		if json.Unmarshal([]byte(raw), &permission) == nil && permission.Report {
+			identity.CanReport = true
+		}
+	}
+	return identity, nil
+}
+
+func (a *Authenticator) AuthorizeReporter(ctx context.Context, remoteAddr string) (Identity, error) {
+	id, err := a.Identify(ctx, remoteAddr)
+	if err != nil {
+		return Identity{}, err
+	}
+	if id.NodeID == "" || (!id.CanReport && !id.CanDeploy && !id.HasTag(a.deployerTag)) {
+		return Identity{}, fmt.Errorf("auth: host report requires a stable node ID and report capability")
+	}
+	return id, nil
 }
 
 // AuthorizeDeployer accepts an explicit deploy capability from local tailscaled,

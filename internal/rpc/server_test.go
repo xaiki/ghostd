@@ -738,3 +738,30 @@ func TestOutputVersionedDomainUsesFirewallLease(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestRedirectVersionedDomainKeepsFirewallLeaseAndGuardsExistingFilters(t *testing.T) {
+	for _, ownedFilter := range []bool{false, true} {
+		s, runner, _, leases := newTestServer(t, []string{"tag:stack-deployer"})
+		if ownedFilter {
+			runner.output = []byte(`{"nftables":[{"chain":{"family":"inet","table":"stack_ghostd","type":"filter"}}]}`)
+		}
+		raw := `{"redirect_only":true,"zones":{"services":{"interfaces":["eth0"],"redirects":[{"port":514,"to_port":15514,"proto":"udp"}]}}}`
+		response, err := s.Apply(withPeer(context.Background()), &pb.ApplyRequest{Domain: "firewall-redirect-v1", DesiredStateJson: raw, DeadManSwitchSeconds: 300})
+		if ownedFilter {
+			if status.Code(err) != codes.FailedPrecondition || len(leases.calls) != 0 || len(runner.commitArgs) != 0 {
+				t.Fatalf("unsafe takeover: %v", err)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		d, err := s.store.Domain("firewall", NftRuleset)
+		if err != nil || d.Pending == nil || d.Pending.ID != response.LeaseId {
+			t.Fatalf("missing lease: %v", err)
+		}
+		if _, err := s.Confirm(freshPeer(context.Background()), &pb.ConfirmRequest{LeaseId: response.LeaseId}); err != nil {
+			t.Fatal(err)
+		}
+	}
+}

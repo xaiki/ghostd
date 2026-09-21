@@ -1,0 +1,3 @@
+FROM docker.io/library/debian:bookworm-slim
+RUN apt-get -o Acquire::Max-FutureTime=10800 update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends systemd dbus dnsmasq iproute2 isc-dhcp-client busybox ndisc6 tcpdump iputils-ping nftables python3 ca-certificates && rm -rf /var/lib/apt/lists/*
+WORKDIR /lab

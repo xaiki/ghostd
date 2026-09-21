@@ -262,3 +262,48 @@ func TestRenderRejectsMissingReachabilityGuard(t *testing.T) {
 		t.Fatal("guard omitted")
 	}
 }
+
+func TestRootlessRedirectIsLocalScopedAndWithdrawn(t *testing.T) {
+	ds := minimalDesiredState()
+	zone := ds.Zones["mgmt"]
+	zone.Redirects = []RedirectRule{{Port: 514, ToPort: 15514, Proto: "udp"}}
+	ds.Zones["mgmt"] = zone
+	script, err := Render(ds, guard())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`iifname "end0.10" fib daddr type local udp dport 514 redirect to :15514`,
+		`ct status dnat meta l4proto udp ct original proto-dst 514 udp dport 15514 accept`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("missing %s in %s", want, script)
+		}
+	}
+	if strings.Contains(script, "    udp dport 15514 accept") {
+		t.Fatal("backend opened directly")
+	}
+	zone.Redirects = nil
+	ds.Zones["mgmt"] = zone
+	script, err = Render(ds, guard())
+	if err != nil || strings.Contains(script, "15514") {
+		t.Fatal("redirect was not withdrawn", err, script)
+	}
+}
+
+func TestRejectInvalidRedirects(t *testing.T) {
+	for _, rules := range [][]RedirectRule{
+		{{Port: 514, ToPort: 0, Proto: "udp"}},
+		{{Port: 514, ToPort: 15514, Proto: "udp;accept"}},
+		{{Port: 514, ToPort: 514, Proto: "udp"}},
+		{{Port: 514, ToPort: 15514, Proto: "udp"}, {Port: 514, ToPort: 15515, Proto: "udp"}},
+	} {
+		ds := minimalDesiredState()
+		zone := ds.Zones["mgmt"]
+		zone.Redirects = rules
+		ds.Zones["mgmt"] = zone
+		if _, err := Render(ds, guard()); err == nil {
+			t.Fatalf("accepted %+v", rules)
+		}
+	}
+}

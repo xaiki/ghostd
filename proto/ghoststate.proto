@@ -15,7 +15,23 @@ service HostState {
   rpc GetState(GetStateRequest) returns (State);
   rpc Apply(ApplyRequest) returns (ApplyResponse);
   rpc Confirm(ConfirmRequest) returns (ConfirmResponse);
+  // Registry reads are separate so ordinary firewall observations stay small.
+  rpc GetRegistry(RegistryRequest) returns (RegistryResponse);
+  rpc ImportLeases(RegistryDocument) returns (RegistryResponse);
+  rpc ReportHost(RegistryDocument) returns (RegistryResponse);
+  rpc RepairIdentity(RegistryDocument) returns (RegistryResponse);
+  rpc DHCPHandover(RegistryDocument) returns (RegistryResponse);
 }
+
+message RegistryRequest {
+  string scope = 1;
+  string address = 2;
+  int64 at_unix = 3;
+  uint64 after_event = 4;
+  uint32 event_limit = 5;
+}
+message RegistryDocument { string json = 1; }
+message RegistryResponse { string json = 1; }
 
 message GetStateRequest {
   // Optional fixed read-only adoption evidence; ordinary state reads stay lightweight.
@@ -34,6 +50,7 @@ message State {
   // bytes + `ip -j addr show` + /proc/sys/net/ipv4/ip_forward), as JSON.
   string netconfig_json = 2;
   string adoption_evidence_json = 3;
+  string dhcp_config_json = 4;
 }
 
 message ApplyRequest {

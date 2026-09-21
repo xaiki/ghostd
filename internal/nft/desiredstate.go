@@ -16,20 +16,29 @@ import (
 // under `Zones`, etc.) — this struct is just the wire shape those already-
 // validated values travel in.
 type DesiredState struct {
-	Zones   map[string]Zone `json:"zones"`
-	Ingress *Ingress        `json:"ingress,omitempty"`
-	Output  *OutputPolicy   `json:"output,omitempty"`
+	RedirectOnly bool            `json:"redirect_only,omitempty"`
+	Zones        map[string]Zone `json:"zones"`
+	Ingress      *Ingress        `json:"ingress,omitempty"`
+	Output       *OutputPolicy   `json:"output,omitempty"`
 }
 
 type Zone struct {
-	Interfaces []string   `json:"interfaces"`
-	SSH        *SSHRule   `json:"ssh,omitempty"`
-	NFS        *NFSRule   `json:"nfs,omitempty"`
-	Services   []string   `json:"services,omitempty"`
-	Ports      []PortRule `json:"ports,omitempty"`
-	Target     string     `json:"target,omitempty"`  // "DROP" (default) or "ACCEPT"
-	Forward    []string   `json:"forward,omitempty"` // egress zone names
-	Masquerade bool       `json:"masquerade,omitempty"`
+	Interfaces []string       `json:"interfaces"`
+	SSH        *SSHRule       `json:"ssh,omitempty"`
+	NFS        *NFSRule       `json:"nfs,omitempty"`
+	Services   []string       `json:"services,omitempty"`
+	Ports      []PortRule     `json:"ports,omitempty"`
+	Target     string         `json:"target,omitempty"`  // "DROP" (default) or "ACCEPT"
+	Forward    []string       `json:"forward,omitempty"` // egress zone names
+	Masquerade bool           `json:"masquerade,omitempty"`
+	Redirects  []RedirectRule `json:"redirects,omitempty"`
+}
+
+// RedirectRule publishes one rootless listener through a privileged host port.
+type RedirectRule struct {
+	Port   int    `json:"port"`
+	ToPort int    `json:"to_port"`
+	Proto  string `json:"proto"`
 }
 
 type SSHRule struct {

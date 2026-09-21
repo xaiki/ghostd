@@ -44,7 +44,13 @@ func TestIntegrationGuestCannotReachLANServices(t *testing.T) {
 	ctx := context.Background()
 	command := func(args ...string) {
 		t.Helper()
-		if out, err := exec.Command("ip", args...).CombinedOutput(); err != nil {
+		cmd := exec.Command("ip", args...)
+		if len(args) >= 2 && args[0] == "-n" {
+			// Enter only the network namespace; ip -n also remounts /sys,
+			// which is unnecessary and unavailable in nested rootless tests.
+			cmd = exec.Command("nsenter", append([]string{"--net=/var/run/netns/" + args[1], "ip"}, args[2:]...)...)
+		}
+		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("ip %v: %v: %s", args, err, out)
 		}
 	}
@@ -81,7 +87,7 @@ func TestIntegrationGuestCannotReachLANServices(t *testing.T) {
 			}
 		}(listener)
 	}
-	for _, port := range []int{69, 5353} {
+	for _, port := range []int{69, 5353, 15514} {
 		listener, err := net.ListenPacket("udp4", fmt.Sprintf("0.0.0.0:%d", port))
 		if err != nil {
 			t.Fatal(err)
@@ -100,7 +106,7 @@ func TestIntegrationGuestCannotReachLANServices(t *testing.T) {
 	}
 	ds := DesiredState{Zones: map[string]Zone{
 		"guest": {Interfaces: []string{"gd-guest"}, Ports: []PortRule{{Port: 53, Proto: "tcp"}, {Port: 5353, Proto: "udp"}}},
-		"lan":   {Interfaces: []string{"gd-lan"}, SSH: &SSHRule{Port: 22}, Ports: []PortRule{{Port: 2049, Proto: "tcp"}}},
+		"lan":   {Interfaces: []string{"gd-lan"}, SSH: &SSHRule{Port: 22}, Ports: []PortRule{{Port: 2049, Proto: "tcp"}}, Redirects: []RedirectRule{{Port: 514, ToPort: 15514, Proto: "udp"}}},
 	}, Ingress: &Ingress{Interfaces: []string{"gd-lan"}, HTTPPort: 18080}}
 	script, err := Render(ds, guard())
 	if err != nil {
@@ -116,7 +122,7 @@ func TestIntegrationGuestCannotReachLANServices(t *testing.T) {
 	}
 	probe := func(zone, proto, address string, allow bool) {
 		t.Helper()
-		cmd := exec.Command("ip", "netns", "exec", names[zone], exe, "-test.run=^TestIntegrationPacketProbe$", "-test.v")
+		cmd := exec.Command("nsenter", "--net=/var/run/netns/"+names[zone], exe, "-test.run=^TestIntegrationPacketProbe$", "-test.v")
 		flag := "0"
 		if allow {
 			flag = "1"
@@ -137,4 +143,31 @@ func TestIntegrationGuestCannotReachLANServices(t *testing.T) {
 	probe("lan", "tcp", "192.0.3.1:2049", true)
 	probe("lan", "tcp", "192.0.3.1:80", true)
 	probe("lan", "tcp", "192.0.3.1:443", true)
+	probe("lan", "udp", "192.0.3.1:514", true)
+	probe("lan", "udp", "192.0.3.1:15514", false)
+	probe("guest", "udp", "192.0.2.1:514", false)
+	probe("guest", "udp", "192.0.3.1:514", false)
+	// A host with no ghostd filtering can adopt only the redirect. Its existing
+	// filter table must still decide unrelated access after the transaction.
+	if err := Restore(ctx, ExecRunner{}, []byte(`{"nftables":[]}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := Commit(ctx, ExecRunner{}, `table inet migration_existing {
+ chain input { type filter hook input priority 0; policy accept; tcp dport 22 drop; }
+}`); err != nil {
+		t.Fatal(err)
+	}
+	defer Commit(ctx, ExecRunner{}, "delete table inet migration_existing")
+	narrow := DesiredState{RedirectOnly: true, Zones: map[string]Zone{"services": {Interfaces: []string{"gd-lan"}, Redirects: []RedirectRule{{Port: 514, ToPort: 15514, Proto: "udp"}}}}}
+	script, err = Render(narrow, guard())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Commit(ctx, ExecRunner{}, script); err != nil {
+		t.Fatal(err)
+	}
+	probe("lan", "udp", "192.0.3.1:514", true)
+	probe("guest", "tcp", "192.0.2.1:22", false)
+	probe("guest", "tcp", "192.0.2.1:53", true)
+
 }
