@@ -5,24 +5,20 @@ import (
 	"errors"
 	"testing"
 
-	"tailscale.com/client/tailscale/apitype"
-	"tailscale.com/tailcfg"
+	"github.com/xaiki/ghostd/internal/overlay"
 )
 
 type fakeWhoIs struct {
-	resp *apitype.WhoIsResponse
+	resp *overlay.Caller
 	err  error
 }
 
-func (f fakeWhoIs) WhoIs(ctx context.Context, remoteAddr string) (*apitype.WhoIsResponse, error) {
+func (f fakeWhoIs) Whois(ctx context.Context, remoteAddr string) (*overlay.Caller, error) {
 	return f.resp, f.err
 }
 
-func taggedResponse(login string, tags ...string) *apitype.WhoIsResponse {
-	return &apitype.WhoIsResponse{
-		Node:        &tailcfg.Node{Tags: tags},
-		UserProfile: &tailcfg.UserProfile{LoginName: login},
-	}
+func taggedResponse(login string, tags ...string) *overlay.Caller {
+	return &overlay.Caller{Tags: tags, Login: login}
 }
 
 func TestIdentifyReturnsTheLoginAndTags(t *testing.T) {
@@ -42,16 +38,16 @@ func TestIdentifyReturnsTheLoginAndTags(t *testing.T) {
 func TestIdentifyOfAnUnknownPeerFails(t *testing.T) {
 	a := NewAuthenticator(fakeWhoIs{err: errors.New("no such peer")}, "tag:stack-deployer")
 	_, err := a.Identify(context.Background(), "8.8.8.8:1")
-	if !errors.Is(err, ErrNotOnTailnet) {
-		t.Fatalf("expected ErrNotOnTailnet, got %v", err)
+	if !errors.Is(err, ErrNotOnOverlay) {
+		t.Fatalf("expected ErrNotOnOverlay, got %v", err)
 	}
 }
 
 func TestIdentifyOfANilNodeFails(t *testing.T) {
-	a := NewAuthenticator(fakeWhoIs{resp: &apitype.WhoIsResponse{}}, "tag:stack-deployer")
+	a := NewAuthenticator(fakeWhoIs{}, "tag:stack-deployer")
 	_, err := a.Identify(context.Background(), "100.64.0.1:1")
-	if !errors.Is(err, ErrNotOnTailnet) {
-		t.Fatalf("expected ErrNotOnTailnet for a WhoIs answer with no node, got %v", err)
+	if !errors.Is(err, ErrNotOnOverlay) {
+		t.Fatalf("expected ErrNotOnOverlay for a WhoIs answer with no node, got %v", err)
 	}
 }
 
@@ -101,7 +97,7 @@ func TestCapabilityAuthorization(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			resp := taggedResponse("operator@example.com")
-			resp.CapMap = tailcfg.PeerCapMap{DeployCapability: {tailcfg.RawMessage(tc.raw)}}
+			resp.Capabilities = overlay.Caps(DeployCapability, tc.raw)
 			a := NewAuthenticator(fakeWhoIs{resp: resp}, "tag:stack-deployer")
 			id, err := a.AuthorizeDeployer(context.Background(), "100.64.0.1:1234")
 			if (err == nil) != tc.allow {
@@ -116,9 +112,28 @@ func TestCapabilityAuthorization(t *testing.T) {
 
 func TestUnrelatedCapabilityDoesNotAuthorize(t *testing.T) {
 	resp := taggedResponse("operator@example.com")
-	resp.CapMap = tailcfg.PeerCapMap{"example.com/other": {`{"deploy":true}`}}
+	resp.Capabilities = overlay.Caps("example.com/other", `{"deploy":true}`)
 	a := NewAuthenticator(fakeWhoIs{resp: resp}, "tag:stack-deployer")
 	if _, err := a.AuthorizeDeployer(context.Background(), "100.64.0.1:1234"); err == nil {
 		t.Fatal("unrelated capability authorized")
+	}
+}
+
+func TestDeployerUsersAuthorizeByLoginWhereThereAreNoCapabilities(t *testing.T) {
+	caller := taggedResponse("ops@example.com")
+	plain := NewAuthenticator(fakeWhoIs{resp: caller}, "tag:stack-deployer")
+	if _, err := plain.AuthorizeDeployer(context.Background(), "100.64.0.1:1"); err == nil {
+		t.Fatal("an untagged caller without a capability was authorized")
+	}
+	byUser := NewAuthenticator(fakeWhoIs{resp: caller}, "tag:stack-deployer").WithDeployerUsers("ops@example.com")
+	if _, err := byUser.AuthorizeDeployer(context.Background(), "100.64.0.1:1"); err != nil {
+		t.Fatal(err)
+	}
+	other := NewAuthenticator(fakeWhoIs{resp: taggedResponse("guest@example.com")}, "tag:stack-deployer").WithDeployerUsers("ops@example.com")
+	if _, err := other.AuthorizeDeployer(context.Background(), "100.64.0.1:1"); err == nil {
+		t.Fatal("a login that is not listed was authorized")
+	}
+	if _, err := NewAuthenticator(fakeWhoIs{resp: caller}, "tag:x").WithDeployerUsers("").AuthorizeDeployer(context.Background(), "100.64.0.1:1"); err == nil {
+		t.Fatal("an empty listed login matched a caller with no login")
 	}
 }

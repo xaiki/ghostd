@@ -12,21 +12,20 @@ import (
 
 	"github.com/xaiki/ghostd/internal/addressbook"
 	"github.com/xaiki/ghostd/internal/auth"
+	"github.com/xaiki/ghostd/internal/overlay"
 	pb "github.com/xaiki/ghostd/proto"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"tailscale.com/client/tailscale/apitype"
-	"tailscale.com/tailcfg"
 )
 
 type reportIdentity struct{ allowed bool }
 
-func (f reportIdentity) WhoIs(context.Context, string) (*apitype.WhoIsResponse, error) {
-	caps := tailcfg.PeerCapMap{}
+func (f reportIdentity) Whois(context.Context, string) (*overlay.Caller, error) {
+	caller := &overlay.Caller{NodeID: "node-a", DNSName: "node-a.example.ts.net."}
 	if f.allowed {
-		caps["ghostd.local/cap/report"] = []tailcfg.RawMessage{`{"report":true}`}
+		caller.Capabilities = overlay.Caps(auth.ReportCapability, `{"report":true}`)
 	}
-	return &apitype.WhoIsResponse{Node: &tailcfg.Node{StableID: "node-a", Name: "node-a.example.ts.net."}, CapMap: caps}, nil
+	return caller, nil
 }
 func registryServer(t *testing.T) *Server {
 	s, _, _, _ := newTestServer(t, []string{"tag:stack-deployer"})

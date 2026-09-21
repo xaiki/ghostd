@@ -5,14 +5,17 @@
 set -eu
 cd "$(dirname "$0")/.."
 profiles="
-:core only
-coredns:container resolver
+:core only (no overlay provider: cannot serve)
+tailscale:core + tailscale overlay
+headscale:core + headscale overlay
+tailscale headscale:both overlay providers
+tailscale coredns:container resolver
 mdns:mDNS only
 coredns mdns:resolver with native .local
 dhcp coredns:DHCP + authoritative DNS
 dhcp coredns mdns:DHCP + native mDNS
 dhcp dnsmasq coredns:DHCP + dnsmasq migration
-dhcp dnsmasq mdns coredns:everything
+tailscale dhcp dnsmasq mdns coredns:everything
 "
 echo "$profiles" | while IFS=: read -r tags label; do
 	[ -n "$label" ] || continue
@@ -23,7 +26,7 @@ echo "$profiles" | while IFS=: read -r tags label; do
 	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -tags "$tags" -o /dev/null ./cmd/ghostd
 done
 echo "== dependency isolation of the default build"
-if go list -deps ./cmd/ghostd | grep -E 'coredns|coredhcp|insomniacslk|miekg/dns|bbolt|pin/tftp|caddyserver|x/net/ipv[46]'; then
+if go list -deps ./cmd/ghostd | grep -E 'tailscale.com|coredns|coredhcp|insomniacslk|miekg/dns|bbolt|pin/tftp|caddyserver|x/net/ipv[46]'; then
 	echo "default build pulls in an optional dependency" >&2; exit 1
 fi
 echo "== unsupported combinations must not compile"

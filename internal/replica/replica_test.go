@@ -13,6 +13,7 @@ import (
 	"github.com/xaiki/ghostd/internal/addressbook"
 	"github.com/xaiki/ghostd/internal/auth"
 	"github.com/xaiki/ghostd/internal/nft"
+	"github.com/xaiki/ghostd/internal/overlay"
 	"github.com/xaiki/ghostd/internal/rpc"
 	"github.com/xaiki/ghostd/internal/state"
 	pb "github.com/xaiki/ghostd/proto"
@@ -20,14 +21,12 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
-	"tailscale.com/client/tailscale/apitype"
-	"tailscale.com/tailcfg"
 )
 
 type deployer struct{}
 
-func (deployer) WhoIs(context.Context, string) (*apitype.WhoIsResponse, error) {
-	return &apitype.WhoIsResponse{Node: &tailcfg.Node{Tags: []string{"tag:stack-deployer"}, StableID: "op"}, UserProfile: &tailcfg.UserProfile{LoginName: "op@example.com"}}, nil
+func (deployer) Whois(context.Context, string) (*overlay.Caller, error) {
+	return &overlay.Caller{Tags: []string{"tag:stack-deployer"}, NodeID: "op", Login: "op@example.com"}, nil
 }
 
 type runner struct{}

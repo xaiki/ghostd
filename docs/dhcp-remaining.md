@@ -81,8 +81,8 @@ detection.
 
 ```sh
 tests/tags.sh                            # all feature combinations, incl. the core-only build
-go test -race -tags "dhcp dnsmasq mdns coredns" ./... && go vet -tags "dhcp dnsmasq mdns coredns" ./...
-GOOS=linux go vet -tags "dhcp dnsmasq mdns coredns" ./...   # the Linux-only tests compile
+go test -race -tags "tailscale dhcp dnsmasq mdns coredns" ./... && go vet -tags "tailscale dhcp dnsmasq mdns coredns" ./...
+GOOS=linux go vet -tags "tailscale dhcp dnsmasq mdns coredns" ./...   # the Linux-only tests compile
 tests/integration/run.sh                # privileged suites in a container
 tests/dhcp-lab/run.sh                   # takeover, relay, RA, DHCPv6 timers, PD  (~4 min)
 tests/e2e/run.sh                        # real daemon under systemd, with a reboot (~3 min)

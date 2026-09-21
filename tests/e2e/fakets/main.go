@@ -19,6 +19,8 @@ func main() {
 	ip := flag.String("ip", "127.0.0.1", "tailnet address reported for this node")
 	tag := flag.String("tag", "tag:stack-deployer", "tag given to every caller; empty makes callers plain peers")
 	peers := flag.String("peers", "/run/tailscale/peers.json", "optional JSON object of node-key -> PeerStatus to report as tailnet peers")
+	capDeploy := flag.Bool("cap-deploy", false, "grant every caller the ghostd.local/cap/deploy capability, as a tailnet grant would")
+	user := flag.String("user", "operator@example.com", "login reported for every caller")
 	flag.Parse()
 	_ = os.Remove(*sock)
 	l, err := net.Listen("unix", *sock)
@@ -49,7 +51,11 @@ func main() {
 		if *tag != "" {
 			node["Tags"] = []string{*tag}
 		}
-		json.NewEncoder(w).Encode(map[string]any{"Node": node, "UserProfile": map[string]any{"ID": 1, "LoginName": "operator@example.com"}, "CapMap": map[string]any{}})
+		caps := map[string]any{}
+		if *capDeploy {
+			caps["ghostd.local/cap/deploy"] = []any{map[string]any{"deploy": true}}
+		}
+		json.NewEncoder(w).Encode(map[string]any{"Node": node, "UserProfile": map[string]any{"ID": 1, "LoginName": *user}, "CapMap": caps})
 	})
 	log.Fatal(http.Serve(l, mux))
 }

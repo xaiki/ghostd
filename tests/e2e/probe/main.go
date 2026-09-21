@@ -600,6 +600,35 @@ func minimalPhase() {
 	}
 }
 
+// headscalePhase: the caller holds a deploy capability and no tag. Headscale has
+// no capability grants, so the provider must not believe one; authorization is by
+// tag or a listed login (--deployer-user).
+func headscalePhase() {
+	waitReady()
+	step("headscale provider: the daemon runs with the headscale overlay")
+	out, _ := sh("/opt/ghostd/ghostd", "--features")
+	check(strings.Contains(out, "overlay: headscale"), "only the headscale provider is built in: %q", out)
+	logs, _ := sh("journalctl", "-u", "ghostd.service", "-n", "50", "--no-pager")
+	check(strings.Contains(logs, "headscale overlay only"), "the listener reports the headscale overlay")
+	step("headscale provider: reads work, a claimed capability does not authorize")
+	_, err := rpc(func(ctx context.Context, c pb.HostStateClient) (*pb.State, error) {
+		return c.GetState(ctx, &pb.GetStateRequest{})
+	})
+	check(err == nil, "any overlay node may read state (%v)", err)
+	_, err = apply("firewall", fmt.Sprintf(firewallDoc, 8080), 60)
+	check(err != nil && strings.Contains(err.Error(), "PermissionDenied"), "deploy capability alone is refused: %v", err)
+	step("headscale provider: a listed login is authorized")
+	shOK("sed", "-i", "s#--overlay=headscale#--overlay=headscale --deployer-user=operator@example.com#", "/etc/systemd/system/ghostd.service")
+	shOK("systemctl", "daemon-reload")
+	shOK("systemctl", "restart", "ghostd.service")
+	waitReady()
+	lease, err := apply("firewall", fmt.Sprintf(firewallDoc, 8080), 60)
+	check(err == nil, "the listed login can deploy (%v)", err)
+	if err == nil {
+		check(confirm(lease) == nil, "and confirm")
+	}
+}
+
 func main() {
 	_ = net.IPv4len
 	if len(os.Args) < 2 {
@@ -617,6 +646,8 @@ func main() {
 		dnsPhase()
 	case "minimal":
 		minimalPhase()
+	case "headscale":
+		headscalePhase()
 	case "apply": // debugging aid: probe apply <domain> <seconds> <file>
 		raw, err := os.ReadFile(os.Args[4])
 		must(err, "read target")

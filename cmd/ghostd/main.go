@@ -29,12 +29,11 @@ import (
 	"github.com/xaiki/ghostd/internal/auth"
 	"github.com/xaiki/ghostd/internal/netconfig"
 	"github.com/xaiki/ghostd/internal/nft"
+	"github.com/xaiki/ghostd/internal/overlay"
 	"github.com/xaiki/ghostd/internal/rpc"
 	"github.com/xaiki/ghostd/internal/sdnotify"
 	"github.com/xaiki/ghostd/internal/state"
 	pb "github.com/xaiki/ghostd/proto"
-
-	tsclient "tailscale.com/client/local"
 )
 
 const (
@@ -59,6 +58,9 @@ func main() {
 	tailscaleIface := flag.String("tailscale-interface", defaultTailscaleIface,
 		"the interface name Apply's reachability guard always keeps open to this daemon's own port (nft.ReachabilityGuard)")
 	watchdogSec := flag.Int("watchdog-sec", 0, "systemd WatchdogSec= value, in seconds (0 disables watchdog pinging)")
+	overlayName := flag.String("overlay", "", "network provider to authenticate callers and bind listeners through ("+strings.Join(overlay.Names(), ", ")+" built in; default: the only one built in, else tailscale)")
+	overlaySocket := flag.String("overlay-socket", "", "override the provider's local client API socket")
+	deployerUsers := flag.String("deployer-user", "", "comma-separated logins that may deploy in addition to the tag and capability paths (for control planes without application capabilities, such as headscale)")
 	showFeatures := flag.Bool("features", false, "list the optional features compiled into this binary and exit")
 	for _, f := range features {
 		if f.flags != nil {
@@ -68,6 +70,11 @@ func main() {
 	flag.Parse()
 	if *showFeatures {
 		fmt.Println("core: firewall, netconfig")
+		if names := overlay.Names(); len(names) > 0 {
+			fmt.Println("overlay:", strings.Join(names, ", "))
+		} else {
+			fmt.Println("overlay: none (daemon mode unavailable)")
+		}
 		if names := builtFeatures(); len(names) > 0 {
 			fmt.Println("optional:", strings.Join(names, ", "))
 		} else {
@@ -112,7 +119,7 @@ func main() {
 		return
 	}
 
-	if err := runDaemonMode(store, *port, *deployerTag, *tailscaleIface, *watchdogSec, *observeOnly); err != nil {
+	if err := runDaemonMode(store, *port, *deployerTag, *tailscaleIface, *watchdogSec, *observeOnly, daemonOverlay{name: *overlayName, socket: *overlaySocket, users: *deployerUsers}); err != nil {
 		log.Fatalf("ghostd: %v", err)
 	}
 }
@@ -177,11 +184,22 @@ func runRevert(store *state.Store, leaseID, domain string) error {
 	return recoverDomain(store, domain, leaseID)
 }
 
-func runDaemon(store *state.Store, port int, deployerTag string, tailscaleIface string, watchdogSec int) error {
-	return runDaemonMode(store, port, deployerTag, tailscaleIface, watchdogSec, false)
+// daemonOverlay is the overlay provider selection from the command line.
+type daemonOverlay struct{ name, socket, users string }
+
+func runDaemon(store *state.Store, port int, deployerTag string, tailscaleIface string, watchdogSec int, provider overlay.Provider) error {
+	return runDaemonWith(store, port, deployerTag, tailscaleIface, watchdogSec, false, provider, "")
 }
 
-func runDaemonMode(store *state.Store, port int, deployerTag string, tailscaleIface string, watchdogSec int, observeOnly bool) error {
+func runDaemonMode(store *state.Store, port int, deployerTag string, tailscaleIface string, watchdogSec int, observeOnly bool, sel daemonOverlay) error {
+	provider, err := overlay.New(sel.name, overlay.Options{Socket: sel.socket})
+	if err != nil {
+		return err
+	}
+	return runDaemonWith(store, port, deployerTag, tailscaleIface, watchdogSec, observeOnly, provider, sel.users)
+}
+
+func runDaemonWith(store *state.Store, port int, deployerTag string, tailscaleIface string, watchdogSec int, observeOnly bool, provider overlay.Provider, deployerUsers string) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -197,8 +215,7 @@ func runDaemonMode(store *state.Store, port int, deployerTag string, tailscaleIf
 	}
 	unlock()
 
-	tsLocal := &tsclient.Client{}
-	env := &featureEnv{ctx: ctx, store: store, observeOnly: observeOnly, tsLocal: tsLocal, fatal: make(chan error, 4), shared: map[string]any{}}
+	env := &featureEnv{ctx: ctx, store: store, observeOnly: observeOnly, overlay: provider, fatal: make(chan error, 4), shared: map[string]any{}}
 	var stops stopper
 	defer func() { stops.run() }()
 	if names := builtFeatures(); len(names) > 0 {
@@ -224,12 +241,12 @@ func runDaemonMode(store *state.Store, port int, deployerTag string, tailscaleIf
 	var listenAddr string
 	for {
 		attempt, cancel := context.WithTimeout(ctx, 5*time.Second)
-		listenAddr, err = tailnetListenAddress(attempt, tsLocal, port)
+		listenAddr, err = provider.ListenAddress(attempt, port)
 		cancel()
 		if err == nil {
 			break
 		}
-		log.Printf("ghostd: waiting for tailnet control transport: %v", err)
+		log.Printf("ghostd: waiting for the %s overlay: %v", provider.Name(), err)
 		select {
 		case e := <-env.fatal:
 			return e
@@ -240,7 +257,7 @@ func runDaemonMode(store *state.Store, port int, deployerTag string, tailscaleIf
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", listenAddr, err)
 	}
-	log.Printf("ghostd: listening on %s (tailnet-only)", listenAddr)
+	log.Printf("ghostd: listening on %s (%s overlay only)", listenAddr, provider.Name())
 	defer listener.Close()
 	if env.dnsAddress, _, err = net.SplitHostPort(listenAddr); err != nil {
 		return err
@@ -262,7 +279,7 @@ func runDaemonMode(store *state.Store, port int, deployerTag string, tailscaleIf
 		return fmt.Errorf("resolve own binary path (needed to arm the dead-man's-switch): %w", err)
 	}
 	leases := state.NewLeases(exePath, state.ExecRunner{})
-	authenticator := auth.NewAuthenticator(tsLocal, deployerTag)
+	authenticator := auth.NewAuthenticator(provider, deployerTag).WithDeployerUsers(strings.Split(deployerUsers, ",")...)
 	guard := nft.ReachabilityGuard{TailscaleInterface: tailscaleIface, Port: port}
 	server := rpc.NewServer(authenticator, store, leases, nft.ExecRunner{}, netconfig.ExecRunner{}, guard)
 	server.ObserveOnly = observeOnly
@@ -300,23 +317,6 @@ func petWatchdog(interval time.Duration) {
 			log.Printf("ghostd: sd_notify WATCHDOG failed (non-fatal): %v", err)
 		}
 	}
-}
-
-// tailnetListenAddress asks the host's own tailscaled for this node's
-// tailnet address — never 0.0.0.0, never a LAN/mgmt interface. Binding to
-// a specific address (not just trusting firewall policy to keep LAN
-// traffic out) is the primary control: even a misconfigured or
-// not-yet-converged firewall domain cannot expose this socket off-tailnet.
-func tailnetListenAddress(ctx context.Context, client *tsclient.Client, port int) (string, error) {
-	status, err := client.Status(ctx)
-	if err != nil {
-		return "", fmt.Errorf("tailscaled status: %w (is tailscaled running and joined?)", err)
-	}
-	if status.Self == nil || len(status.Self.TailscaleIPs) == 0 {
-		return "", fmt.Errorf("this host has no tailnet address yet (not joined?)")
-	}
-	ip := status.Self.TailscaleIPs[0]
-	return net.JoinHostPort(ip.String(), fmt.Sprintf("%d", port)), nil
 }
 
 // Observation never restores a baseline or interferes with armed rollback jobs.

@@ -37,6 +37,8 @@ opens only the sockets — it asked for:
 
 | Tag | Adds | Requires |
 | --- | --- | --- |
+| `tailscale` | Overlay provider: the local `tailscaled` API, with application capabilities | — |
+| `headscale` | Overlay provider for a Headscale-managed host: same local API, tags and logins only | — |
 | `coredns` | The container resolver (CoreDNS) on the tailnet address, with the per-container DNS ACL | — |
 | `dhcp` | DHCPv4/v6, authoritative LAN DNS, the identity ledger, prefix delegation, TFTP/PXE, peer suggestions, warm standby, and their RPCs | `coredns` |
 | `dnsmasq` | Takeover from, and conversion of, a dnsmasq install (`--convert-dnsmasq`, the handover RPCs) | `dhcp` |
@@ -46,7 +48,7 @@ opens only the sockets — it asked for:
 go build -trimpath -o bin/ghostd ./cmd/ghostd                                         # core only
 go build -trimpath -tags "coredns mdns" -o bin/ghostd ./cmd/ghostd                    # container DNS + native .local
 go build -trimpath -tags "dhcp coredns" -o bin/ghostd ./cmd/ghostd                    # a DHCP/DNS authority
-go build -trimpath -tags "dhcp dnsmasq mdns coredns" -o bin/ghostd ./cmd/ghostd       # everything
+go build -trimpath -tags "tailscale dhcp dnsmasq mdns coredns" -o bin/ghostd ./cmd/ghostd       # everything
 bin/ghostd --features                                                                 # what this binary contains
 ```
 
@@ -63,7 +65,7 @@ For a Linux ARM64 target built on another OS, the binary is CGO-free:
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -tags "dhcp coredns" -o bin/ghostd-linux-arm64 ./cmd/ghostd
 ```
 
-Tests take the same tags (`go test -tags "dhcp dnsmasq mdns coredns" ./...`);
+Tests take the same tags (`go test -tags "tailscale dhcp dnsmasq mdns coredns" ./...`);
 `tests/tags.sh` builds, vets and tests every supported combination.
 
 ## Install

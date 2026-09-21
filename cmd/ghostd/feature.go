@@ -4,9 +4,9 @@ import (
 	"context"
 	"sort"
 
+	"github.com/xaiki/ghostd/internal/overlay"
 	"github.com/xaiki/ghostd/internal/rpc"
 	"github.com/xaiki/ghostd/internal/state"
-	tsclient "tailscale.com/client/local"
 )
 
 // Optional features are compiled in by build tag and plug into the daemon here.
@@ -27,7 +27,8 @@ type featureEnv struct {
 	ctx         context.Context
 	store       *state.Store
 	observeOnly bool
-	tsLocal     *tsclient.Client
+	// overlay is the network provider (tailscale, headscale, ...).
+	overlay overlay.Provider
 	// server exists from the attach phase on.
 	server *rpc.Server
 	// fatal ends the daemon: a feature's listener failed and cannot recover.

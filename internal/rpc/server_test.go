@@ -10,11 +10,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/xaiki/ghostd/internal/overlay"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
-	"tailscale.com/client/tailscale/apitype"
-	"tailscale.com/tailcfg"
 
 	"github.com/xaiki/ghostd/internal/auth"
 	"github.com/xaiki/ghostd/internal/netconfig"
@@ -31,16 +30,12 @@ import (
 const validDesiredStateJSON = `{"zones":{"trusted":{"interfaces":["tailscale0"]}}}`
 
 type fakeWhoIs struct {
-	caps tailcfg.PeerCapMap
+	caps overlay.CapMap
 	tags []string
 }
 
-func (f fakeWhoIs) WhoIs(ctx context.Context, remoteAddr string) (*apitype.WhoIsResponse, error) {
-	return &apitype.WhoIsResponse{
-		Node:        &tailcfg.Node{Tags: f.tags},
-		CapMap:      f.caps,
-		UserProfile: &tailcfg.UserProfile{LoginName: "test@example.com"},
-	}, nil
+func (f fakeWhoIs) Whois(ctx context.Context, remoteAddr string) (*overlay.Caller, error) {
+	return &overlay.Caller{Tags: f.tags, Capabilities: f.caps, Login: "test@example.com"}, nil
 }
 
 type fakeNftRunner struct {
@@ -589,9 +584,7 @@ func TestConfirmReadCannotOutliveDeadline(t *testing.T) {
 
 func TestCapabilityCallerPassesMutationGateAndRevocationClosesIt(t *testing.T) {
 	s, _, _, _ := newTestServer(t, nil)
-	s.authenticator = auth.NewAuthenticator(fakeWhoIs{caps: tailcfg.PeerCapMap{
-		auth.DeployCapability: {`{"deploy":true}`},
-	}}, "tag:stack-deployer")
+	s.authenticator = auth.NewAuthenticator(fakeWhoIs{caps: overlay.Caps(auth.DeployCapability, `{"deploy":true}`)}, "tag:stack-deployer")
 	// Invalid payload proves authorization succeeded without mutating the host.
 	_, err := s.Apply(withPeer(context.Background()), &pb.ApplyRequest{Domain: "firewall", DesiredStateJson: "invalid"})
 	if err == nil || strings.Contains(err.Error(), "auth:") {
@@ -610,9 +603,7 @@ func TestCapabilityCallerPassesMutationGateAndRevocationClosesIt(t *testing.T) {
 
 func TestCapabilityCallerAppliesAndConfirms(t *testing.T) {
 	s, _, _, _ := newTestServer(t, nil)
-	s.authenticator = auth.NewAuthenticator(fakeWhoIs{caps: tailcfg.PeerCapMap{
-		auth.DeployCapability: {`{"deploy":true}`},
-	}}, "tag:stack-deployer")
+	s.authenticator = auth.NewAuthenticator(fakeWhoIs{caps: overlay.Caps(auth.DeployCapability, `{"deploy":true}`)}, "tag:stack-deployer")
 	ctx := withPeer(context.Background())
 	applied, err := s.Apply(ctx, &pb.ApplyRequest{Domain: "firewall", DesiredStateJson: validDesiredStateJSON, DeadManSwitchSeconds: 300})
 	if err != nil {

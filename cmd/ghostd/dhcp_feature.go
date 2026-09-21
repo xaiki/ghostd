@@ -7,11 +7,11 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"github.com/xaiki/ghostd/internal/overlay"
 	"github.com/xaiki/ghostd/internal/replica"
 	"log"
 	"os"
 	"path/filepath"
-	tsclient "tailscale.com/client/local"
 	"time"
 
 	"github.com/xaiki/ghostd/internal/addressbook"
@@ -223,7 +223,7 @@ func init() {
 		attach: func(env *featureEnv) (func(), error) {
 			manager := env.shared["dhcp.manager"].(*addressbook.Manager)
 			env.server.DHCP = manager
-			manager.SetPeerSource(func(ctx context.Context) ([]addressbook.Peer, error) { return tailnetPeers(ctx, env.tsLocal) })
+			manager.SetPeerSource(func(ctx context.Context) ([]addressbook.Peer, error) { return overlayPeers(ctx, env.overlay) })
 			if authority := os.Getenv("GHOSTD_IDENTITY_AUTHORITY"); authority != "" && !env.observeOnly {
 				go runReports(env.ctx, authority)
 			}
@@ -241,23 +241,19 @@ func init() {
 // followAddr is the leader a warm standby mirrors (--follow).
 var followAddr string
 
-// tailnetPeers reads the peer inventory from the local tailscaled. LAN
-// endpoints come from what tailscaled itself learned about direct paths.
-func tailnetPeers(ctx context.Context, client *tsclient.Client) ([]addressbook.Peer, error) {
+// overlayPeers reads the peer inventory from the overlay provider. LAN endpoints
+// are the private paths its client itself learned, not what a peer claims.
+func overlayPeers(ctx context.Context, p overlay.Provider) ([]addressbook.Peer, error) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	status, err := client.Status(ctx)
+	list, err := p.Peers(ctx)
 	if err != nil {
 		return nil, err
 	}
 	var peers []addressbook.Peer
-	for _, p := range status.Peer {
-		peer := addressbook.Peer{ID: string(p.ID), DNSName: p.DNSName, HostName: p.HostName, Online: p.Online,
-			LANAddrs: addressbook.PrivateEndpoints(append([]string{p.CurAddr}, p.Addrs...)...)}
-		for _, a := range p.TailscaleIPs {
-			peer.Addresses = append(peer.Addresses, a.String())
-		}
-		peers = append(peers, peer)
+	for _, q := range list {
+		peers = append(peers, addressbook.Peer{ID: q.ID, DNSName: q.DNSName, HostName: q.HostName, Online: q.Online,
+			Addresses: q.Addresses, LANAddrs: addressbook.PrivateEndpoints(q.Endpoints...)})
 	}
 	return peers, nil
 }
