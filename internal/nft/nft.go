@@ -41,10 +41,10 @@ func (ExecRunner) RunStdin(ctx context.Context, name string, script string, args
 }
 
 // ReadRulesetJSON is GetState's firewall half, and what Confirm persists as
-// last-confirmed state: the live kernel ruleset, structured (nft -j), not
-// a text scrape — the same "diffable, not a blob" requirement FIREWALL.md
-// put on GetState generally. Restore replays the owned objects after removing
-// kernel handles, which have positioning semantics in explicit add commands.
+// last-confirmed state: the live kernel ruleset, structured (nft -j), not a
+// text scrape — the same "diffable, not a blob" requirement GetState carries
+// generally. Restore replays the owned objects after removing kernel handles,
+// which have positioning semantics in explicit add commands.
 func ReadRulesetJSON(ctx context.Context, runner Runner) (string, error) {
 	out, err := runner.Output(ctx, "nft", "-j", "list", "ruleset")
 	if err != nil {

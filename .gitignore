@@ -1,4 +1,20 @@
+# Build output. /ghostd covers a build from the repo root, /cmd/ghostd/ghostd a
+# build run inside the package directory (or `go build ./cmd/ghostd` from there).
+# Never use a bare `ghostd` pattern: it would also ignore the cmd/ghostd/ source.
 /bin/
 /ghostd
+/cmd/ghostd/ghostd
+
+# Compiled test binaries (`go test -c`).
 *.test
+
+# Coverage and profiling artifacts.
 *.out
+*.prof
+*.coverprofile
+/coverage.html
+/cpu.prof
+/mem.prof
+
+# Tracked on purpose, not ignored: proto/ (the wire contract and its generated
+# Go bindings) and systemd/ (the unit file). Do not add ignore rules for them.

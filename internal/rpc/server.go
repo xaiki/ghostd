@@ -1,7 +1,7 @@
 // Package rpc wires the gRPC surface (proto/ghoststate.proto) to
 // internal/auth, internal/state, internal/nft and internal/netconfig. No
-// policy decisions live here: every method either reads live state or
-// enacts a state Nornir already resolved — see FIREWALL.md.
+// policy decisions live here: every method either reads live state or enacts a
+// state the client already resolved — see docs/operations.md.
 package rpc
 
 import (

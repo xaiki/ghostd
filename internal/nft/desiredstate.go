@@ -7,14 +7,13 @@ import (
 	"strings"
 )
 
-// DesiredState is the JSON shape Nornir sends in ApplyRequest.desired_state_json
-// — a direct, unchanged port of the firewall.base.zones/firewall.ingress
-// schema (docs/ops/firewall.md, pre-Phase-4) onto this daemon's own
-// renderer. Nornir still owns the schema and its validation rules (a zone
-// literally named "trusted" reusing the full-accept convention, at least
-// one zone must declare ssh, an egress zone named in `forward` must exist
-// under `Zones`, etc.) — this struct is just the wire shape those already-
-// validated values travel in.
+// DesiredState is the JSON shape a client sends in
+// ApplyRequest.desired_state_json: the zone and ingress schema this daemon
+// renders. The client still owns that schema and the policy decisions behind
+// it (a zone literally named "trusted" reusing the full-accept convention, at
+// least one zone must declare ssh, an egress zone named in `forward` must
+// exist under Zones, and so on) — this struct is just the wire shape those
+// already-resolved values travel in. See docs/firewall.md.
 type DesiredState struct {
 	RedirectOnly bool            `json:"redirect_only,omitempty"`
 	Zones        map[string]Zone `json:"zones"`

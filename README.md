@@ -1,424 +1,204 @@
 # ghostd
 
-A small, rootful Linux daemon for applying firewall and interface configuration
-over a Tailscale network, with an independent rollback timer for every change.
+A small, rootful Linux daemon that applies firewall and network-interface
+configuration over a Tailscale network, with an independent rollback timer for
+every change.
 
-Clients decide policy. ghostd validates and executes resolved JSON targets through
-three gRPC methods: `GetState`, `Apply`, and `Confirm`. A change becomes persistent
-only after a deployer reconnects and confirms its lease. Unconfirmed changes are
-recovered from a durable pre-apply snapshot, even if the daemon exits.
+Clients decide policy; ghostd validates and executes it. A client sends a
+fully-resolved declarative target as JSON over gRPC, ghostd renders and applies
+it, then arms a dead-man's switch. The change becomes permanent only when the
+client reconnects on a fresh TCP connection and confirms its lease. If no
+confirmation arrives before the deadline, a separate transient systemd timer
+restores a durable pre-apply snapshot — independently of the daemon process, the
+tailnet, or whether anyone is watching. The full set of guarantees, and the
+places they stop, is in [docs/operations.md](docs/operations.md).
 
-The Go module is self-contained: this directory can be published as its own
-repository. It needs neither Python nor the parent project's inventory, plugins,
-or deployment tools. The current module name (`github.com/xaiki/ghostd`), service name,
-and default paths are retained for existing installations.
+ghostd is one Go binary and one systemd unit. It needs no Python, no
+configuration-management system and no inventory: a client is anything that
+speaks the methods in [proto/ghoststate.proto](proto/ghoststate.proto).
 
 ## Requirements
 
-- Linux, systemd as the service manager, and root privileges.
-- `nft` with JSON input/output and inet-family NAT support; `ip` from iproute2;
-  `sysctl`; `systemd-run` and `systemctl` on the daemon's `PATH`.
-- A running, joined `tailscaled`, using a kernel Tailscale interface. The default
-  interface is `tailscale0`; userspace-networking mode is not supported.
-- Go **1.26.7 or newer** to build (see [go.mod](go.mod)).
+- Linux with systemd as the service manager, and root privileges.
+- `nft` with JSON input/output and inet-family NAT support; `ip` from
+  iproute2; `sysctl`; `getent`; and `systemd-run` plus `systemctl` on the
+  daemon's `PATH`.
+- A running, joined `tailscaled` using a kernel Tailscale interface. The default
+  interface name is `tailscale0`; userspace-networking mode is not supported.
+- Go **1.26.7 or newer** to build (see [go.mod](go.mod)). Go is needed on the
+  build machine only, never on the target.
 
-The daemon listens on the first IP returned by the local Tailscale status API,
-TCP port **7443** by default. It does not listen on wildcard or LAN addresses.
-There is no application-layer TLS: transport encryption comes from Tailscale.
-Do not expose the listener through a public proxy.
-
-Each RPC resolves its caller using the local tailscaled `WhoIs` API. Any recognized
-peer allowed to reach the port can read state. `Apply` and `Confirm` additionally
-require either the configured node tag (`tag:stack-deployer` by default) or a
-`ghostd.local/cap/deploy` application capability containing `{"deploy": true}`.
-Capabilities are read from local tailscaled's `WhoIs` response on every call,
-including confirmation; callers cannot supply them in RPC payloads. Missing,
-false, or malformed permissions do not authorize mutations.
-
-Keep workstations user-owned. Grant authorized users access to specific server
-Tailscale IPs in the tailnet policy (example addresses/identities only):
-
-```json
-{"grants": [{
-  "src": ["operator@example.com"],
-  "dst": ["100.64.0.10"],
-  "ip": ["tcp:7443"],
-  "app": {"ghostd.local/cap/deploy": [{"deploy": true}]}
-}]}
-```
-
-Merge this rule into existing policy; do not replace the policy with this example.
-Use the actual listener port if changed. No workstation tags or SSH policy changes
-are required. The node-tag path remains available for dedicated automation.
-
-Treat deployer access as host-administrator access. Interface configuration can
-contain root-executed ifupdown hooks, and the legacy `forward` action executes an
-existing root-owned script. The domain validators are not a sandbox for untrusted
-administrators. `GetState` includes the host's full nftables ruleset and interface
-configuration, so restrict read access through tailnet policy when appropriate.
-
-## Build and install
-
-Run from this directory (the root of the standalone repository):
+## Build
 
 ```sh
 go test ./...
 go build -trimpath -o bin/ghostd ./cmd/ghostd
 ```
 
-For a Linux ARM64 target built on another OS:
+For a Linux ARM64 target built on another OS, the binary is CGO-free:
 
 ```sh
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -o bin/ghostd-linux-arm64 ./cmd/ghostd
 ```
 
-On the target Linux host, install its native binary and the supplied unit:
+## Install
 
 ```sh
 sudo install -D -m 0755 bin/ghostd /opt/ghostd/ghostd
 sudo install -m 0644 systemd/ghostd.service /etc/systemd/system/ghostd.service
 sudo systemctl daemon-reload
+```
+
+Install the native binary, or the cross-compiled one where that applies. The
+daemon must stay at its installed path while leases are pending: the
+dead-man's-switch timer re-invokes that exact binary.
+
+## Quick start
+
+```sh
 sudo systemctl enable --now ghostd.service
 sudo systemctl status ghostd.service
+sudo journalctl -u ghostd.service -b
 ```
 
-Use the cross-compiled binary instead of `bin/ghostd` when applicable. The unit
-runs as root, restarts on failure, and enables a 30-second systemd watchdog.
-On its first start, with an empty state directory, ghostd installs no policy.
-On subsequent starts it recovers pending changes before restoring confirmed
-state and opening the RPC listener. It refuses to serve if recovery fails.
+The unit runs as root, restarts on failure, and enables a 30-second systemd
+watchdog. On its first start, with an empty state directory, ghostd installs no
+policy. On later starts it recovers any pending change, then restores confirmed
+state before opening the RPC listener. It refuses to serve if recovery fails.
 
-Keep an independent console or management path available for the first cutover.
-ghostd leaves `/etc/nftables.conf` and other nft tables untouched. However, an
-accept in one base chain cannot override a drop in another writer's base chain;
-coexisting firewalls can still block traffic. Arrange ownership and boot ordering
-with any other firewall manager before relying on ghostd's reachability guard.
-
-## Firewall target
-
-Save this as `firewall.json`, adjusting interface names and policy for your host:
-
-```json
-{
-  "zones": {
-    "trusted": {"interfaces": ["tailscale0"]},
-    "lan": {
-      "interfaces": ["eth0"],
-      "ssh": {"port": 22},
-      "ports": [{"port": 53, "proto": "udp"}, {"port": 53, "proto": "tcp"}],
-      "forward": ["wan"]
-    },
-    "wan": {"interfaces": ["eth1"], "masquerade": true}
-  }
-}
-```
-
-Render without root privileges, tailscaled, or any host changes:
+`ghostd` also has a render-only mode that needs no root, no tailscaled and makes
+no host changes:
 
 ```sh
 bin/ghostd --render-firewall < firewall.json > firewall.nft
+sudo nft -c -f firewall.nft   # Linux: syntax check only
 ```
 
-On Linux, `sudo nft -c -f firewall.nft` checks the result without applying it.
-The RPC performs this same syntax check before arming a lease.
+Keep an independent console or management path available for the first cutover.
+ghostd leaves `/etc/nftables.conf` and other nft tables untouched, but an
+`accept` in one base chain cannot override a `drop` in another writer's base
+chain, so arrange ownership and boot ordering with any other firewall manager
+before relying on ghostd's reachability guard.
 
-A target replaces only **`table inet stack_ghostd`**, atomically. Removing a port
-or zone removes its rules on the next apply. Other writers' tables are excluded
-from both snapshots and replay. Existing conntrack flows are not flushed, so
-removing an opening does not immediately terminate established connections.
+## The RPC contract
 
-- Zone names are identifiers; interfaces must be explicit names, assigned to
-  only one zone. `trusted` accepts all input from its interfaces.
-- Other zones allow their declared TCP/UDP ports and SSH, with input defaulting
-  to drop. `target: "ACCEPT"` permits all remaining input in that zone.
-- At least one zone must declare SSH or be named `trusted`. Every rendered policy
-  also permits ghostd's own TCP port on its configured Tailscale interface.
-- Loopback, established/related input, IPv6 error traffic, and IPv6 neighbor/router
-  discovery with hop limit 255 are permitted independently of zone services.
-- Forwarding defaults to drop except established/related flows and explicit
-  zone-to-zone `forward` declarations. `masquerade` applies on that zone's egress
-  interfaces. Kernel forwarding must also be enabled separately.
-- Optional `ingress: {"interfaces": ["eth0"], "http_port": 18080}` redirects
-  host-destined TCP 80 to that port and TCP 443 to **8443**, and admits those
-  destination ports. Forwarded traffic to other hosts is not redirected.
-- A zone can declare `redirects: [{"port": 514, "to_port": 15514, "proto": "udp"}]`.
-  This redirects incoming host-destined traffic on that zone's interfaces and
-  admits only the translated flow to the backend port. It does not open the
-  backend directly (trusted/ACCEPT zones retain their existing broad access).
-  TCP and UDP, IPv4 and IPv6 are supported; locally originated traffic is not
-  redirected. Removing the declaration removes the redirect on the next apply.
-  This lets rootless Wazuh publish `15514:514/udp` without lowering
-  `net.ipv4.ip_unprivileged_port_start`. Update ghostd before applying policies
-  with this field; older daemons reject unknown fields without applying them.
-- Legacy `services` names are `mdns`, `dns`, `dhcp`, `dhcpv6-client`, `http`, and
-  `https`. `nfs: {"exports": ["10.0.0.0/24"]}` permits TCP 111, 2049, and 20048
-  from those IPv4 CIDRs. For other services, supply explicit `ports`.
+The wire contract is [proto/ghoststate.proto](proto/ghoststate.proto), with Go
+bindings checked in under `proto/`. Bindings for other languages can be
+generated from that file. There is no gRPC reflection service.
 
-Service discovery, plugin activation, VLAN placement, and port-catalog lookup
-belong to the client. The daemon has no dependency on a specific policy generator.
+| Method | Purpose |
+| --- | --- |
+| `GetState` | Read live firewall and interface state. Read-only, no deployer tag required. |
+| `Apply` | Enact a resolved target behind a dead-man's switch; returns a lease ID. |
+| `Confirm` | Cancel that switch, from a fresh TCP connection. |
 
-## Netconfig target
+`Apply` takes `domain`, `desired_state_json` (a JSON **string**, not a nested
+object) and a positive `dead_man_switch_seconds`. A second apply to the same
+domain is rejected while a lease is pending. Confirmation is not idempotent, and
+any authorized deployer can confirm a known pending lease.
 
-The `netconfig` domain takes a file map and an ordered list of actions:
+A separate registry surface serves DHCP, DNS and device identity: `GetRegistry`,
+`ImportLeases`, `ReportHost`, `RepairIdentity` and `DHCPHandover`. See
+[docs/dhcp.md](docs/dhcp.md).
+
+A worked `grpcurl`/`jq` example, including the fresh-connection rule for
+confirmation, is in [docs/operations.md](docs/operations.md).
+
+## Security model
+
+Each RPC resolves its caller with the local tailscaled `WhoIs` API. There is no
+Unix-login path and no application-layer TLS: transport encryption comes from
+Tailscale, and the listener binds a tailnet address only — never a wildcard or a
+LAN address. Do not expose it through a public proxy.
+
+Any recognised peer that can reach the port may read state. Mutations require
+either the configured node tag (`tag:stack-deployer` by default) or a
+`ghostd.local/cap/deploy` application capability containing `{"deploy": true}`.
+Capabilities are read from local tailscaled on every call, including
+confirmation; callers cannot supply permissions in an RPC payload, and missing,
+false or malformed permissions do not authorize mutations. The full model,
+including the separate `ghostd.local/cap/report` capability, is in
+[docs/security.md](docs/security.md).
+
+Two limits are worth stating plainly:
+
+- **The domain validators are not a sandbox for untrusted administrators.**
+  Treat deployer access as host-administrator access. Interface configuration can
+  contain root-executed ifupdown hooks, and the legacy `forward` action executes
+  an existing root-owned script.
+- **`GetState` exposes the host's full nftables ruleset and interface
+  configuration.** Restrict read access through tailnet policy where that
+  matters.
+
+An example grant for an authorized user — documentation addresses and identities
+only, merged into existing policy rather than replacing it:
 
 ```json
-{
-  "files": {
-    "/etc/network/interfaces.d/stack-eth0.10.conf": "auto eth0.10\niface eth0.10 inet static\n    address 192.0.2.1/24\n    vlan-raw-device eth0\n"
-  },
-  "actions": [
-    ["vlan", "eth0", "eth0.10", "10"],
-    ["addr", "eth0.10", "192.0.2.1/24"],
-    ["up", "eth0.10"]
-  ]
-}
+{"grants": [{
+  "src": ["deployer@example.com"],
+  "dst": ["100.64.0.10"],
+  "ip": ["tcp:7443"],
+  "app": {"ghostd.local/cap/deploy": [{"deploy": true}]}
+}]}
 ```
 
-Supply the complete target and replayable actions, including configuration
-already present on the host: confirmed targets are replayed at daemon startup.
-The daemon writes declared files, then executes actions in order. It does not
-remove omitted files, addresses, or interfaces, and does not reload a network
-manager. Persisted interface files require an ifupdown-compatible host setup.
+Keep workstations user-owned. No workstation tags or SSH policy changes are
+required. Use the actual listener port if it was changed. The node-tag path
+remains available for dedicated automation.
 
-Allowed actions are `vlan` (base, device, VLAN ID), `addr` (device, address/prefix),
-`up` (device), `sysctl` (`net.ipv4.ip_forward=0` or `=1`), and the legacy `forward`
-(`/etc/stack-forward.sh`). Existing VLANs must match the requested parent and ID;
-existing addresses must match the device, address, and prefix.
+## Migrating from `smarthome-ghostd`
 
-Files may be written below `/etc/network/interfaces.d/`, or to the two forwarding
-files `/etc/sysctl.d/99-stack-forward.conf` and
-`/etc/sysctl.d/99-stack-no-forward.conf`. The latter accept only an empty string
-or `net.ipv4.ip_forward=0\n` / `net.ipv4.ip_forward=1\n`.
+The project was previously published with a `smarthome` prefix. That prefix is
+gone, and the rename is **breaking for existing installations**: the service
+name, install paths and timer unit names all changed.
 
-**Rollback restores touched file contents (including prior absence) and the
-previous IPv4 forwarding value. It does not undo additive live link/address
-changes or arbitrary effects of the legacy forwarding script.** Use the firewall
-domain for nft policy rather than that script. There is no cross-domain atomic
-transaction: each domain has its own lease and confirmed state.
-
-## RPC workflow
-
-The wire contract is [proto/ghoststate.proto](proto/ghoststate.proto); generated
-Go bindings are included. Clients in other languages can generate bindings from
-that file. No gRPC reflection service is enabled.
-
-1. Call `ghostd.HostState/GetState` to read both live domains.
-2. Call `Apply` with `domain`, `desired_state_json` (a JSON **string**, not a nested
-   object), and positive `dead_man_switch_seconds`, for example 300.
-3. Save the returned `lease_id`. Close the apply connection.
-4. Independently check the required application/management paths. Open a new TCP
-   connection to ghostd and call `Confirm` with that lease ID before expiry.
-5. Require `ok: true`. If any step fails, leave the lease unconfirmed and inspect
-   recovery before retrying. A second apply to the same domain is rejected while
-   a pending lease remains.
-
-For example, using `grpcurl` and `jq` from an authorized deployer (each grpcurl
-invocation opens a separate connection):
-
-```sh
-GHOSTD_ADDR=100.64.0.10:7443
-
-grpcurl -plaintext -import-path proto -proto ghoststate.proto \
-  "$GHOSTD_ADDR" ghostd.HostState/GetState
-
-jq -n --rawfile desired firewall.json \
-  '{domain:"firewall", desired_state_json:$desired, dead_man_switch_seconds:300}' \
-  > apply.json
-
-grpcurl -plaintext -import-path proto -proto ghoststate.proto -d @ \
-  "$GHOSTD_ADDR" ghostd.HostState/Apply < apply.json
-
-# After checking connectivity, copy leaseId from the Apply response:
-grpcurl -plaintext -import-path proto -proto ghoststate.proto \
-  -d '{"lease_id":"REPLACE-WITH-RETURNED-LEASE-ID"}' \
-  "$GHOSTD_ADDR" ghostd.HostState/Confirm
-```
-
-A different source TCP endpoint is required for confirmation. This is a
-reachability check, not proof that every application works. Any authorized
-deployer can confirm a known pending lease. Expired, incomplete, unknown, or
-already completed leases are rejected. Confirmation is not idempotent: if its
-response is lost, inspect state rather than assuming a retry's rejection means
-rollback occurred.
-
-## Persistence and recovery
-
-The default store is `/var/lib/ghostd/last-good`, created with mode 0700.
-Transaction files are mode 0600 and atomically replaced with file and directory
-syncs. They contain confirmed state and, while applying, the lease ID, deadline,
-pre-apply snapshot, target, source peer, and successful-apply marker. Preserve this
-directory across upgrades; do not edit it while the daemon or a revert is running.
-
-Before mutation, ghostd saves the snapshot and arms a separate transient systemd
-timer. The timer launches the installed binary with `--revert-lease`,
-`--revert-domain`, and the same `--store-dir`. It needs neither the original daemon
-process nor a working tailnet. The binary must remain at its installed path while
-leases are pending. Apply commands are bounded by the requested timeout; the
-timer may wait for an in-flight operation to release the process-shared lock.
-
-Successful confirmation atomically saves the confirmed state and clears the
-pending lease before stopping its `.timer`. A timer that has already fired sees
-that its lease is no longer pending and does nothing. Failed or interrupted
-applies cannot be confirmed. Startup rolls back any pending transaction even if
-its original deadline has not elapsed, since transient timers do not survive a
-reboot. With no pending transaction, startup replays confirmed state.
-
-Firewall recovery replaces only ghostd's table; a failed first apply restores
-its prior absence. Netconfig recovery has the limits described above. Existing
-legacy `nft-ruleset.json` and `netconfig-state.json` stores are read only when a
-new domain transaction record does not exist.
-
-Useful diagnostics on the host:
-
-```sh
-sudo journalctl -u ghostd.service -b
-sudo systemctl list-timers 'ghostd-revert-*'
-sudo journalctl -u 'ghostd-revert-*' -b
-sudo nft list table inet stack_ghostd
-```
-
-If a revert fails, its pending record remains. Correct the underlying command or
-filesystem failure using your independent management path, then restart ghostd
-to retry recovery. Stopping ghostd alone does not disarm outstanding timers and
-does not remove its firewall table. Avoid upgrades or uninstalling the binary
-until all pending leases have been confirmed or recovered.
-
-## Flags
-
-| Flag | Default | Purpose |
+| Item | Old | New |
 | --- | --- | --- |
-| `--port` | `7443` | TCP listener and firewall reachability-guard port |
-| `--deployer-tag` | `tag:stack-deployer` | Alternative caller node tag for mutations |
-| `--tailscale-interface` | `tailscale0` | Interface allowed by the reachability guard |
-| `--store-dir` | `/var/lib/ghostd/last-good` | Durable transaction storage |
-| `--watchdog-sec` | `0` | Watchdog interval setting; match systemd `WatchdogSec` |
-| `--render-firewall` | false | Render stdin JSON to nft syntax and exit |
-| `--revert-lease`, `--revert-domain` | empty | Internal timer recovery command |
+| Go module path | `smarthome/ghostd` | `github.com/xaiki/ghostd` |
+| proto `go_package` | `smarthome/ghostd/proto` | `github.com/xaiki/ghostd/proto` |
+| systemd unit | `smarthome-ghostd.service` | `ghostd.service` |
+| Installed binary | `/opt/smarthome/ghostd/ghostd` | `/opt/ghostd/ghostd` |
+| Unit file | `/etc/systemd/system/smarthome-ghostd.service` | `/etc/systemd/system/ghostd.service` |
+| State directory | `/var/lib/smarthome-ghostd/last-good` | `/var/lib/ghostd/last-good` |
+| Runtime directory | `/run/smarthome-ghostd` | `/run/ghostd` |
+| Revert timer units | `smarthome-ghostd-revert-*` | `ghostd-revert-*` |
 
-Use a systemd `ExecStart` override for different settings. Keep the daemon and
-render-only flags consistent when reviewing the resulting rules.
+Unchanged, and deliberately not renamed: the `ghostd.local/cap/deploy` and
+`ghostd.local/cap/report` capability namespaces, the default deployer tag
+`tag:stack-deployer`, the default listen port 7443, and the domain names.
 
-## Tests
+To migrate a host, in order:
 
-```sh
-go test ./...
-go test -race ./...
-go vet ./...
-```
+1. Confirm every pending lease, or let it recover, then stop the old unit. Do not
+   uninstall the old binary while a revert timer is outstanding.
+2. Move the state directory so confirmed state and the DHCP ledger survive:
+   `sudo mv /var/lib/smarthome-ghostd /var/lib/ghostd`.
+3. Install the new binary at `/opt/ghostd/ghostd` and the new unit as
+   `/etc/systemd/system/ghostd.service`.
+4. `sudo systemctl daemon-reload`, then `sudo systemctl disable --now
+   smarthome-ghostd.service` and `sudo systemctl enable --now ghostd.service`.
+5. Check `systemctl list-timers 'ghostd-revert-*'` and confirm the daemon
+   restored the expected state. Remove the old unit and binary once no old timer
+   remains.
 
-Tests normally use fake command runners. Privileged integration tests are opt-in.
-Run them only in a **disposable Linux VM** with nftables, iproute2, and systemd:
-network namespaces isolate nft tests, but the other tests create transient units
-and temporary files under the real `/etc/network/interfaces.d/`.
+## Documentation
 
-```sh
-go test -c ./internal/nft -o /tmp/ghostd-nft.test
-go test -c ./cmd/ghostd -o /tmp/ghostd-main.test
-go test -c ./internal/state -o /tmp/ghostd-state.test
-go test -c ./internal/netconfig -o /tmp/ghostd-netconfig.test
-sudo unshare -n env GHOSTD_NFT_INTEGRATION=1 /tmp/ghostd-nft.test -test.run TestIntegration -test.v
-sudo unshare -n env GHOSTD_NFT_INTEGRATION=1 /tmp/ghostd-main.test -test.run TestIntegration -test.v
-sudo env GHOSTD_SYSTEMD_INTEGRATION=1 /tmp/ghostd-state.test -test.run TestIntegration -test.v
-sudo unshare -n env GHOSTD_NETCONFIG_INTEGRATION=1 /tmp/ghostd-netconfig.test -test.run TestIntegration -test.v
-```
-
-Integration coverage includes repeated firewall replacement, rule withdrawal,
-foreign-table preservation, first-apply recovery, stale timer handling, durable
-boot recovery, timer cancellation/firing, and netconfig file restoration.
-These checks do not replace a real-tailnet connectivity test before deployment.
-
-To regenerate Go bindings, use `protoc` with `protoc-gen-go` and
-`protoc-gen-go-grpc` on `PATH` (generator versions are recorded in the generated
-files):
-
-```sh
-protoc -I proto --go_out=proto --go_opt=paths=source_relative \
-  --go-grpc_out=proto --go-grpc_opt=paths=source_relative proto/ghoststate.proto
-```
+| Document | Contents |
+| --- | --- |
+| [docs/README.md](docs/README.md) | Documentation index |
+| [docs/security.md](docs/security.md) | Authentication, capabilities and the privilege model |
+| [docs/operations.md](docs/operations.md) | RPC workflow, persistence, recovery, flags, tests |
+| [docs/firewall.md](docs/firewall.md) | Firewall domain: zones, services, NAT, redirects, output policy |
+| [docs/netconfig.md](docs/netconfig.md) | Netconfig domain: files, actions, rollback limits |
+| [docs/adoption.md](docs/adoption.md) | Observing and adopting an unmanaged host |
+| [docs/dhcp.md](docs/dhcp.md) | DHCP, authoritative DNS, device identity, dnsmasq takeover |
+| [docs/dhcp-dns-identity.md](docs/dhcp-dns-identity.md) | Design: registry, allocation and identity model |
+| [docs/dhcp-remaining.md](docs/dhcp-remaining.md) | Known gaps and remaining DHCP/DNS work |
+| [docs/lan-discovery.md](docs/lan-discovery.md) | Planned, not built: LAN DNS-SD on behalf of containers |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Build, test, lint and proto-generation workflow |
 
 ## License
 
 ghostd is licensed under **GNU GPL version 2 only** (`GPL-2.0-only`), without
-warranty. See [LICENSE](LICENSE). Third-party dependencies retain their respective
+warranty. See [LICENSE](LICENSE). Third-party dependencies retain their own
 licenses; this notice covers ghostd's own source.
-
-### Redirect-only adoption
-
-`redirect_only: true` with interface-scoped zones and `redirects` manages only
-NAT in the owned table, preserving existing host filtering. Filtering fields in
-this mode are rejected; it cannot replace an existing ghostd filter table.
-The client uses `firewall-redirect-v1` so older daemons reject the request rather
-than silently installing a full filtering policy. Leases, rollback and fresh
-connection confirmation use the existing firewall transaction domain.
-
-### Container DNS
-
-The daemon embeds CoreDNS (bind, cache, forward, and a small `ghostlocal`
-plugin) on TCP/UDP port 53 of its own tailnet address. It never binds a public
-wildcard or rewrites the host's resolver. `.local` A/AAAA queries use the host's
-NSS resolver through bounded `getent` calls, preserving Avahi support even in
-our static, cgo-free binary. Other queries go to Tailscale's Quad100 resolver;
-answers are cached for at most 30 seconds. A failed host lookup returns SERVFAIL,
-not a fabricated address; missing names return NXDOMAIN.
-
-After binding successfully, ghostd atomically publishes
-`/run/ghostd/dns.env` and `resolv.conf`. Systemd owns this runtime
-directory. Generated bridged Quadlets on ghostd-enabled hosts read `dns.env`
-into the service environment and pass its address as Podman's upstream DNS.
-Aardvark continues answering container aliases. The resolver file is available
-for clients without Podman discovery; mounting it over a Podman container's
-resolver would bypass that discovery and is not the default.
-
-Apply ghostd before restarting generated containers; move also prepares it on
-the destination and dependent hosts. Existing containers pick up DNS changes
-when recreated. DNS bind conflicts fail daemon startup with an explicit error.
-The firewall permits DNS input from standard Podman bridge interfaces; custom
-bridge interface names need their corresponding DNS permission in the declared
-firewall zone.
-
-Per-container DNS ACLs are not enforced by this first resolver integration.
-Aardvark/NAT can hide the original container identity, so policy must not infer
-identity from the forwarded source address. An authenticated or isolated
-per-container query path is needed before allowlists can provide isolation.
-Any policy check must run before the shared cache, and network access still
-requires firewall enforcement independently of DNS visibility.
-
-
-### DHCP and device identity
-
-The optional `dhcp-v1` domain serves explicitly declared IPv4/IPv6
-scopes with authoritative DNS and a durable lease/event ledger. Configuration
-rollback never rewinds leases. `GetRegistry`, `ImportLeases` and `ReportHost`
-provide attribution and controlled adoption; reporters use their authenticated
-Tailscale stable node identity and a separate report capability. See
-[configuration, handover and verification](docs/dhcp.md).
-DHCPv6 IA_NA, RA, relay admission and transactional dnsmasq takeover/rollback
-are included. Prefix delegation and multi-authority HA are separate increments.
-
-### LAN discovery
-
-Planned, not implemented. The domain advertises and browses DNS-SD on behalf of
-containers, which sit on a Podman bridge that mDNS multicast does not cross — so a
-containerized app can neither advertise itself nor see a LAN service, and we will
-not install Avahi to close that instead. Reasoning, consumers, the airgap with host
-Avahi and the open questions live in [docs/lan-discovery.md](docs/lan-discovery.md).
-
-Wiring follows the newest domain (`dhcp-v1`) rather than inventing a shape:
-`rpc/server.go` (domain constant, `Apply` case, `legacyName`, the `Confirm` loop,
-`GetState`, the server field), `state/transaction.go`'s domain allowlist,
-`cmd/ghostd/main.go` (`prepareDomain`/`recoverDomain`/`--revert-domain`),
-`proto/ghoststate.proto` with regenerated Go, and `state/lease.go`. The reconciler
-imitates `addressbook.Manager.Apply` — desired set in, live listeners out, close
-what is no longer wanted — and rollback rides the existing lease/revert timer.
-Wire structs parse with `DisallowUnknownFields`, so the daemon must be upgraded
-before a new field arrives; use a versioned domain so an older daemon rejects the
-request instead of mis-rendering it. DNS-SD is plain DNS and `miekg/dns` is already
-a dependency; the binary is cgo-free, so there is no `libavahi` binding to reach
-for.
-
-Two obligations this domain owns before it is worth anything, both argued in the
-design doc rather than restated here: **resolution must be answered here before any
-host Avahi is retired** (context `.local` lookups currently end in `getent`), and a
-per-container class allowlist needs an identity, because a reflected multicast
-stream carries none and a packet cannot be filtered per container on a shared
-bridge.

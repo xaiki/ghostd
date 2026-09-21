@@ -1,18 +1,15 @@
-// Package netconfig owns the netconfig domain's read and execute side
-// (FIREWALL.md Phase 5). The pure planning — which files a machine's
-// projection wants, which `ip`/`sysctl` steps live state still needs — stays
-// entirely in machines.net_ifaces (plan_network/desired_files/live_actions,
-// reused unchanged per FIREWALL.md); this package is only the executor,
-// the same relationship internal/nft has with machines.firewall_schema.
+// Package netconfig owns the netconfig domain's read and execute side. The
+// pure planning — which files a machine wants, which `ip`/`sysctl` steps live
+// state still needs — stays entirely with the client; this package is only
+// the executor, the same relationship internal/nft has with the client's
+// firewall schema.
 //
 // Every action this package recognizes is additive by construction — no
-// action kind here ever removes an address or brings an interface down.
-// That is FIREWALL.md's own stated invariant for this domain ("Netconfig
-// keeps net_ifaces.py's existing invariants... Additive only"), and Apply
-// enforces it as a hard refusal (see Validate) rather than trusting the
-// caller, since Apply is the one place a malformed desired_state_json from
-// anywhere could otherwise slip an unrecognized, non-additive action past
-// every other layer of review.
+// action kind here ever removes an address or brings an interface down. That
+// invariant is enforced as a hard refusal (see Validate) rather than trusted
+// from the caller, since Apply is the one place a malformed
+// desired_state_json from anywhere could otherwise slip an unrecognized,
+// non-additive action past every other layer of review.
 package netconfig
 
 import (
@@ -30,9 +27,8 @@ import (
 )
 
 // InterfacesDir is the one directory this package ever writes to or reads
-// from — the same path machines.net_ifaces.py has always written
-// `/etc/network/interfaces.d/stack-*.conf` into. Validate refuses any
-// desired-state file path outside it.
+// from. Validate refuses any desired-state file path outside it, and the
+// conventional file naming inside it is `stack-*.conf`.
 const InterfacesDir = "/etc/network/interfaces.d"
 
 var forwardingFiles = map[string]bool{
@@ -52,13 +48,11 @@ func (ExecRunner) Output(ctx context.Context, name string, args ...string) ([]by
 	return exec.CommandContext(ctx, name, args...).CombinedOutput()
 }
 
-// DesiredState is the JSON shape Nornir sends in ApplyRequest.desired_state_json
-// for domain="netconfig" — the *complete* file set
-// (machines.net_ifaces.desired_files) plus the live actions still needed
-// (machines.net_ifaces.live_actions), rendered straight from the
-// NetworkPlan Nornir's own plan_network already computed. Each action is
-// `[kind, ...args]`, matching that Python action tuple's own shape
-// one-for-one — see machines.net_ifaces.ghostd_desired_state_json.
+// DesiredState is the JSON shape a client sends in
+// ApplyRequest.desired_state_json for domain="netconfig": the *complete* file
+// set the host should have, plus the live actions still needed to reach it,
+// rendered from the plan the client already computed. Each action is
+// `[kind, ...args]`. See docs/netconfig.md.
 type DesiredState struct {
 	ExpectedFilesSHA256 map[string]string `json:"expected_files_sha256,omitempty"`
 	Files               map[string]string `json:"files"`
@@ -152,14 +146,12 @@ func Validate(ds DesiredState) error {
 
 // validateNoConflictingAddresses refuses a desired state where two "addr"
 // actions claim the same bare address — e.g. 10.0.0.1/24 on one device and
-// 10.0.0.1/32 on another. This is the wire-side twin of
-// machines.net_ifaces._check_no_conflicting_addresses: Nornir's own
-// planning already refuses this before it ever renders a desired_state_json
-// (see that function's doc), but Apply is the one point any malformed
-// desired_state_json — from a bug, not just this codebase's own client —
-// would otherwise slip past. Same discipline as everywhere else in this
-// package: refuse outright rather than pick a winner between the
-// conflicting declarations.
+// 10.0.0.1/32 on another. The client's own planning is expected to have
+// refused this before it ever rendered a desired_state_json, but Apply is the
+// one point any malformed desired_state_json — from a bug, not just this
+// codebase's own client — would otherwise slip past. Same discipline as
+// everywhere else in this package: refuse outright rather than pick a winner
+// between the conflicting declarations.
 func validateNoConflictingAddresses(actions [][]string) error {
 	claims := map[string]map[string]bool{} // bare ip -> set of "dev ip" pairs
 	for _, action := range actions {
@@ -238,12 +230,11 @@ func writeFile(path, content string) error {
 
 // Apply writes every declared file, then executes every action, in order.
 // It is idempotent by construction: `ds` is the *complete* target, not a
-// pre-vetted diff (this daemon does not decide policy, see FIREWALL.md),
-// and a boot-time or dead-man's-switch Restore replays exactly this
-// function against whatever is already live — so each action tolerates
-// "already applied" itself, the same fallback-on-failure idiom
-// machines.net_ifaces.render_converge_script's bash already used (`ip link
-// add ... || ip link show ...`), just as Go exec calls instead of shell
+// pre-vetted diff (this daemon does not decide policy, see docs/netconfig.md),
+// and a boot-time or dead-man's-switch Restore replays exactly this function
+// against whatever is already live — so each action tolerates "already
+// applied" itself, the same fallback-on-failure idiom of
+// `ip link add ... || ip link show ...`, as Go exec calls instead of shell
 // operators.
 func Apply(ctx context.Context, runner Runner, ds DesiredState) error {
 	if err := Validate(ds); err != nil {
@@ -375,11 +366,9 @@ func applyAction(ctx context.Context, runner Runner, action []string) error {
 }
 
 // LiveState is GetState's netconfig half: the persisted interfaces.d file
-// bytes plus live addressing/forwarding, structured — the same facts
-// machines.net_ifaces._live_state/parse_network_live already read over SSH,
-// now read directly by the daemon and returned over RPC. Diffable, because
-// Nornir still does the diffing (machines.net_ifaces.plan_network, reused
-// unchanged).
+// bytes plus live addressing/forwarding, structured. Diffable, because the
+// diffing itself still belongs to the client: the daemon reports facts and
+// executes a decided target, and never computes the target itself.
 type LiveState struct {
 	Observation       map[string]json.RawMessage `json:"observation,omitempty"`
 	ObservationErrors map[string]string          `json:"observation_errors,omitempty"`
@@ -526,9 +515,8 @@ func ReadLiveJSON(ctx context.Context, runner Runner) (string, error) {
 // single-shot target, so replaying exactly what was live is both correct
 // and trivial. There is no equivalent for interface configuration —
 // re-deriving the actions needed to reach an observed `ip -j addr show`
-// snapshot is exactly the diffing machines.net_ifaces.live_actions already
-// owns, and duplicating that logic here would be a second, driftable copy
-// of it. Replaying the already-decided, already-applied DesiredState
+// snapshot is exactly the diffing the client already owns, and duplicating
+// that logic here would be a second, driftable copy of it. Replaying the already-decided, already-applied DesiredState
 // instead is simpler and just as safe: every action Apply runs is
 // additive and idempotent by construction (see applyAction's own
 // fallback-on-failure checks), so replaying them against whatever is live

@@ -22,7 +22,7 @@ RestartSec=5
 WatchdogSec=30
 # Root is the point: this daemon owns nftables/netconfig, the same
 # surfaces firewalld's polkit grant used to reach for a different user.
-# What changed is the authentication path (FIREWALL.md), not the
+# What changed is the authentication path (docs/security.md), not the
 # privilege level the work itself has always needed.
 User=root
 

@@ -9,11 +9,11 @@ import (
 )
 
 // ReachabilityGuard is what Apply always adds to the input chain itself,
-// never something a caller's desired_state can omit or override — the
-// "hard-coded reachability guard, independent of the dead-man's-switch"
-// FIREWALL.md requires: a desired_state that would leave this daemon's own
-// listener unreachable is refused before it is ever loaded into the
-// kernel, not rolled back five minutes later.
+// never something a caller's desired_state can omit or override: a hard-coded
+// reachability guard, independent of the dead-man's-switch. A desired_state
+// that would leave this daemon's own listener unreachable is refused before
+// it is ever loaded into the kernel, not rolled back five minutes later.
+// See docs/firewall.md.
 type ReachabilityGuard struct {
 	TailscaleInterface string
 	Port               int
@@ -280,7 +280,7 @@ func writePostroutingChain(b *strings.Builder, ds DesiredState, names []string) 
 func writeZoneChain(b *strings.Builder, name string, zone Zone) error {
 	fmt.Fprintf(b, "  chain zone_%s {\n", name)
 	if name == "trusted" {
-		// The one intentional builtin reuse (docs/ops/firewall.md): full
+		// The one intentional builtin reuse (docs/firewall.md): full
 		// accept, matching firewalld's own trusted-zone convention this
 		// schema was already written against.
 		b.WriteString("    accept\n")

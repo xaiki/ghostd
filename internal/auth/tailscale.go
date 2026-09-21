@@ -1,7 +1,7 @@
 // Package auth resolves and authorizes every RPC caller through the host's
-// own tailscaled — never through which Unix user is making the call. See
-// FIREWALL.md: this is the whole reason ghostd exists instead of another
-// firewalld-shaped polkit grant.
+// own tailscaled — never through which Unix user is making the call. This is
+// the whole reason ghostd exists instead of another firewalld-shaped polkit
+// grant; see docs/security.md.
 package auth
 
 import (
@@ -50,7 +50,7 @@ var ErrNotOnTailnet = errors.New("auth: caller is not a recognized tailnet peer"
 // Reachability itself is the first gate: the RPC listener only ever binds the tailscale interface
 // (cmd/ghostd/main.go), so a caller reaching this code already dialed in over
 // the tailnet — WhoIs is what turns "reached the socket" into "is this
-// identity", the gate FIREWALL.md means by "never Unix login".
+// identity", the gate that replaces Unix login.
 type Authenticator struct {
 	client      WhoIs
 	deployerTag string

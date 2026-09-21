@@ -13,9 +13,8 @@ func send(state string) error {
 	addr := os.Getenv("NOTIFY_SOCKET")
 	if addr == "" {
 		// Not running under systemd (a dev shell, a test) — silently a
-		// no-op, the same "no watcher, no error" contract
-		// machines.host_progress's report_item follows on the Python
-		// side for the same reason: this must never be why the daemon
+		// no-op: the same "no watcher, no error" contract the rest of the
+		// daemon follows, because this must never be why the daemon
 		// fails to start.
 		return nil
 	}
