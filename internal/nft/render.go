@@ -96,7 +96,7 @@ func validInterface(name string) bool {
 func validPort(port int) bool { return port >= 1 && port <= 65535 }
 
 func validate(ds DesiredState) error {
-	if ds.RedirectOnly && (ds.Output != nil || ds.Ingress != nil) {
+	if ds.RedirectOnly && (ds.Output != nil || ds.Ingress != nil || ds.AllowDNATForward) {
 		return fmt.Errorf("nft: redirect-only policy cannot contain output or ingress policy")
 	}
 	if err := validateOutput(ds.Output); err != nil {
@@ -244,6 +244,9 @@ func writeForwardChain(b *strings.Builder, ds DesiredState, names []string) {
 	b.WriteString("  chain forward {\n")
 	b.WriteString("    type filter hook forward priority 0; policy drop;\n")
 	b.WriteString("    ct state established,related accept\n")
+	if ds.AllowDNATForward {
+		b.WriteString("    ct status dnat accept\n")
+	}
 	for _, name := range names {
 		zone := ds.Zones[name]
 		for _, egress := range sortedStrings(zone.Forward) {

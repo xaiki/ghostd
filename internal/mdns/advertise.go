@@ -378,12 +378,17 @@ func (c Config) validateReflect() error {
 			return fmt.Errorf("mdns: network %s has two reflect rules; a network is one permission set, list its services once", r.Network)
 		}
 		networks[r.Network] = true
-		if len(r.AllowServices) == 0 || len(r.AllowServices) > 32 {
+		if (len(r.AllowServices) == 0 && r.Advertise == nil) || len(r.AllowServices) > 32 {
 			return fmt.Errorf("mdns: network %s needs 1..32 allow_services", r.Network)
 		}
 		for _, s := range r.AllowServices {
 			if !serviceRE.MatchString(s) {
 				return fmt.Errorf("mdns: %q is not a service class like _ipp._tcp", s)
+			}
+		}
+		if r.Advertise != nil {
+			if err := r.Advertise.validate(); err != nil {
+				return fmt.Errorf("mdns: network %s: %w", r.Network, err)
 			}
 		}
 	}

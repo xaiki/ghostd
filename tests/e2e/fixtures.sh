@@ -58,5 +58,6 @@ for n in 0 1; do
 		nsenter --net="/run/netns/$ns" -- ip addr add "10.9$n.0.10/24" dev "${ns}p"
 		nsenter --net="/run/netns/$ns" -- ip link set "${ns}p" up
 		nsenter --net="/run/netns/$ns" -- ip route add 224.0.0.0/4 dev "${ns}p"
+		nsenter --net="/run/netns/$ns" -- ip route add default via "10.9$n.0.1"
 	fi
 done

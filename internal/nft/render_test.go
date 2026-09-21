@@ -348,3 +348,39 @@ func TestTFTPServiceAttachesConntrackHelper(t *testing.T) {
 		t.Fatal("helper attached without the service")
 	}
 }
+
+func TestAllowDNATForwardAdmitsOnlyTranslatedFlows(t *testing.T) {
+	render := func(doc string) string {
+		t.Helper()
+		desired, err := ParseDesiredState(doc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out, err := Render(desired, ReachabilityGuard{TailscaleInterface: "tailscale0", Port: 7443})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	on := render(`{"allow_dnat_forward":true,"zones":{"trusted":{"interfaces":["tailscale0"]}}}`)
+	i := strings.Index(on, "chain forward")
+	j := strings.Index(on[i:], "}")
+	if !strings.Contains(on[i:i+j], "ct status dnat accept") || !strings.Contains(on[i:i+j], "policy drop") {
+		t.Fatalf("forward chain:\n%s", on[i:i+j])
+	}
+	if off := render(`{"zones":{"trusted":{"interfaces":["tailscale0"]}}}`); strings.Contains(off, "ct status dnat") {
+		t.Fatal("dnat forwarding admitted without asking")
+	}
+	if _, err := Render(mustParse(t, `{"redirect_only":true,"allow_dnat_forward":true,"zones":{"lan":{"interfaces":["eth0"]}}}`), ReachabilityGuard{}); err == nil {
+		t.Fatal("a filtering field was accepted in redirect-only mode")
+	}
+}
+
+func mustParse(t *testing.T, doc string) DesiredState {
+	t.Helper()
+	d, err := ParseDesiredState(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return d
+}

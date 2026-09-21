@@ -37,6 +37,9 @@ type ReflectRule struct {
 	Network string `json:"network"`
 	// AllowServices are the DNS-SD classes (_ipp._tcp) this network may browse.
 	AllowServices []string `json:"allow_services"`
+	// Advertise re-advertises the container network's own service instances on the
+	// LAN under ghostd's address, with DNAT into the container (see nat.go).
+	Advertise *NATConfig `json:"advertise,omitempty"`
 }
 
 // classOf extracts the "_type._proto" a DNS-SD name belongs to, whether it is

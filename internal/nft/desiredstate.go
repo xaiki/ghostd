@@ -19,6 +19,11 @@ type DesiredState struct {
 	Zones        map[string]Zone `json:"zones"`
 	Ingress      *Ingress        `json:"ingress,omitempty"`
 	Output       *OutputPolicy   `json:"output,omitempty"`
+	// AllowDNATForward accepts forwarded flows that another table DNATed (`ct
+	// status dnat`). The mdns NAT installs its own DNAT table; without this the
+	// default-drop forward policy here would discard the translated flows. Only
+	// connections that a DNAT rule actually rewrote are admitted.
+	AllowDNATForward bool `json:"allow_dnat_forward,omitempty"`
 }
 
 type Zone struct {

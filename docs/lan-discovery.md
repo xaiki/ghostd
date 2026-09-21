@@ -18,7 +18,7 @@ below; the analysis after it is kept because it is why those decisions were made
 | Conflicts | Before advertising, ghostd **probes** each name; a name another host already owns refuses the apply and leaves the previous set running. Lab: avahi owns "Lobby Printer"; advertising over it is refused. | `internal/mdns/service.go` |
 | Records are captured, not recalled | Unchanged. ghostd ships **no** Time Machine record set: supply one captured from a known-good advertisement. | — |
 
-The reflector's one deliberate limit: a container's own advertisements are not reflected out, because its address is private to the bridge; anything that must be found from the LAN is declared in `mdns-v1` with the host's address and published port. The ACL, the reflector and the mDNS domain are described for operators in [dhcp.md](dhcp.md#per-container-dns-acl)
+A container's own advertisements go out through an **mDNS NAT**: ghostd re-advertises each instance on the LAN under its own address and a pooled port, with a DNAT (in its own nft table) into the container, so LAN clients find and reach a container service with no host networking. (`records` still declares what ghostd itself serves.) The ACL, the reflector, the NAT and the mDNS domain are described for operators in [dhcp.md](dhcp.md#per-container-dns-acl)
 and [operations.md](operations.md#mdns-advertisement).
 
 ## Analysis (why)

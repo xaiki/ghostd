@@ -207,10 +207,36 @@ TXT, and the address records of the hosts their SRVs point at, remembered for tw
 minutes); nothing else — no other class, no service enumeration, no unrelated
 host. Toward the LAN go only the container's *queries* for allowed classes and the
 hosts those services named. One rule per network (a network is one permission
-set); `records` and `host` are needed only if you also advertise. A container's own
-advertisements are not reflected outward (its address is private to the bridge):
-declare anything the LAN must find in `records`. The container bridge's firewall
-zone needs the `mdns` service.
+set); `records` and `host` are needed only if you also advertise. The container
+bridge's firewall zone needs the `mdns` service.
+
+#### mDNS NAT: containers advertising to the LAN
+
+A service a container advertises on its bridge names a bridge-private address, so
+reflecting it as-is would send LAN clients somewhere they cannot reach. Add
+`advertise` to the rule and ghostd does what a router would:
+
+```json
+{"lan": "eth0", "network": "podman-print",
+ "advertise": {"services": ["_ipp._tcp"], "ports": "20000-20999"}}
+```
+
+It learns the container's instances (PTR, SRV, TXT and its host's address, goodbyes
+included), re-advertises each on the LAN under **ghostd's own LAN address**, the
+network's host name (`podman-print.local`) and a **port from the pool** (stable per
+container address and port), and installs a DNAT from that port to the container's
+address and port in its own nft table (`ghostd_mdns_nat`, replaced atomically,
+removed on stop). A LAN client browsing `_ipp._tcp` finds the container's service
+and its connection lands in the container: no host networking, nothing published by
+hand, and the bridge address is never disclosed. It also answers LAN queries from
+what it learned and relays them to the network so the container refreshes. Records
+lapse with their own TTLs. Only IPv4 is mapped, so only IPv4 is published.
+
+The firewall must let the translated flows through its default-drop forward
+policy: set `"allow_dnat_forward": true` in the firewall target (it admits only
+connections a DNAT rule actually rewrote, `ct status dnat`), enable IPv4
+forwarding in netconfig, and give the container network's zone the `mdns` service.
+Instance names are not conflict-probed on the LAN: keep them distinct.
 
 ## Environment
 

@@ -37,6 +37,7 @@ disposable containers.
 | Per-container DNS ACL | Listener identity, checked before lease answers and cache, per-identity cache, per-identity host grants | unit; integration (loopback aliases); e2e (avahi + python-zeroconf) |
 | mDNS without avahi on the host | Native legacy-unicast client | unit; e2e |
 | Per-container mDNS reflector | Per-network filters: allowed classes and the hosts they name inward, allowed queries outward | unit; e2e (avahi on the LAN, python-zeroconf inside two container-network namespaces: each sees only its own class, by browse and by name) |
+| mDNS NAT | Container advertisements re-advertised on the LAN at ghostd's address and a pooled port, DNAT into the container, goodbyes and expiry | unit; e2e (python-zeroconf advertiser inside a container network, avahi/zeroconf client on the LAN: found, resolved to ghostd:port, TCP connection lands in the container, withdrawn on goodbye) |
 | LAN advertisement | `mdns-v1` with probing and conflict refusal | unit; e2e (avahi as a competing responder, python-zeroconf as the client, across a reboot) |
 | TFTP/PXE | `boot` + `tftp`, converter support | unit; e2e (dnsmasq, then ghostd, serve a boot file to busybox tftp behind the firewall) |
 | DHCPv6 prefix delegation | `pd` pool, ledger, attribution, kernel routes | unit; dhcp-lab (`dhclient -6 -P`, route installed and removed) |
@@ -56,10 +57,11 @@ detection.
   standby with fenced, manual promotion. Not covered: a lab with two real daemons
   (the standby is tested over real gRPC between two ledgers, not two systemd
   services), and restarting a demoted leader as a follower is an operator step.
-- **Reflector limits.** It is per container network by design (the network carries
-  the permission); a container's own advertisements are not reflected outward, so
-  LAN-visible services are declared in `mdns-v1`. IPv6 reflection is implemented
-  but lab-tested on IPv4 only.
+- **Reflector and NAT limits.** Per container network by design (the network
+  carries the permission). The NAT maps IPv4 only, does not conflict-probe the
+  instance names it re-advertises on the LAN, and learns from what a container
+  announces (a container that never announces is never mapped). IPv6 reflection is
+  implemented but lab-tested on IPv4 only.
 - **DHCPv6 PD is not part of a dnsmasq takeover**, because dnsmasq's lease file
   cannot carry it; delegations are added with an ordinary apply afterwards. Relayed
   requests route via the relay's recorded peer-address, but that path is

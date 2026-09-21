@@ -21,7 +21,7 @@ trap cleanup EXIT HUP INT TERM
 for cmd in ghostd:./cmd/ghostd fakets:./tests/e2e/fakets probe:./tests/e2e/probe; do
 	GOOS=linux GOARCH="$arch" CGO_ENABLED=0 go build -trimpath -tags "${GHOSTD_TAGS-tailscale dhcp dnsmasq mdns coredns}" -o "$bin/${cmd%%:*}" "${cmd#*:}"
 done
-cp tests/e2e/fixtures.sh tests/e2e/zc.py "$bin/"
+cp tests/e2e/fixtures.sh tests/e2e/zc.py tests/e2e/zcadv.py "$bin/"
 podman build -q -t localhost/ghostd-dhcp-lab -f tests/dhcp-lab/Containerfile tests/dhcp-lab >/dev/null
 podman rm -f "$name" >/dev/null 2>&1 || true
 podman run -d --name "$name" --privileged --systemd=always --network none \

@@ -83,6 +83,13 @@ zone-to-zone `forward` declarations, which name an egress zone that must exist.
 Kernel forwarding must also be enabled separately — that is the `sysctl` action
 in the [netconfig](netconfig.md) domain, not a firewall feature.
 
+### DNAT forwarding
+
+`"allow_dnat_forward": true` adds `ct status dnat accept` to the forward chain, so
+flows another table DNATed (the mDNS NAT's `ghostd_mdns_nat`) pass the default-drop
+forward policy. It admits only connections a DNAT rule actually rewrote, and is not
+allowed in redirect-only mode.
+
 ### Services
 
 Legacy `services` names are `mdns`, `tftp`, `dns`, `dhcp`, `dhcpv6-client`, `http`

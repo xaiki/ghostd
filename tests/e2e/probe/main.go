@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/miekg/dns"
@@ -224,7 +225,7 @@ func bindingFor(address string) map[string]any {
 	return nil
 }
 
-const firewallDoc = `{"zones":{"trusted":{"interfaces":["tailscale0"]},"ctr":{"interfaces":["ctr0","ctr1"],"services":["mdns"]},"lan":{"interfaces":["lab0"],"services":["dns","dhcp","mdns","tftp"],"ports":[{"port":%d,"proto":"tcp"}]}}}`
+const firewallDoc = `{"allow_dnat_forward":true,"zones":{"trusted":{"interfaces":["tailscale0"]},"ctr":{"interfaces":["ctr0","ctr1"],"services":["mdns"]},"lan":{"interfaces":["lab0"],"services":["dns","dhcp","mdns","tftp"],"ports":[{"port":%d,"proto":"tcp"}]}}}`
 
 func target(enabled bool) string {
 	return fmt.Sprintf(`{"scopes":[{"id":"lan","interface":"lab0","subnet":"10.77.0.0/24","server":"10.77.0.1","router":"10.77.0.1","start":"10.77.0.10","end":"10.77.0.30","zone":"lab.home.arpa","lease_seconds":600,"enabled":%t}],"devices":[]}`, enabled)
@@ -430,7 +431,7 @@ func dnsPhase() {
 	mdnsPhase()
 }
 
-const mdnsAdvert = `{"interfaces":["lab0"],"host":"nas","reflect":[{"lan":"lab0","network":"ctr0","allow_services":["_ipp._tcp"]},{"lan":"lab0","network":"ctr1","allow_services":["_googlecast._tcp"]}],"records":[{"service":"_smb._tcp","instance":"NAS Share","port":445},{"service":"_ipp._tcp","instance":"Shared Queue","port":631,"txt":["rp=ipp/print"],"subtypes":["_universal"]}]}`
+const mdnsAdvert = `{"interfaces":["lab0"],"host":"nas","reflect":[{"lan":"lab0","network":"ctr0","allow_services":["_ipp._tcp"],"advertise":{"services":["_ipp._tcp"],"ports":"20000-20099"}},{"lan":"lab0","network":"ctr1","allow_services":["_googlecast._tcp"]}],"records":[{"service":"_smb._tcp","instance":"NAS Share","port":445},{"service":"_ipp._tcp","instance":"Shared Queue","port":631,"txt":["rp=ipp/print"],"subtypes":["_universal"]}]}`
 
 // zc asks the LAN's multicast DNS as another host would: python-zeroconf, an
 // independent implementation, inside the printer's namespace.
@@ -441,6 +442,38 @@ func zcIn(ns, addr string, args ...string) string {
 	cmd := exec.Command("nsenter", append([]string{"--net=/run/netns/" + ns, "--", "env", "ZC_IFACE=" + addr, "python3", "/opt/ghostd/zc.py"}, args...)...)
 	out, _ := cmd.CombinedOutput()
 	return strings.TrimSpace(string(out))
+}
+
+// natPhase: a container advertises a service on its own network; the LAN finds it at
+// ghostd's address and a mapped port, and a connection there lands in the container.
+func natPhase() {
+	step("mDNS NAT: a container's own advertisement is re-advertised on the LAN and reachable through DNAT")
+	adv := exec.Command("nsenter", "--net=/run/netns/cnt0", "--", "env", "ZC_IFACE=10.90.0.10", "python3", "/opt/ghostd/zcadv.py", "Container Printer", "cprinter", "10.90.0.10", "6310", "600")
+	must(adv.Start(), "start the container advertiser")
+	defer func() { adv.Process.Signal(syscall.SIGTERM); adv.Wait() }()
+	var info string
+	eventually("the LAN to find the container's service", 40*time.Second, func() bool {
+		info = zc("info", "_ipp._tcp.local.", "Container Printer._ipp._tcp.local.")
+		return strings.Contains(info, "port=") && !strings.Contains(info, "port=6310")
+	})
+	port := 0
+	fmt.Sscanf(info[strings.Index(info, "port=")+5:], "%d", &port)
+	check(port >= 20000 && port <= 20099, "the LAN sees a mapped port, not the container's 6310: %s", info)
+	check(strings.Contains(info, "addrs=10.77.0.1") && !strings.Contains(info, "10.90.0.10") && strings.Contains(info, "server=ctr0.local."), "at ghostd's LAN address, under the network's host name, never the bridge-private address: %s", info)
+	check(strings.Contains(info, "txt=rp=ipp/print"), "with its TXT record intact")
+	check(strings.Contains(zc("browse", "_ipp._tcp.local."), "Container Printer"), "browse on the LAN lists it")
+	tab, _ := sh("nft", "list", "table", "inet", "ghostd_mdns_nat")
+	check(strings.Contains(tab, fmt.Sprintf("dport %d dnat ip to 10.90.0.10:6310", port)), "a DNAT was installed in ghostd's own table")
+	banner, err := sh("nsenter", "--net=/run/netns/printer", "--", "python3", "-c", fmt.Sprintf("import socket;s=socket.create_connection(('10.77.0.1',%d),5);print(s.recv(100).decode().strip())", port))
+	check(err == nil && strings.Contains(banner, "HELLO-FROM-CONTAINER Container Printer"), "a LAN client's connection to ghostd:%d lands in the container (%q, %v)", port, banner, err)
+	_, err = sh("nsenter", "--net=/run/netns/printer", "--", "python3", "-c", "import socket;socket.create_connection(('10.90.0.10',6310),2)")
+	check(err != nil, "the bridge-private address itself stays unreachable from the LAN")
+	adv.Process.Signal(syscall.SIGTERM)
+	adv.Wait()
+	eventually("the goodbye to withdraw the service and its DNAT", 30*time.Second, func() bool {
+		t, _ := sh("nft", "list", "table", "inet", "ghostd_mdns_nat")
+		return !strings.Contains(t, "dnat") && !strings.Contains(zc("browse", "_ipp._tcp.local."), "Container Printer")
+	})
 }
 
 func mdnsPhase() {
@@ -480,6 +513,8 @@ func mdnsPhase() {
 	check(strings.Contains(zcIn("cnt1", "10.91.0.10", "browse", "_googlecast._tcp.local."), "Lobby Speaker"), "ctr1 sees the speaker")
 	check(zcIn("cnt1", "10.91.0.10", "browse", "_ipp._tcp.local.") == "", "and not the printer")
 	check(zcIn("cnt1", "10.91.0.10", "info", "_ipp._tcp.local.", "Lobby Printer._ipp._tcp.local.") == "none", "not even by name")
+
+	natPhase()
 
 	step("mDNS advertisement: a name another host already owns is refused, and the old set keeps answering")
 	clash := `{"interfaces":["lab0"],"host":"nas","records":[{"service":"_ipp._tcp","instance":"Lobby Printer","port":631}]}`

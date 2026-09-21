@@ -20,6 +20,8 @@ import (
 // another mDNS daemon: if avahi still holds it, Apply fails with the bind error
 // instead of two responders disagreeing about the same names.
 type Service struct {
+	// NAT installs the DNAT table; nil drives nft.
+	NAT   NATRunner
 	mu    sync.Mutex
 	cfg   Config
 	run   *running
@@ -52,6 +54,10 @@ type running struct {
 
 	advertise map[int]bool
 	rules     []*reflectRule
+	nats      []*natRule
+	natRunner NATRunner
+	// testEmit captures everything sent outward (interface index, message).
+	testEmit func(ifIndex int, m *dns.Msg)
 
 	mu      sync.Mutex
 	probing bool
@@ -132,6 +138,13 @@ func (s *Service) start(cfg Config) (*running, error) {
 			return nil, err
 		}
 		r.rules = append(r.rules, &reflectRule{cfg: rule, f: newFilter(rule.AllowServices), lan: lan.Index, net: ctr.Index})
+		if rule.Advertise != nil {
+			n, err := newNATRule(rule, lan.Index)
+			if err != nil {
+				return nil, err
+			}
+			r.nats = append(r.nats, n)
+		}
 	}
 	pc4, err := net.ListenPacket("udp4", "0.0.0.0:5353")
 	if err != nil {
@@ -158,12 +171,21 @@ func (s *Service) start(cfg Config) (*running, error) {
 			_ = r.c6.JoinGroup(&i, &net.UDPAddr{IP: group6.IP})
 		}
 	}
+	r.natRunner = s.NAT
+	if r.natRunner == nil {
+		r.natRunner = nftRunner{}
+	}
 	r.probing = len(cfg.Records) > 0
 	r.wg.Add(1)
 	go func() { defer r.wg.Done(); r.serve4() }()
 	if r.c6 != nil {
 		r.wg.Add(1)
 		go func() { defer r.wg.Done(); r.serve6() }()
+	}
+	if len(r.nats) > 0 {
+		r.applyNAT() // an empty table: nothing to map until a container announces
+		r.wg.Add(1)
+		go func() { defer r.wg.Done(); r.runNAT() }()
 	}
 	if len(cfg.Records) == 0 {
 		return r, nil // a pure reflector claims no names: nothing to probe or announce
@@ -234,6 +256,7 @@ func (r *running) announce(ttl uint32) {
 }
 
 func (r *running) stop() {
+	r.stopNAT()
 	r.announce(0) // goodbye
 	r.stopNoGoodbye()
 }
@@ -279,6 +302,8 @@ func (r *running) handle(data []byte, src *net.UDPAddr, ifIndex int, v6 bool) {
 		return
 	}
 	r.reflect(m, ifIndex, v6)
+	r.natLearn(m, ifIndex)
+	r.natAnswer(m, src, ifIndex, v6)
 	if !r.advertise[ifIndex] {
 		return
 	}
@@ -292,10 +317,14 @@ func (r *running) handle(data []byte, src *net.UDPAddr, ifIndex int, v6 bool) {
 		r.mu.Unlock()
 		return
 	}
-	resp := r.a.Answer(m, i.Name)
-	if resp == nil {
-		return
+	if resp := r.a.Answer(m, i.Name); resp != nil {
+		r.reply(m, resp, src, ifIndex, v6)
 	}
+}
+
+// reply sends resp to a querier the way RFC 6762 asks: multicast, or unicast for a
+// QU question or a legacy resolver (short TTLs, no cache-flush bit).
+func (r *running) reply(m, resp *dns.Msg, src *net.UDPAddr, ifIndex int, v6 bool) {
 	unicast := src.Port != 5353
 	for _, q := range m.Question {
 		if q.Qclass&0x8000 != 0 {
@@ -311,9 +340,6 @@ func (r *running) handle(data []byte, src *net.UDPAddr, ifIndex int, v6 bool) {
 		resp.Id = m.Id
 		resp.Question = m.Question
 		if src.Port != 5353 {
-			// Legacy unicast (RFC 6762 6.7): a plain DNS resolver is asking. Its
-			// answers must carry short TTLs and no cache-flush bit, or a stub
-			// resolver rejects them for a class mismatch.
 			for _, rr := range append(append([]dns.RR{}, resp.Answer...), resp.Extra...) {
 				h := rr.Header()
 				h.Class = dns.ClassINET
@@ -395,3 +421,15 @@ func (r *running) forward(m *dns.Msg, ifIndex int, v6 bool) {
 		r.send4(m, ifIndex, group4)
 	}
 }
+
+// emit multicasts a message out of one interface (both families).
+func (r *running) emit(ifIndex int, m *dns.Msg) {
+	if r.testEmit != nil {
+		r.testEmit(ifIndex, m)
+		return
+	}
+	r.send4(m, ifIndex, group4)
+	r.send6(m, ifIndex, group6)
+}
+
+var logf = log.Printf
