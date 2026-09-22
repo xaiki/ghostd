@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
+
+	"github.com/xaiki/ghostd/internal/wellknown"
 )
 
 func containerAnnouncement(host string, ip string, instance string, port uint16, ttl uint32) *dns.Msg {
@@ -187,7 +189,7 @@ func TestContainerServiceIsReadvertisedOnTheLANAndMapped(t *testing.T) {
 	}
 	pack := func(m *dns.Msg) []byte { b, _ := m.Pack(); return b }
 	// The container announces on its bridge.
-	r.handle(pack(containerAnnouncement("printer", "10.90.0.10", "Office", 631, 120)), &net.UDPAddr{IP: net.ParseIP("10.90.0.10"), Port: 5353}, 10, false)
+	r.handle(pack(containerAnnouncement("printer", "10.90.0.10", "Office", 631, 120)), &net.UDPAddr{IP: net.ParseIP("10.90.0.10"), Port: wellknown.PortMDNS}, 10, false)
 	pub := n.published()
 	if len(pub) != 1 {
 		t.Fatal(pub)
@@ -230,7 +232,7 @@ func TestContainerServiceIsReadvertisedOnTheLANAndMapped(t *testing.T) {
 	r.testForward = func(idx int, m *dns.Msg) { forwarded = append(forwarded, idx) }
 	q := new(dns.Msg)
 	q.SetQuestion("_ipp._tcp.local.", dns.TypePTR)
-	r.handle(pack(q), &net.UDPAddr{IP: net.ParseIP("10.77.0.60"), Port: 5353}, 1, false)
+	r.handle(pack(q), &net.UDPAddr{IP: net.ParseIP("10.77.0.60"), Port: wellknown.PortMDNS}, 1, false)
 	if len(replies) != 1 || len(replies[0].Answer) != 1 {
 		t.Fatal("LAN browse not answered from the NAT cache:", replies)
 	}
@@ -240,7 +242,7 @@ func TestContainerServiceIsReadvertisedOnTheLANAndMapped(t *testing.T) {
 	// A class nobody advertises through the NAT gets no answer and is not relayed.
 	replies, forwarded = nil, nil
 	q.SetQuestion("_smb._tcp.local.", dns.TypePTR)
-	r.handle(pack(q), &net.UDPAddr{IP: net.ParseIP("10.77.0.60"), Port: 5353}, 1, false)
+	r.handle(pack(q), &net.UDPAddr{IP: net.ParseIP("10.77.0.60"), Port: wellknown.PortMDNS}, 1, false)
 	if len(replies) != 0 || len(forwarded) != 0 {
 		t.Fatal("a class outside the rule was answered or relayed")
 	}
@@ -249,13 +251,13 @@ func TestContainerServiceIsReadvertisedOnTheLANAndMapped(t *testing.T) {
 	// TXT records, a previously browsed URL) still lands in the container.
 	replies = nil
 	q.SetQuestion("printer.local.", dns.TypeA)
-	r.handle(pack(q), &net.UDPAddr{IP: net.ParseIP("10.77.0.60"), Port: 5353}, 1, false)
+	r.handle(pack(q), &net.UDPAddr{IP: net.ParseIP("10.77.0.60"), Port: wellknown.PortMDNS}, 1, false)
 	if len(replies) != 1 || len(replies[0].Answer) != 1 || replies[0].Answer[0].(*dns.A).A.String() != "10.77.0.1" {
 		t.Fatal("the container's own host name is not answered with ghostd's address:", replies)
 	}
 	// The container says goodbye: withdrawn on the LAN and unmapped.
 	emitted = nil
-	r.handle(pack(containerAnnouncement("printer", "10.90.0.10", "Office", 631, 0)), &net.UDPAddr{IP: net.ParseIP("10.90.0.10"), Port: 5353}, 10, false)
+	r.handle(pack(containerAnnouncement("printer", "10.90.0.10", "Office", 631, 0)), &net.UDPAddr{IP: net.ParseIP("10.90.0.10"), Port: wellknown.PortMDNS}, 10, false)
 	if len(n.published()) != 0 || strings.Contains(fake.last(), "dnat") {
 		t.Fatal("goodbye left a mapping behind:", fake.last())
 	}
@@ -271,7 +273,7 @@ func TestContainerServiceIsReadvertisedOnTheLANAndMapped(t *testing.T) {
 		t.Fatal("the LAN was not sent a TTL-0 withdrawal for the instance that left:", emitted)
 	}
 	// Stopping withdraws everything and removes the table.
-	r.handle(pack(containerAnnouncement("printer", "10.90.0.10", "Office", 631, 120)), &net.UDPAddr{IP: net.ParseIP("10.90.0.10"), Port: 5353}, 10, false)
+	r.handle(pack(containerAnnouncement("printer", "10.90.0.10", "Office", 631, 120)), &net.UDPAddr{IP: net.ParseIP("10.90.0.10"), Port: wellknown.PortMDNS}, 10, false)
 	r.stopNAT()
 	if got := fake.last(); strings.Contains(got, "chain") {
 		t.Fatal("the table survived a stop:", got)

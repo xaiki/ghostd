@@ -214,8 +214,8 @@ func TestConfigValidation(t *testing.T) {
 	}
 }
 
-// A plain resolver (dig, a stub) that asks from a port other than 5353 must get
-// records it will accept: class IN, short TTL. handle() is the seam.
+// A plain resolver (dig, a stub) that asks from a port other than the mDNS port
+// must get records it will accept: class IN, short TTL. handle() is the seam.
 func TestLegacyUnicastAnswersDropCacheFlushAndCapTTL(t *testing.T) {
 	a := testAnswerer()
 	q := new(dns.Msg)

@@ -18,6 +18,7 @@ import (
 	"github.com/insomniacslk/dhcp/dhcpv6"
 	"github.com/miekg/dns"
 	core "github.com/xaiki/ghostd/internal/coredhcpserver"
+	"github.com/xaiki/ghostd/internal/wellknown"
 )
 
 type Manager struct {
@@ -157,12 +158,12 @@ func (m *Manager) Apply(c Config, save func() error) error {
 			added[key] = srv
 		}
 		if m.dns[scope.Server] == nil && addedDNS[scope.Server] == nil {
-			udp, e := net.ListenPacket("udp", net.JoinHostPort(scope.Server, "53"))
+			udp, e := net.ListenPacket("udp", wellknown.HostPort(scope.Server, wellknown.PortDNS))
 			if e != nil {
 				cleanup()
 				return e
 			}
-			tcp, e := net.Listen("tcp", net.JoinHostPort(scope.Server, "53"))
+			tcp, e := net.Listen("tcp", wellknown.HostPort(scope.Server, wellknown.PortDNS))
 			if e != nil {
 				udp.Close()
 				cleanup()
@@ -194,7 +195,7 @@ func (m *Manager) Apply(c Config, save func() error) error {
 					old.close()
 					delete(m.tftp, scope.Server)
 				}
-				conn, e := net.ListenPacket("udp", net.JoinHostPort(scope.Server, "69"))
+				conn, e := net.ListenPacket("udp", wellknown.HostPort(scope.Server, wellknown.PortTFTP))
 				if e != nil {
 					cleanup()
 					return fmt.Errorf("TFTP bind %s: %w", scope.Server, e)
@@ -282,7 +283,7 @@ func matches4(s Scope, r *dhcpv4.DHCPv4, peer net.Addr) bool {
 		return r.GatewayIPAddr.IsUnspecified()
 	}
 	p, ok := peer.(*net.UDPAddr)
-	return ok && p.Port == 67 && p.IP.Equal(net.ParseIP(s.Relay.Peer)) && r.GatewayIPAddr.Equal(net.ParseIP(s.Relay.Link)) && r.HopCount <= 16
+	return ok && p.Port == wellknown.PortDHCPv4Server && p.IP.Equal(net.ParseIP(s.Relay.Peer)) && r.GatewayIPAddr.Equal(net.ParseIP(s.Relay.Link)) && r.HopCount <= 16
 }
 func matches6(s Scope, r dhcpv6.DHCPv6, peer net.Addr) bool {
 	if !s.Is6() {
@@ -292,7 +293,7 @@ func matches6(s Scope, r dhcpv6.DHCPv6, peer net.Addr) bool {
 		return !r.IsRelay()
 	}
 	p, ok := peer.(*net.UDPAddr)
-	if !ok || p.Port != 547 || !p.IP.Equal(net.ParseIP(s.Relay.Peer)) {
+	if !ok || p.Port != wellknown.PortDHCPv6Server || !p.IP.Equal(net.ParseIP(s.Relay.Peer)) {
 		return false
 	}
 	depth := 0

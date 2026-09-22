@@ -2,9 +2,10 @@
 
 // Package mdns is ghostd's query-side multicast DNS client. It sends legacy
 // unicast queries (RFC 6762 section 6.7) from an ephemeral port, so it never
-// binds UDP 5353 and never has to share it with another mDNS daemon: replies
-// come straight back to the querying socket. This is what lets ghostd resolve
-// and browse .local names on behalf of containers without avahi on the host.
+// binds the mDNS port and never has to share it with another mDNS daemon:
+// replies come straight back to the querying socket. This is what lets ghostd
+// resolve and browse .local names on behalf of containers without avahi on the
+// host.
 package mdns
 
 import (
@@ -17,11 +18,13 @@ import (
 	"github.com/miekg/dns"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
+
+	"github.com/xaiki/ghostd/internal/wellknown"
 )
 
 var (
-	group4 = &net.UDPAddr{IP: net.ParseIP("224.0.0.251"), Port: 5353}
-	group6 = &net.UDPAddr{IP: net.ParseIP("ff02::fb"), Port: 5353}
+	group4 = &net.UDPAddr{IP: net.ParseIP(wellknown.MDNSGroup4), Port: wellknown.PortMDNS}
+	group6 = &net.UDPAddr{IP: net.ParseIP(wellknown.MDNSGroup6), Port: wellknown.PortMDNS}
 )
 
 // Querier asks the LAN. Interfaces names the LAN interfaces to query on; when

@@ -13,6 +13,8 @@ import (
 
 	"github.com/mdlayher/ndp"
 	"golang.org/x/net/ipv6"
+
+	"github.com/xaiki/ghostd/internal/wellknown"
 )
 
 type raListener struct {
@@ -38,7 +40,7 @@ func newRA(scope Scope, config func() Config) (*raListener, error) {
 	if e != nil {
 		return nil, e
 	}
-	if e = conn.JoinGroup(netip.MustParseAddr("ff02::2")); e != nil {
+	if e = conn.JoinGroup(netip.MustParseAddr(wellknown.AllRouters6)); e != nil {
 		conn.Close()
 		return nil, e
 	}
@@ -87,7 +89,7 @@ func (r *raListener) run() {
 	last := time.Time{}
 	send := func(dst netip.Addr, withdraw bool) {
 		if !dst.IsValid() || dst.IsUnspecified() {
-			dst = netip.MustParseAddr("ff02::1")
+			dst = netip.MustParseAddr(wellknown.AllNodes6)
 		}
 		r.conn.SetWriteDeadline(time.Now().Add(time.Second))
 		if e := r.conn.WriteTo(Advertisement(r.scope, withdraw), nil, dst); e != nil {

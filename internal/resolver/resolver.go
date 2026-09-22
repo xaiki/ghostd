@@ -21,6 +21,8 @@ import (
 	"github.com/coredns/coredns/core/dnsserver"
 	"github.com/coredns/coredns/plugin"
 	"github.com/miekg/dns"
+
+	"github.com/xaiki/ghostd/internal/wellknown"
 )
 
 const RuntimeDir = "/run/ghostd"
@@ -79,7 +81,7 @@ func WithLAN(c LANClient) Option { return func(o *options) { o.lan = c } }
 // Start binds TCP and UDP before publishing the environment consumed by Quadlet.
 // The address is the host tailnet IP, never a wildcard/public listener.
 func Start(address, directory string, opts ...Option) (func(), error) {
-	return start(address, 53, "100.100.100.100", directory, opts...)
+	return start(address, wellknown.PortDNS, wellknown.Quad100, directory, opts...)
 }
 
 func start(address string, port int, upstream, directory string, opts ...Option) (func(), error) {

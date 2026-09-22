@@ -9,9 +9,11 @@ import (
 	"log"
 	"net"
 	"net/netip"
+	"strconv"
 	"time"
 
 	"github.com/xaiki/ghostd/internal/addressbook"
+	"github.com/xaiki/ghostd/internal/wellknown"
 	pb "github.com/xaiki/ghostd/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -54,7 +56,7 @@ func reportHost(ctx context.Context, authority string) (string, error) {
 	// public DNS answers where plaintext gRPC would lack the tailnet protection.
 	host, port, err := net.SplitHostPort(authority)
 	if err != nil {
-		host, port = authority, "7443"
+		host, port = authority, strconv.Itoa(defaultPort)
 	}
 	addresses, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
 	if err != nil {
@@ -62,7 +64,7 @@ func reportHost(ctx context.Context, authority string) (string, error) {
 	}
 	var target string
 	for _, ip := range addresses {
-		if netip.MustParsePrefix("100.64.0.0/10").Contains(ip) || netip.MustParsePrefix("fd7a:115c:a1e0::/48").Contains(ip) {
+		if netip.MustParsePrefix(wellknown.TailnetCGNAT4).Contains(ip) || netip.MustParsePrefix(wellknown.TailnetULA6).Contains(ip) {
 			target = net.JoinHostPort(ip.String(), port)
 			break
 		}

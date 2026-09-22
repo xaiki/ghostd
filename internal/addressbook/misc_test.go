@@ -11,6 +11,8 @@ import (
 	"github.com/insomniacslk/dhcp/dhcpv4"
 	"github.com/insomniacslk/dhcp/dhcpv6"
 	"github.com/insomniacslk/dhcp/iana"
+
+	"github.com/xaiki/ghostd/internal/wellknown"
 )
 
 func TestReverseNames(t *testing.T) {
@@ -57,7 +59,7 @@ func TestRelayAdmissionMatchesOnlyTheDeclaredPeerAndLink(t *testing.T) {
 		r.HopCount = hops
 		return r
 	}
-	relayPeer := &net.UDPAddr{IP: net.ParseIP("10.0.0.100"), Port: 67}
+	relayPeer := &net.UDPAddr{IP: net.ParseIP("10.0.0.100"), Port: wellknown.PortDHCPv4Server}
 	for name, tc := range map[string]struct {
 		s    Scope
 		r    *dhcpv4.DHCPv4
@@ -68,10 +70,10 @@ func TestRelayAdmissionMatchesOnlyTheDeclaredPeerAndLink(t *testing.T) {
 		"direct refuses relayed":      {direct4, req("10.8.0.1", 0), relayPeer, false},
 		"relay ok":                    {relay4, req("10.8.0.1", 1), relayPeer, true},
 		"wrong link":                  {relay4, req("10.9.0.1", 1), relayPeer, false},
-		"wrong peer":                  {relay4, req("10.8.0.1", 1), &net.UDPAddr{IP: net.ParseIP("10.0.0.101"), Port: 67}, false},
-		"wrong source port":           {relay4, req("10.8.0.1", 1), &net.UDPAddr{IP: net.ParseIP("10.0.0.100"), Port: 68}, false},
+		"wrong peer":                  {relay4, req("10.8.0.1", 1), &net.UDPAddr{IP: net.ParseIP("10.0.0.101"), Port: wellknown.PortDHCPv4Server}, false},
+		"wrong source port":           {relay4, req("10.8.0.1", 1), &net.UDPAddr{IP: net.ParseIP("10.0.0.100"), Port: wellknown.PortDHCPv4Client}, false},
 		"too many hops":               {relay4, req("10.8.0.1", 17), relayPeer, false},
-		"non-UDP peer":                {relay4, req("10.8.0.1", 1), &net.TCPAddr{IP: net.ParseIP("10.0.0.100"), Port: 67}, false},
+		"non-UDP peer":                {relay4, req("10.8.0.1", 1), &net.TCPAddr{IP: net.ParseIP("10.0.0.100"), Port: wellknown.PortDHCPv4Server}, false},
 		"an IPv6 scope never matches": {v6, req("", 0), nil, false},
 	} {
 		if got := matches4(tc.s, tc.r, tc.peer); got != tc.want {
@@ -85,14 +87,14 @@ func TestRelayAdmissionMatchesOnlyTheDeclaredPeerAndLink(t *testing.T) {
 		m, _ := dhcpv6.EncapsulateRelay(inner, dhcpv6.MessageTypeRelayForward, net.ParseIP(link), net.ParseIP("fe80::2"))
 		return m
 	}
-	peer6 := &net.UDPAddr{IP: net.ParseIP("fd77::100"), Port: 547}
+	peer6 := &net.UDPAddr{IP: net.ParseIP("fd77::100"), Port: wellknown.PortDHCPv6Server}
 	if !matches6(v6, inner, nil) || matches6(v6, fwd("fd88::1"), peer6) || matches6(direct4, inner, nil) {
 		t.Fatal("direct IPv6 matching")
 	}
 	if !matches6(relay6, fwd("fd88::1"), peer6) {
 		t.Fatal("the declared relay and link must match")
 	}
-	if matches6(relay6, fwd("fd89::1"), peer6) || matches6(relay6, fwd("fd88::1"), &net.UDPAddr{IP: net.ParseIP("fd77::101"), Port: 547}) || matches6(relay6, inner, peer6) || matches6(relay6, fwd("fd88::1"), &net.UDPAddr{IP: net.ParseIP("fd77::100"), Port: 546}) {
+	if matches6(relay6, fwd("fd89::1"), peer6) || matches6(relay6, fwd("fd88::1"), &net.UDPAddr{IP: net.ParseIP("fd77::101"), Port: wellknown.PortDHCPv6Server}) || matches6(relay6, inner, peer6) || matches6(relay6, fwd("fd88::1"), &net.UDPAddr{IP: net.ParseIP("fd77::100"), Port: wellknown.PortDHCPv6Client}) {
 		t.Fatal("a wrong link, peer, port, or an un-relayed message was admitted")
 	}
 	// Nested relays are unwrapped to the innermost link.

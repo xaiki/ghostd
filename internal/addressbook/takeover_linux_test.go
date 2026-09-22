@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
+
+	"github.com/xaiki/ghostd/internal/wellknown"
 )
 
 type labDNSmasq struct {
@@ -281,7 +283,7 @@ func TestDNSmasqTakeoverLab(t *testing.T) {
 	client("client1", 6)
 	client("client2", 4)
 	client("client2", 6)
-	if _, e = net.ListenPacket("udp", "0.0.0.0:67"); e == nil {
+	if _, e = net.ListenPacket("udp", wellknown.HostPort("0.0.0.0", wellknown.PortDHCPv4Server)); e == nil {
 		t.Fatal("legacy authority no longer owns DHCP port")
 	}
 	// A failed configuration commit must restore the real old authority, keeping

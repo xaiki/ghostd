@@ -7,6 +7,7 @@ import (
 	"log"
 
 	"github.com/xaiki/ghostd/internal/resolver"
+	"github.com/xaiki/ghostd/internal/wellknown"
 )
 
 // resolverOptions lets other features (mdns) add to the container resolver.
@@ -37,7 +38,8 @@ func init() {
 			if len(acl.Identities) > 0 {
 				log.Printf("ghostd: DNS ACL: %d identities, each on its own listener", len(acl.Identities))
 			}
-			log.Printf("ghostd: container DNS listening on %s:53 (tailnet-only)", env.dnsAddress)
+			log.Printf("ghostd: container DNS listening on %s (tailnet-only)",
+				wellknown.HostPort(env.dnsAddress, wellknown.PortDNS))
 			return stop, nil
 		},
 	})

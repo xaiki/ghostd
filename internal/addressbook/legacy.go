@@ -15,6 +15,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/xaiki/ghostd/internal/wellknown"
 )
 
 type LegacySpec struct {
@@ -60,7 +62,7 @@ func (l SystemDNSmasq) Start() error {
 	}
 	// Type=simple can acknowledge start before dnsmasq has bound its sockets, and
 	// "active" only proves a process exists. Rollback is complete only when the
-	// service's own process holds the DHCP server socket (UDP 67 or 547).
+	// service's own process holds the DHCP server ports.
 	deadline := time.Now().Add(servingTimeout)
 	var last error
 	for {
@@ -77,7 +79,7 @@ func (l SystemDNSmasq) Start() error {
 			return e
 		}
 		pid, _ := strconv.Atoi(pidText)
-		owns, e := processOwnsUDPPort(pid, 67, 547)
+		owns, e := processOwnsUDPPort(pid, wellknown.PortDHCPv4Server, wellknown.PortDHCPv6Server)
 		if owns {
 			return nil
 		}

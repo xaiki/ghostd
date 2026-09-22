@@ -8,8 +8,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/miekg/dns"
+	"github.com/xaiki/ghostd/internal/wellknown"
 	bolt "go.etcd.io/bbolt"
-	"net"
 	"reflect"
 	"sort"
 	"strings"
@@ -371,7 +371,7 @@ func (h Handover) Confirm() error {
 		for _, network := range []string{"udp", "tcp"} {
 			query := new(dns.Msg)
 			query.SetQuestion(scope.Zone+".", dns.TypeSOA)
-			reply, _, err := (&dns.Client{Net: network, Timeout: 2 * time.Second}).Exchange(query, net.JoinHostPort(scope.Server, "53"))
+			reply, _, err := (&dns.Client{Net: network, Timeout: 2 * time.Second}).Exchange(query, wellknown.HostPort(scope.Server, wellknown.PortDNS))
 			if err != nil || reply == nil || !reply.Authoritative || reply.Rcode != dns.RcodeSuccess || len(reply.Answer) == 0 {
 				return fmt.Errorf("scope %s DNS %s verification failed: %v", scope.ID, network, err)
 			}

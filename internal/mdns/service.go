@@ -13,9 +13,11 @@ import (
 	"github.com/miekg/dns"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
+
+	"github.com/xaiki/ghostd/internal/wellknown"
 )
 
-// Service owns the advertising sockets. It binds UDP 5353 exclusively — no
+// Service owns the advertising sockets. It binds the mDNS port exclusively — no
 // SO_REUSEADDR, no SO_REUSEPORT — so it can never quietly share the port with
 // another mDNS daemon: if avahi still holds it, Apply fails with the bind error
 // instead of two responders disagreeing about the same names.
@@ -158,9 +160,9 @@ func (s *Service) start(cfg Config) (*running, error) {
 			r.nats = append(r.nats, n)
 		}
 	}
-	pc4, err := net.ListenPacket("udp4", "0.0.0.0:5353")
+	pc4, err := net.ListenPacket("udp4", wellknown.HostPort("0.0.0.0", wellknown.PortMDNS))
 	if err != nil {
-		return nil, fmt.Errorf("mdns: cannot bind UDP 5353 (is another mDNS daemon running?): %w", err)
+		return nil, fmt.Errorf("mdns: cannot bind UDP %d (is another mDNS daemon running?): %w", wellknown.PortMDNS, err)
 	}
 	r.c4 = ipv4.NewPacketConn(pc4)
 	r.c4.SetControlMessage(ipv4.FlagInterface|ipv4.FlagDst, true)
@@ -173,7 +175,7 @@ func (s *Service) start(cfg Config) (*running, error) {
 			return nil, fmt.Errorf("mdns: join on %s: %w", i.Name, err)
 		}
 	}
-	if pc6, err := net.ListenPacket("udp6", "[::]:5353"); err == nil {
+	if pc6, err := net.ListenPacket("udp6", wellknown.HostPort("::", wellknown.PortMDNS)); err == nil {
 		r.c6 = ipv6.NewPacketConn(pc6)
 		r.c6.SetControlMessage(ipv6.FlagInterface|ipv6.FlagDst, true)
 		r.c6.SetMulticastHopLimit(255)
@@ -337,7 +339,7 @@ func (r *running) handle(data []byte, src *net.UDPAddr, ifIndex int, v6 bool) {
 // reply sends resp to a querier the way RFC 6762 asks: multicast, or unicast for a
 // QU question or a legacy resolver (short TTLs, no cache-flush bit).
 func (r *running) reply(m, resp *dns.Msg, src *net.UDPAddr, ifIndex int, v6 bool) {
-	unicast := src.Port != 5353
+	unicast := src.Port != wellknown.PortMDNS
 	for _, q := range m.Question {
 		if q.Qclass&0x8000 != 0 {
 			unicast = true
@@ -351,7 +353,7 @@ func (r *running) reply(m, resp *dns.Msg, src *net.UDPAddr, ifIndex int, v6 bool
 		dst = src
 		resp.Id = m.Id
 		resp.Question = m.Question
-		if src.Port != 5353 {
+		if src.Port != wellknown.PortMDNS {
 			for _, rr := range append(append([]dns.RR{}, resp.Answer...), resp.Extra...) {
 				h := rr.Header()
 				h.Class = dns.ClassINET

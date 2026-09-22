@@ -17,6 +17,7 @@ import (
 	"github.com/insomniacslk/dhcp/dhcpv4"
 	"github.com/insomniacslk/dhcp/dhcpv6"
 	core "github.com/xaiki/ghostd/internal/coredhcpserver"
+	"github.com/xaiki/ghostd/internal/wellknown"
 )
 
 type pluginInstance struct {
@@ -146,7 +147,7 @@ func (m *Manager) startCore(key string, conn net.PacketConn) (*core.Servers, err
 	c := &config.Config{}
 	options := core.Options{}
 	if family == "4" {
-		sc.Addresses = []net.UDPAddr{{IP: net.IPv4zero, Port: 67, Zone: iface}}
+		sc.Addresses = []net.UDPAddr{{IP: net.IPv4zero, Port: wellknown.PortDHCPv4Server, Zone: iface}}
 		c.Server4 = sc
 		options.Conn4 = conn
 		options.Guard4 = func(r *dhcpv4.DHCPv4, peer net.Addr) func() {
@@ -160,7 +161,7 @@ func (m *Manager) startCore(key string, conn net.PacketConn) (*core.Servers, err
 			return nil
 		}
 	} else {
-		sc.Addresses = []net.UDPAddr{{IP: net.IPv6unspecified, Port: 547, Zone: iface}}
+		sc.Addresses = []net.UDPAddr{{IP: net.IPv6unspecified, Port: wellknown.PortDHCPv6Server, Zone: iface}}
 		c.Server6 = sc
 		options.Conn6 = conn
 		options.Guard6 = func(r dhcpv6.DHCPv6, peer net.Addr) func() {

@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/insomniacslk/dhcp/dhcpv4"
+
+	"github.com/xaiki/ghostd/internal/wellknown"
 )
 
 // TestDHCPProbeClient is a lab child, run inside a client namespace, that
@@ -41,7 +43,7 @@ func TestDHCPProbeClient(t *testing.T) {
 		t.Fatal(e)
 	}
 	defer pc.Close()
-	broadcast := &net.UDPAddr{IP: net.IPv4bcast, Port: 67}
+	broadcast := &net.UDPAddr{IP: net.IPv4bcast, Port: wellknown.PortDHCPv4Server}
 	exchange := func(m *dhcpv4.DHCPv4, want dhcpv4.MessageType) *dhcpv4.DHCPv4 {
 		t.Helper()
 		if _, e := pc.WriteTo(m.ToBytes(), broadcast); e != nil {

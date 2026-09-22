@@ -7,6 +7,7 @@ import (
 	"github.com/insomniacslk/dhcp/dhcpv4"
 	"github.com/insomniacslk/dhcp/dhcpv6"
 	"github.com/insomniacslk/dhcp/iana"
+	"github.com/xaiki/ghostd/internal/wellknown"
 	"net"
 	"os"
 	"testing"
@@ -19,12 +20,12 @@ func TestRelayClient(t *testing.T) {
 	if os.Getenv("GHOSTD_RELAY_CLIENT") != "1" {
 		t.Skip("lab child only")
 	}
-	send, e := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("10.77.0.100"), Port: 67})
+	send, e := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("10.77.0.100"), Port: wellknown.PortDHCPv4Server})
 	if e != nil {
 		t.Fatal(e)
 	}
 	defer send.Close()
-	receive, e := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("10.88.0.1"), Port: 67})
+	receive, e := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("10.88.0.1"), Port: wellknown.PortDHCPv4Server})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -36,7 +37,7 @@ func TestRelayClient(t *testing.T) {
 	}
 	r.GatewayIPAddr = net.ParseIP("10.88.0.1")
 	r.HopCount = 1
-	if _, e = send.WriteToUDP(r.ToBytes(), &net.UDPAddr{IP: net.ParseIP("10.77.0.1"), Port: 67}); e != nil {
+	if _, e = send.WriteToUDP(r.ToBytes(), &net.UDPAddr{IP: net.ParseIP("10.77.0.1"), Port: wellknown.PortDHCPv4Server}); e != nil {
 		t.Fatal(e)
 	}
 	b := make([]byte, 4096)
@@ -54,7 +55,7 @@ func TestRelayClient(t *testing.T) {
 		t.Fatal(e)
 	}
 	request.GatewayIPAddr = r.GatewayIPAddr
-	send.WriteToUDP(request.ToBytes(), &net.UDPAddr{IP: net.ParseIP("10.77.0.1"), Port: 67})
+	send.WriteToUDP(request.ToBytes(), &net.UDPAddr{IP: net.ParseIP("10.77.0.1"), Port: wellknown.PortDHCPv4Server})
 	receive.SetReadDeadline(time.Now().Add(2 * time.Second))
 	n, _, e = receive.ReadFromUDP(b)
 	if e != nil {
@@ -66,12 +67,12 @@ func TestRelayClient(t *testing.T) {
 	}
 	// Same approved peer but wrong relay link: no response is allowed.
 	request.GatewayIPAddr = net.ParseIP("10.89.0.1")
-	send.WriteToUDP(request.ToBytes(), &net.UDPAddr{IP: net.ParseIP("10.77.0.1"), Port: 67})
+	send.WriteToUDP(request.ToBytes(), &net.UDPAddr{IP: net.ParseIP("10.77.0.1"), Port: wellknown.PortDHCPv4Server})
 	receive.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
 	if _, _, e = receive.ReadFromUDP(b); e == nil {
 		t.Fatal("wrong relay link accepted")
 	}
-	conn, e := net.ListenUDP("udp6", &net.UDPAddr{IP: net.ParseIP("fd77::100"), Port: 547})
+	conn, e := net.ListenUDP("udp6", &net.UDPAddr{IP: net.ParseIP("fd77::100"), Port: wellknown.PortDHCPv6Server})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -81,7 +82,7 @@ func TestRelayClient(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	conn.WriteToUDP(relay.ToBytes(), &net.UDPAddr{IP: net.ParseIP("fd77::1"), Port: 547})
+	conn.WriteToUDP(relay.ToBytes(), &net.UDPAddr{IP: net.ParseIP("fd77::1"), Port: wellknown.PortDHCPv6Server})
 	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	n, _, e = conn.ReadFromUDP(b)
 	if e != nil {
@@ -92,7 +93,7 @@ func TestRelayClient(t *testing.T) {
 		t.Fatal(reply, e)
 	}
 	relay.LinkAddr = net.ParseIP("fd89::1")
-	conn.WriteToUDP(relay.ToBytes(), &net.UDPAddr{IP: net.ParseIP("fd77::1"), Port: 547})
+	conn.WriteToUDP(relay.ToBytes(), &net.UDPAddr{IP: net.ParseIP("fd77::1"), Port: wellknown.PortDHCPv6Server})
 	conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
 	if _, _, e = conn.ReadFromUDP(b); e == nil {
 		t.Fatal("wrong IPv6 relay link accepted")
@@ -106,7 +107,7 @@ func TestRelayClient(t *testing.T) {
 		if e != nil {
 			t.Fatal(e)
 		}
-		conn.WriteToUDP(fwd.ToBytes(), &net.UDPAddr{IP: net.ParseIP("fd77::1"), Port: 547})
+		conn.WriteToUDP(fwd.ToBytes(), &net.UDPAddr{IP: net.ParseIP("fd77::1"), Port: wellknown.PortDHCPv6Server})
 		conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 		n, _, e := conn.ReadFromUDP(b)
 		if e != nil {

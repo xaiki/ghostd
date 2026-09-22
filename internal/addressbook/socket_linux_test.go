@@ -10,6 +10,8 @@ import (
 
 	"github.com/insomniacslk/dhcp/dhcpv4"
 	"github.com/miekg/dns"
+
+	"github.com/xaiki/ghostd/internal/wellknown"
 )
 
 // Run only inside an isolated network namespace: this binds real DHCP/DNS
@@ -41,7 +43,7 @@ func TestLinuxListenerAndPortOwnership(t *testing.T) {
 		t.Fatal(e)
 	}
 	client.SetDeadline(time.Now().Add(3 * time.Second))
-	if _, e = client.WriteToUDP(request.ToBytes(), &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 67}); e != nil {
+	if _, e = client.WriteToUDP(request.ToBytes(), &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: wellknown.PortDHCPv4Server}); e != nil {
 		t.Fatal(e)
 	}
 	buffer := make([]byte, 4096)

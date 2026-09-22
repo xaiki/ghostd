@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
+
+	"github.com/xaiki/ghostd/internal/wellknown"
 )
 
 // Probes are active checks a takeover can require before it is confirmed. The
@@ -111,7 +113,7 @@ func probeDNS(ctx context.Context, p Probe, c Config) (string, error) {
 	for _, network := range []string{"udp", "tcp"} {
 		q := new(dns.Msg)
 		q.SetQuestion(dns.Fqdn(p.Name), qt)
-		r, _, err := (&dns.Client{Net: network, Timeout: 2 * time.Second}).ExchangeContext(ctx, q, net.JoinHostPort(sc.Server, "53"))
+		r, _, err := (&dns.Client{Net: network, Timeout: 2 * time.Second}).ExchangeContext(ctx, q, wellknown.HostPort(sc.Server, wellknown.PortDNS))
 		if err != nil {
 			return "", fmt.Errorf("%s query of %s via %s: %w", network, p.Name, sc.Server, err)
 		}
@@ -140,7 +142,7 @@ func verifyLeaseThroughDNS(ctx context.Context, sc Scope, leased netip.Addr) (st
 	}
 	q := new(dns.Msg)
 	q.SetQuestion(arpa, dns.TypePTR)
-	r, _, err := (&dns.Client{Net: "udp", Timeout: 2 * time.Second}).ExchangeContext(ctx, q, net.JoinHostPort(sc.Server, "53"))
+	r, _, err := (&dns.Client{Net: "udp", Timeout: 2 * time.Second}).ExchangeContext(ctx, q, wellknown.HostPort(sc.Server, wellknown.PortDNS))
 	if err != nil || len(r.Answer) == 0 {
 		return "", fmt.Errorf("no PTR for the leased address %s from %s: %v", leased, sc.Server, err)
 	}
@@ -149,7 +151,7 @@ func verifyLeaseThroughDNS(ctx context.Context, sc Scope, leased netip.Addr) (st
 		return "", fmt.Errorf("PTR %v is not in zone %s", r.Answer[0], sc.Zone)
 	}
 	q.SetQuestion(ptr.Ptr, dns.TypeA)
-	r, _, err = (&dns.Client{Net: "tcp", Timeout: 2 * time.Second}).ExchangeContext(ctx, q, net.JoinHostPort(sc.Server, "53"))
+	r, _, err = (&dns.Client{Net: "tcp", Timeout: 2 * time.Second}).ExchangeContext(ctx, q, wellknown.HostPort(sc.Server, wellknown.PortDNS))
 	if err != nil || len(r.Answer) == 0 {
 		return "", fmt.Errorf("%s does not resolve back: %v", ptr.Ptr, err)
 	}

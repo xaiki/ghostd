@@ -12,6 +12,7 @@ import (
 	"github.com/coredns/coredns/plugin"
 	"github.com/miekg/dns"
 	"github.com/xaiki/ghostd/internal/addressbook"
+	"github.com/xaiki/ghostd/internal/wellknown"
 )
 
 var registry atomic.Pointer[addressbook.Manager]
@@ -52,11 +53,12 @@ func init() {
 var Forward plugin.Handler = plugin.HandlerFunc(func(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
+	upstream := wellknown.HostPort(wellknown.Quad100, wellknown.PortDNS)
 	client := &dns.Client{Net: "udp", Timeout: 3 * time.Second}
-	reply, _, err := client.ExchangeContext(ctx, r, "100.100.100.100:53")
+	reply, _, err := client.ExchangeContext(ctx, r, upstream)
 	if err == nil && reply.Truncated {
 		client.Net = "tcp"
-		reply, _, err = client.ExchangeContext(ctx, r, "100.100.100.100:53")
+		reply, _, err = client.ExchangeContext(ctx, r, upstream)
 	}
 	if err != nil {
 		return dns.RcodeServerFailure, err

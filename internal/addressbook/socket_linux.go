@@ -8,6 +8,8 @@ import (
 	"golang.org/x/sys/unix"
 	"net"
 	"syscall"
+
+	"github.com/xaiki/ghostd/internal/wellknown"
 )
 
 func listenDHCP(iface string) (net.PacketConn, error) {
@@ -25,7 +27,7 @@ func listenDHCP(iface string) (net.PacketConn, error) {
 		return socketErr
 	}}
 	// No SO_REUSEADDR/SO_REUSEPORT: never share a scope with another allocator.
-	return lc.ListenPacket(context.Background(), "udp4", "0.0.0.0:67")
+	return lc.ListenPacket(context.Background(), "udp4", wellknown.HostPort("0.0.0.0", wellknown.PortDHCPv4Server))
 }
 
 func listenDHCP6(iface string) (net.PacketConn, error) {
@@ -37,7 +39,7 @@ func listenDHCP6(iface string) (net.PacketConn, error) {
 		}
 		return e
 	}}
-	conn, e := lc.ListenPacket(context.Background(), "udp6", "[::]:547")
+	conn, e := lc.ListenPacket(context.Background(), "udp6", wellknown.HostPort("::", wellknown.PortDHCPv6Server))
 	if e != nil {
 		return nil, e
 	}
@@ -47,7 +49,7 @@ func listenDHCP6(iface string) (net.PacketConn, error) {
 		return nil, e
 	}
 	pc := ipv6.NewPacketConn(conn)
-	if e = pc.JoinGroup(link, &net.UDPAddr{IP: net.ParseIP("ff02::1:2")}); e != nil {
+	if e = pc.JoinGroup(link, &net.UDPAddr{IP: net.ParseIP(wellknown.DHCPv6RelayAgents6)}); e != nil {
 		conn.Close()
 		return nil, e
 	}

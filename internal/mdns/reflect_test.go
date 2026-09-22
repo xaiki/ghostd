@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
+
+	"github.com/xaiki/ghostd/internal/wellknown"
 )
 
 func hdr(name string, t uint16) dns.RR_Header {
@@ -144,7 +146,7 @@ func TestRulesAreIndependentPerNetworkAndDirectional(t *testing.T) {
 	r.testForward = func(idx int, m *dns.Msg) { sent[idx] = append(sent[idx], m) }
 	pack := func(m *dns.Msg) []byte { b, _ := m.Pack(); return b }
 	// The LAN announces: each network receives only its own classes.
-	r.handle(pack(lanAnnouncement()), &net.UDPAddr{IP: net.ParseIP("192.0.2.60"), Port: 5353}, 1, false)
+	r.handle(pack(lanAnnouncement()), &net.UDPAddr{IP: net.ParseIP("192.0.2.60"), Port: wellknown.PortMDNS}, 1, false)
 	if len(sent[10]) != 1 || !strings.Contains(strings.ToLower(names(sent[10][0].Answer)), "_ipp._tcp") || strings.Contains(strings.ToLower(names(sent[10][0].Answer)+names(sent[10][0].Extra)), "googlecast") {
 		t.Fatal("ctr0 saw the wrong records:", sent[10])
 	}
@@ -158,18 +160,18 @@ func TestRulesAreIndependentPerNetworkAndDirectional(t *testing.T) {
 	sent = map[int][]*dns.Msg{}
 	q := new(dns.Msg)
 	q.SetQuestion("_googlecast._tcp.local.", dns.TypePTR)
-	r.handle(pack(q), &net.UDPAddr{IP: net.ParseIP("10.90.0.10"), Port: 5353}, 10, false)
+	r.handle(pack(q), &net.UDPAddr{IP: net.ParseIP("10.90.0.10"), Port: wellknown.PortMDNS}, 10, false)
 	if len(sent) != 0 {
 		t.Fatal("ctr0 may not browse googlecast, yet a query left:", sent)
 	}
 	q.SetQuestion("_ipp._tcp.local.", dns.TypePTR)
-	r.handle(pack(q), &net.UDPAddr{IP: net.ParseIP("10.90.0.10"), Port: 5353}, 10, false)
+	r.handle(pack(q), &net.UDPAddr{IP: net.ParseIP("10.90.0.10"), Port: wellknown.PortMDNS}, 10, false)
 	if len(sent[1]) != 1 || len(sent[11]) != 0 {
 		t.Fatal("query not forwarded to the LAN only:", sent)
 	}
 	// A container's own response is never reflected outward.
 	sent = map[int][]*dns.Msg{}
-	r.handle(pack(lanAnnouncement()), &net.UDPAddr{IP: net.ParseIP("10.90.0.10"), Port: 5353}, 10, false)
+	r.handle(pack(lanAnnouncement()), &net.UDPAddr{IP: net.ParseIP("10.90.0.10"), Port: wellknown.PortMDNS}, 10, false)
 	if len(sent) != 0 {
 		t.Fatal("a container's advertisement leaked to the LAN:", sent)
 	}
