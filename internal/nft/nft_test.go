@@ -76,7 +76,8 @@ func TestIntegrationReplaceAndRollback(t *testing.T) {
 		t.Fatal(err)
 	}
 	ds := minimalDesiredState()
-	ds.Ingress = &Ingress{Interfaces: []string{"end0.10"}, HTTPPort: 18080}
+	ds.Ingress = &Ingress{Interfaces: []string{"end0.10"}, Redirects: []RedirectRule{
+		{Port: 80, ToPort: 18080, Proto: "tcp"}, {Port: 443, ToPort: 8443, Proto: "tcp"}}}
 	zone := ds.Zones["mgmt"]
 	zone.Ports = []PortRule{{Port: 12345, Proto: "tcp"}}
 	ds.Zones["mgmt"] = zone

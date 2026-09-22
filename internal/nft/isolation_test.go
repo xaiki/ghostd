@@ -8,6 +8,8 @@ import (
 	"os/exec"
 	"testing"
 	"time"
+
+	"github.com/xaiki/ghostd/internal/wellknown"
 )
 
 // Invoked by the parent test inside a client network namespace.
@@ -87,7 +89,7 @@ func TestIntegrationGuestCannotReachLANServices(t *testing.T) {
 			}
 		}(listener)
 	}
-	for _, port := range []int{69, 5353, 15514} {
+	for _, port := range []int{wellknown.PortTFTP, wellknown.PortMDNS, 15514} {
 		listener, err := net.ListenPacket("udp4", fmt.Sprintf("0.0.0.0:%d", port))
 		if err != nil {
 			t.Fatal(err)
@@ -105,9 +107,10 @@ func TestIntegrationGuestCannotReachLANServices(t *testing.T) {
 		}(listener)
 	}
 	ds := DesiredState{Zones: map[string]Zone{
-		"guest": {Interfaces: []string{"gd-guest"}, Ports: []PortRule{{Port: 53, Proto: "tcp"}, {Port: 5353, Proto: "udp"}}},
-		"lan":   {Interfaces: []string{"gd-lan"}, SSH: &SSHRule{Port: 22}, Ports: []PortRule{{Port: 2049, Proto: "tcp"}}, Redirects: []RedirectRule{{Port: 514, ToPort: 15514, Proto: "udp"}}},
-	}, Ingress: &Ingress{Interfaces: []string{"gd-lan"}, HTTPPort: 18080}}
+		"guest": {Interfaces: []string{"gd-guest"}, Ports: []PortRule{{Port: wellknown.PortDNS, Proto: "tcp"}, {Port: wellknown.PortMDNS, Proto: "udp"}}},
+		"lan":   {Interfaces: []string{"gd-lan"}, SSH: &SSHRule{Port: 22}, Ports: []PortRule{{Port: wellknown.PortNFS, Proto: "tcp"}}, Redirects: []RedirectRule{{Port: 514, ToPort: 15514, Proto: "udp"}}},
+	}, Ingress: &Ingress{Interfaces: []string{"gd-lan"}, Redirects: []RedirectRule{
+		{Port: wellknown.PortHTTP, ToPort: 18080, Proto: "tcp"}, {Port: wellknown.PortHTTPS, ToPort: 8443, Proto: "tcp"}}}}
 	script, err := Render(ds, guard())
 	if err != nil {
 		t.Fatal(err)
@@ -132,17 +135,17 @@ func TestIntegrationGuestCannotReachLANServices(t *testing.T) {
 			t.Fatalf("%s probe: %v: %s", zone, err, out)
 		}
 	}
-	probe("guest", "tcp", "192.0.2.1:53", true)
-	probe("guest", "udp", "192.0.2.1:5353", true)
-	for _, port := range []int{22, 2049, 18080, 8443} {
+	probe("guest", "tcp", wellknown.HostPort("192.0.2.1", wellknown.PortDNS), true)
+	probe("guest", "udp", wellknown.HostPort("192.0.2.1", wellknown.PortMDNS), true)
+	for _, port := range []int{22, wellknown.PortNFS, 18080, 8443} {
 		probe("guest", "tcp", fmt.Sprintf("192.0.2.1:%d", port), false)
 	}
-	probe("guest", "udp", "192.0.2.1:69", false)
+	probe("guest", "udp", wellknown.HostPort("192.0.2.1", wellknown.PortTFTP), false)
 	// Even addressing the router's LAN IP cannot escape the incoming guest zone.
-	probe("guest", "tcp", "192.0.3.1:2049", false)
-	probe("lan", "tcp", "192.0.3.1:2049", true)
-	probe("lan", "tcp", "192.0.3.1:80", true)
-	probe("lan", "tcp", "192.0.3.1:443", true)
+	probe("guest", "tcp", wellknown.HostPort("192.0.3.1", wellknown.PortNFS), false)
+	probe("lan", "tcp", wellknown.HostPort("192.0.3.1", wellknown.PortNFS), true)
+	probe("lan", "tcp", wellknown.HostPort("192.0.3.1", wellknown.PortHTTP), true)
+	probe("lan", "tcp", wellknown.HostPort("192.0.3.1", wellknown.PortHTTPS), true)
 	probe("lan", "udp", "192.0.3.1:514", true)
 	probe("lan", "udp", "192.0.3.1:15514", false)
 	probe("guest", "udp", "192.0.2.1:514", false)
@@ -168,6 +171,6 @@ func TestIntegrationGuestCannotReachLANServices(t *testing.T) {
 	}
 	probe("lan", "udp", "192.0.3.1:514", true)
 	probe("guest", "tcp", "192.0.2.1:22", false)
-	probe("guest", "tcp", "192.0.2.1:53", true)
+	probe("guest", "tcp", wellknown.HostPort("192.0.2.1", wellknown.PortDNS), true)
 
 }

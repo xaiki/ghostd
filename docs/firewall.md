@@ -109,12 +109,22 @@ those IPv4 CIDRs. For anything else, supply explicit `ports`.
 ### Ingress
 
 ```json
-"ingress": {"interfaces": ["eth0"], "http_port": 18080}
+"ingress": {"interfaces": ["eth0"],
+            "redirects": [{"port": 80, "to_port": 18080, "proto": "tcp"},
+                          {"port": 443, "to_port": 8443, "proto": "tcp"}]}
 ```
 
-This redirects host-destined TCP 80 to `http_port` and TCP 443 to **8443**, and
-admits those destination ports on those interfaces. Traffic forwarded through the
-host to another machine is not redirected.
+Each pair redirects host-destined TCP on the public port to the port the ingress
+backend answers on, over the named interfaces, and admits those backend ports
+there. Both sides of every pair come from the client, so a stack fronting its
+ingress on anything but 80/443 declares that rather than having it assumed here;
+`proto` is `tcp`. Traffic forwarded through the host to another machine is not
+redirected.
+
+Locally generated traffic never traverses prerouting, so the same pairs are
+written into a nat `output` chain for the host's own LAN and tailnet
+destinations: without it the machine cannot reach its own ingress address, and
+neither can anything already running on it.
 
 ### Port redirects
 

@@ -58,9 +58,13 @@ type PortRule struct {
 	Proto string `json:"proto"` // "tcp" or "udp"
 }
 
+// Ingress is one host's inbound entry point: the interfaces the redirect
+// covers and the port pairs it translates. Both arrive from the client — this
+// daemon assumes no port of its own, so a stack that fronts its ingress on
+// anything but 80/443 declares that fact rather than having it baked in here.
 type Ingress struct {
-	Interfaces []string `json:"interfaces"`
-	HTTPPort   int      `json:"http_port"`
+	Interfaces []string       `json:"interfaces"`
+	Redirects  []RedirectRule `json:"redirects,omitempty"`
 }
 
 func ParseDesiredState(raw string) (DesiredState, error) {

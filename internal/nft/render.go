@@ -5,7 +5,10 @@ import (
 	"net/netip"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
+
+	"github.com/xaiki/ghostd/internal/wellknown"
 )
 
 // ReachabilityGuard is what Apply always adds to the input chain itself,
@@ -25,28 +28,28 @@ const tableName = "stack_ghostd"
 // pairs — a small, explicit set. An unrecognized name is a render error,
 // never a silently-dropped rule: see Render's own doc.
 // serviceReplyPorts are source ports a service's peers answer from. mDNS
-// responders reply to a legacy-unicast query from UDP 5353 straight to the
+// responders reply to a legacy-unicast query from the mDNS port straight to the
 // asker's ephemeral port, which conntrack does not associate with the multicast
 // question; without this, ghostd's own native .local client is silent behind
 // its own default-drop policy. Only unprivileged destination ports are opened.
 var serviceReplyPorts = map[string][]PortRule{
-	"mdns": {{Port: 5353, Proto: "udp"}},
+	"mdns": {{Port: wellknown.PortMDNS, Proto: "udp"}},
 }
 
 var builtinServices = map[string][]PortRule{
-	"mdns":          {{Port: 5353, Proto: "udp"}},
-	"tftp":          {{Port: 69, Proto: "udp"}},
-	"dns":           {{Port: 53, Proto: "tcp"}, {Port: 53, Proto: "udp"}},
-	"dhcp":          {{Port: 67, Proto: "udp"}},
-	"dhcpv6-client": {{Port: 546, Proto: "udp"}},
-	"http":          {{Port: 80, Proto: "tcp"}},
-	"https":         {{Port: 443, Proto: "tcp"}},
+	"mdns":          {{Port: wellknown.PortMDNS, Proto: "udp"}},
+	"tftp":          {{Port: wellknown.PortTFTP, Proto: "udp"}},
+	"dns":           {{Port: wellknown.PortDNS, Proto: "tcp"}, {Port: wellknown.PortDNS, Proto: "udp"}},
+	"dhcp":          {{Port: wellknown.PortDHCPv4Server, Proto: "udp"}},
+	"dhcpv6-client": {{Port: wellknown.PortDHCPv6Client, Proto: "udp"}},
+	"http":          {{Port: wellknown.PortHTTP, Proto: "tcp"}},
+	"https":         {{Port: wellknown.PortHTTPS, Proto: "tcp"}},
 }
 
 // nfsPorts is deliberately TCP-only (rpcbind, nfsd, mountd) — the common
 // case for a modern NFSv4-only export; a UDP variant can be added if a
 // real export ever needs it, rather than guessed at now.
-var nfsPorts = []int{111, 2049, 20048}
+var nfsPorts = []int{wellknown.PortRPCBind, wellknown.PortNFS, wellknown.PortMountd}
 
 // Render replaces only our table in one atomic nft transaction. An add is
 // idempotent, so add/delete works on both the first and subsequent applies.
@@ -76,6 +79,7 @@ func Render(ds DesiredState, guard ReachabilityGuard) (string, error) {
 	writeForwardChain(&b, ds, names)
 	writeOutputChain(&b, ds.Output)
 	writePreroutingChain(&b, ds)
+	writeIngressOutputChain(&b, ds)
 	writePostroutingChain(&b, ds, names)
 	for _, name := range names {
 		if err := writeZoneChain(&b, name, ds.Zones[name]); err != nil {
@@ -106,13 +110,20 @@ func validate(ds DesiredState) error {
 		return fmt.Errorf("nft: no zones declared")
 	}
 	if ds.Ingress != nil {
-		if !validPort(ds.Ingress.HTTPPort) || len(ds.Ingress.Interfaces) == 0 {
-			return fmt.Errorf("nft: ingress requires interfaces and a valid HTTP port")
+		if len(ds.Ingress.Interfaces) == 0 || len(ds.Ingress.Redirects) == 0 {
+			return fmt.Errorf("nft: ingress requires interfaces and the ports to redirect")
 		}
 		for _, iface := range ds.Ingress.Interfaces {
 			if !validInterface(iface) {
 				return fmt.Errorf("nft: invalid ingress interface %q", iface)
 			}
+		}
+		seenIngress := map[int]bool{}
+		for _, rule := range ds.Ingress.Redirects {
+			if !validPort(rule.Port) || !validPort(rule.ToPort) || rule.Port == rule.ToPort || rule.Proto != "tcp" || seenIngress[rule.Port] {
+				return fmt.Errorf("nft: invalid or duplicate ingress redirect %+v", rule)
+			}
+			seenIngress[rule.Port] = true
 		}
 	}
 	assigned := map[string]string{}
@@ -208,6 +219,47 @@ func ifaceSet(interfaces []string) string {
 	return "{ " + strings.Join(quoted, ", ") + " }"
 }
 
+// ingressOutputDestinations is the destination scope of the locally generated
+// redirect: the private and tailnet ranges the standalone stack_ingress table
+// covered, never the loopback or public ones.
+var ingressOutputDestinations = []struct{ family, prefix string }{
+	{"ip", wellknown.TailnetCGNAT4},
+	{"ip6", wellknown.TailnetULA6},
+	{"ip", "{ 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 }"},
+	{"ip6", "fc00::/7"},
+}
+
+// sortedIngressRedirects makes wire order stable, so the same policy renders
+// the same ruleset twice.
+func sortedIngressRedirects(ingress *Ingress) []RedirectRule {
+	redirects := append([]RedirectRule(nil), ingress.Redirects...)
+	sort.Slice(redirects, func(i, j int) bool { return redirects[i].Port < redirects[j].Port })
+	return redirects
+}
+
+// backendPorts is the deduplicated set of translated ports the input chain
+// must accept for the interfaces that carry the ingress.
+func backendPorts(ingress *Ingress) []int {
+	seen := map[int]bool{}
+	ports := []int{}
+	for _, rule := range sortedIngressRedirects(ingress) {
+		if !seen[rule.ToPort] {
+			seen[rule.ToPort] = true
+			ports = append(ports, rule.ToPort)
+		}
+	}
+	sort.Ints(ports)
+	return ports
+}
+
+func portSet(ports []int) string {
+	parts := make([]string, len(ports))
+	for i, port := range ports {
+		parts[i] = strconv.Itoa(port)
+	}
+	return strings.Join(parts, ", ")
+}
+
 func writeInputChain(b *strings.Builder, ds DesiredState, guard ReachabilityGuard, names []string) {
 	b.WriteString("  chain input {\n")
 	b.WriteString("    type filter hook input priority 0; policy drop;\n")
@@ -216,8 +268,8 @@ func writeInputChain(b *strings.Builder, ds DesiredState, guard ReachabilityGuar
 	// Rootful Podman bridges reach the host resolver through input; rootless
 	// forwarding originates on the host and uses the loopback rule above.
 	// ghostd binds DNS only to its tailnet address, never the public address.
-	b.WriteString("    iifname \"podman*\" udp dport 53 accept\n")
-	b.WriteString("    iifname \"podman*\" tcp dport 53 accept\n")
+	fmt.Fprintf(b, "    iifname \"podman*\" udp dport %d accept\n", wellknown.PortDNS)
+	fmt.Fprintf(b, "    iifname \"podman*\" tcp dport %d accept\n", wellknown.PortDNS)
 	// IPv6 addressing needs NDP/RA even when no application service is open.
 	// Neighbor/router discovery is link-local in scope (hop limit 255); ICMP
 	// errors are required for path MTU discovery and transport correctness.
@@ -233,9 +285,9 @@ func writeInputChain(b *strings.Builder, ds DesiredState, guard ReachabilityGuar
 		zone := ds.Zones[name]
 		fmt.Fprintf(b, "    iifname %s jump zone_%s\n", ifaceSet(zone.Interfaces), name)
 	}
-	if ds.Ingress != nil && len(ds.Ingress.Interfaces) > 0 {
-		fmt.Fprintf(b, "    iifname %s tcp dport { %d, 8443 } accept\n",
-			ifaceSet(ds.Ingress.Interfaces), ds.Ingress.HTTPPort)
+	if ds.Ingress != nil && len(ds.Ingress.Redirects) > 0 {
+		fmt.Fprintf(b, "    iifname %s tcp dport { %s } accept\n",
+			ifaceSet(ds.Ingress.Interfaces), portSet(backendPorts(ds.Ingress)))
 	}
 	b.WriteString("  }\n")
 }
@@ -270,8 +322,34 @@ func writePreroutingChain(b *strings.Builder, ds DesiredState) {
 	}
 	if ds.Ingress != nil {
 		for _, iface := range sortedStrings(ds.Ingress.Interfaces) {
-			fmt.Fprintf(b, "    iifname %q fib daddr type local tcp dport 80 dnat to :%d\n", iface, ds.Ingress.HTTPPort)
-			fmt.Fprintf(b, "    iifname %q fib daddr type local tcp dport 443 dnat to :8443\n", iface)
+			for _, rule := range sortedIngressRedirects(ds.Ingress) {
+				fmt.Fprintf(b, "    iifname %q fib daddr type local tcp dport %d dnat to :%d\n",
+					iface, rule.Port, rule.ToPort)
+			}
+		}
+	}
+	b.WriteString("  }\n")
+}
+
+// writeIngressOutputChain covers what the prerouting redirect cannot see: a
+// packet this host generates itself never traverses prerouting, so the
+// interface-scoped DNAT above leaves the machine unable to reach its own
+// ingress address -- and so does anything already running on it. The rootful
+// stack_ingress table this daemon replaced wrote the same rules into both the
+// prerouting and output hooks for exactly that reason, with the same
+// destination scope: local destinations in the private and tailnet ranges,
+// never the loopback or public ones. Redirect, not DNAT, so the rewritten
+// destination is the loopback address the ingress backend itself listens on.
+func writeIngressOutputChain(b *strings.Builder, ds DesiredState) {
+	if ds.Ingress == nil || len(ds.Ingress.Redirects) == 0 {
+		return
+	}
+	b.WriteString("  chain output_redirect {\n")
+	b.WriteString("    type nat hook output priority -100;\n")
+	for _, rule := range sortedIngressRedirects(ds.Ingress) {
+		for _, destination := range ingressOutputDestinations {
+			fmt.Fprintf(b, "    fib daddr type local %s daddr %s tcp dport %d redirect to :%d\n",
+				destination.family, destination.prefix, rule.Port, rule.ToPort)
 		}
 	}
 	b.WriteString("  }\n")
@@ -353,5 +431,5 @@ func writeTFTPHelper(b *strings.Builder, ds DesiredState, names []string) {
 	}
 	b.WriteString("  ct helper ghost_tftp {\n    type \"tftp\" protocol udp\n  }\n")
 	b.WriteString("  chain tftp_helper {\n    type filter hook prerouting priority -300; policy accept;\n")
-	fmt.Fprintf(b, "    iifname %s udp dport 69 ct helper set \"ghost_tftp\"\n  }\n", ifaceSet(ifaces))
+	fmt.Fprintf(b, "    iifname %s udp dport %d ct helper set \"ghost_tftp\"\n  }\n", ifaceSet(ifaces), wellknown.PortTFTP)
 }

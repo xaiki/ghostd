@@ -181,7 +181,10 @@ func TestRenderMasqueradeOnEgressInterface(t *testing.T) {
 
 func TestRenderIngressDNATAndAccept(t *testing.T) {
 	ds := minimalDesiredState()
-	ds.Ingress = &Ingress{Interfaces: []string{"end0"}, HTTPPort: 18080}
+	ds.Ingress = &Ingress{Interfaces: []string{"end0"}, Redirects: []RedirectRule{
+		{Port: 80, ToPort: 18080, Proto: "tcp"},
+		{Port: 443, ToPort: 8443, Proto: "tcp"},
+	}}
 	script, err := Render(ds, guard())
 	if err != nil {
 		t.Fatalf("Render: %v", err)
@@ -192,8 +195,64 @@ func TestRenderIngressDNATAndAccept(t *testing.T) {
 	if !strings.Contains(script, `iifname "end0" fib daddr type local tcp dport 443 dnat to :8443`) {
 		t.Fatalf("expected a 443->8443 DNAT rule in:\n%s", script)
 	}
-	if !strings.Contains(script, `iifname { "end0" } tcp dport { 18080, 8443 } accept`) {
+	if !strings.Contains(script, `iifname { "end0" } tcp dport { 8443, 18080 } accept`) {
 		t.Fatalf("expected an input-chain accept for the DNAT'd ports in:\n%s", script)
+	}
+}
+
+func TestIngressRendersThePortsTheClientSent(t *testing.T) {
+	ds := minimalDesiredState()
+	ds.Ingress = &Ingress{Interfaces: []string{"end0"},
+		Redirects: []RedirectRule{{Port: 8080, ToPort: 19090, Proto: "tcp"}}}
+	script, err := Render(ds, guard())
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	for _, want := range []string{
+		`iifname "end0" fib daddr type local tcp dport 8080 dnat to :19090`,
+		`iifname { "end0" } tcp dport { 19090 } accept`,
+		"fib daddr type local ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } tcp dport 8080 redirect to :19090",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("missing %q in:\n%s", want, script)
+		}
+	}
+	for _, hardcoded := range []string{"dport 80 ", "dport 443 ", ":8443"} {
+		if strings.Contains(script, hardcoded) {
+			t.Fatalf("port %q is still hardcoded in:\n%s", hardcoded, script)
+		}
+	}
+}
+
+func TestIngressRedirectCoversLocallyGeneratedTraffic(t *testing.T) {
+	ds := minimalDesiredState()
+	ds.Ingress = &Ingress{Interfaces: []string{"end0"}, Redirects: []RedirectRule{
+		{Port: 80, ToPort: 18080, Proto: "tcp"},
+		{Port: 443, ToPort: 8443, Proto: "tcp"},
+	}}
+	script, err := Render(ds, guard())
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	for _, want := range []string{
+		"chain output_redirect {\n    type nat hook output priority -100;",
+		"fib daddr type local ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } tcp dport 80 redirect to :18080",
+		"fib daddr type local ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } tcp dport 443 redirect to :8443",
+		"fib daddr type local ip daddr 100.64.0.0/10 tcp dport 80 redirect to :18080",
+		"fib daddr type local ip6 daddr fd7a:115c:a1e0::/48 tcp dport 443 redirect to :8443",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("missing %q in:\n%s", want, script)
+		}
+	}
+	// The nat output hook exists only for an ingress host: without one there
+	// is nothing to redirect a locally generated 80/443 connection to.
+	plain, err := Render(minimalDesiredState(), guard())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(plain, "output_redirect") {
+		t.Fatalf("ingress output redirect rendered without an ingress policy:\n%s", plain)
 	}
 }
 
@@ -244,7 +303,19 @@ func TestRenderRejectsUnsafeOrAmbiguousFields(t *testing.T) {
 		"shared interface":   func(ds *DesiredState) { ds.Zones["other"] = Zone{Interfaces: []string{"end0.10"}} },
 		"wildcard interface": func(ds *DesiredState) { z := ds.Zones["mgmt"]; z.Interfaces = []string{"end*"}; ds.Zones["mgmt"] = z },
 		"unknown target":     func(ds *DesiredState) { z := ds.Zones["mgmt"]; z.Target = "ACCEPP"; ds.Zones["mgmt"] = z },
-		"ingress port":       func(ds *DesiredState) { ds.Ingress = &Ingress{Interfaces: []string{"end0"}, HTTPPort: -1} },
+		"ingress port": func(ds *DesiredState) {
+			ds.Ingress = &Ingress{Interfaces: []string{"end0"}, Redirects: []RedirectRule{{Port: 80, ToPort: 80, Proto: "tcp"}}}
+		},
+		"ingress proto": func(ds *DesiredState) {
+			ds.Ingress = &Ingress{Interfaces: []string{"end0"}, Redirects: []RedirectRule{{Port: 80, ToPort: 18080, Proto: "udp"}}}
+		},
+		"ingress without ports": func(ds *DesiredState) {
+			ds.Ingress = &Ingress{Interfaces: []string{"end0"}}
+		},
+		"ingress duplicate port": func(ds *DesiredState) {
+			ds.Ingress = &Ingress{Interfaces: []string{"end0"}, Redirects: []RedirectRule{
+				{Port: 80, ToPort: 18080, Proto: "tcp"}, {Port: 80, ToPort: 19090, Proto: "tcp"}}}
+		},
 	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {
