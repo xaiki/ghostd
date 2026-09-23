@@ -379,6 +379,22 @@ func TestRejectInvalidRedirects(t *testing.T) {
 	}
 }
 
+// chainBody is one rendered chain's rules, so a test can say which chain a rule
+// must or must not appear in — several rules are deliberate in one chain and
+// wrong in another.
+func chainBody(t *testing.T, out, name string) string {
+	t.Helper()
+	_, rest, ok := strings.Cut(out, "chain "+name+" {")
+	if !ok {
+		t.Fatalf("no chain %s in\n%s", name, out)
+	}
+	body, _, ok := strings.Cut(rest, "\n  }")
+	if !ok {
+		t.Fatalf("chain %s is unterminated in\n%s", name, out)
+	}
+	return body
+}
+
 func TestMDNSServiceAlsoAdmitsUnicastReplies(t *testing.T) {
 	desired, err := ParseDesiredState(`{"zones":{"trusted":{"interfaces":["tailscale0"]},"lan":{"interfaces":["eth0"],"services":["mdns"]}}}`)
 	if err != nil {
@@ -393,10 +409,57 @@ func TestMDNSServiceAlsoAdmitsUnicastReplies(t *testing.T) {
 			t.Fatalf("missing %q in\n%s", want, out)
 		}
 	}
-	// Zones without the service admit neither.
+	// A zone that does not declare the service admits neither, in its own chain.
+	// The bridge admission is unconditional (TestContainerBridgesMaySpeakMDNS) and
+	// no zone declaration can switch it on or off.
 	plain, _ := ParseDesiredState(`{"zones":{"trusted":{"interfaces":["tailscale0"]},"lan":{"interfaces":["eth0"],"services":["dns"]}}}`)
-	if out, _ = Render(plain, ReachabilityGuard{TailscaleInterface: "tailscale0", Port: 7443}); strings.Contains(out, "5353") {
+	out, err = Render(plain, ReachabilityGuard{TailscaleInterface: "tailscale0", Port: 7443})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(chainBody(t, out, "zone_lan"), "5353") {
 		t.Fatal("mDNS admitted without the service")
+	}
+}
+
+// A container's own mDNS has to reach the host: the relay hears it on the
+// bridge, and a bridge is not a zone — the schema takes explicit interface names
+// (never a glob) and keeps podman*/veth* out of zones — so the admission lives
+// beside the two DNS rules instead. Another zone's services must not widen it.
+func TestContainerBridgesMaySpeakMDNS(t *testing.T) {
+	desired, err := ParseDesiredState(`{"zones":{"trusted":{"interfaces":["tailscale0"]},"lan":{"interfaces":["end0"],"services":["mdns"]}}}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := Render(desired, ReachabilityGuard{TailscaleInterface: "tailscale0", Port: 7443})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, `iifname "podman*" udp dport 5353 accept`) {
+		t.Fatalf("a container's mDNS is dropped at the input hook:\n%s", out)
+	}
+	// The bridges admit the port and nothing else. Widening — a protocol, a port,
+	// a second glob — fails here rather than quietly opening a bridge.
+	var bridges []string
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, `iifname "podman*"`) {
+			bridges = append(bridges, strings.TrimSpace(line))
+		}
+	}
+	want := []string{
+		`iifname "podman*" udp dport 53 accept`,
+		`iifname "podman*" tcp dport 53 accept`,
+		`iifname "podman*" udp dport 5353 accept`,
+	}
+	if strings.Join(bridges, "|") != strings.Join(want, "|") {
+		t.Fatalf("container bridges admit\n  %v\nwant\n  %v", bridges, want)
+	}
+	// And the input chain gained nothing beside that port: the answered-from-5353
+	// case belongs to a zone that declares mdns (zone_lan above keeps its own reply
+	// rule), never to a bridge no zone names.
+	input := chainBody(t, out, "input")
+	if strings.Contains(input, `tcp dport 5353`) || strings.Contains(input, `sport 5353`) {
+		t.Fatalf("the input chain was widened past the mDNS port:\n%s", out)
 	}
 }
 

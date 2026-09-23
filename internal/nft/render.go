@@ -270,6 +270,15 @@ func writeInputChain(b *strings.Builder, ds DesiredState, guard ReachabilityGuar
 	// ghostd binds DNS only to its tailnet address, never the public address.
 	fmt.Fprintf(b, "    iifname \"podman*\" udp dport %d accept\n", wellknown.PortDNS)
 	fmt.Fprintf(b, "    iifname \"podman*\" tcp dport %d accept\n", wellknown.PortDNS)
+	// A container's own mDNS has to reach the host too, for the relay to carry
+	// it anywhere: a bridge is not a zone (the schema takes explicit interface
+	// names, never a glob), so it is admitted here, beside the DNS rules above.
+	// The port is the boundary, as it is for a zone's own mdns service, and it
+	// cannot be the group address instead: the relay's forwarded question leaves
+	// from the mDNS port, so a responder that answers it directly (the QU bit)
+	// answers to that port as well, and a group-scoped rule would drop exactly
+	// that answer. UDP 5353, the same podman* bridges, nothing wider.
+	fmt.Fprintf(b, "    iifname \"podman*\" udp dport %d accept\n", wellknown.PortMDNS)
 	// IPv6 addressing needs NDP/RA even when no application service is open.
 	// Neighbor/router discovery is link-local in scope (hop limit 255); ICMP
 	// errors are required for path MTU discovery and transport correctness.
