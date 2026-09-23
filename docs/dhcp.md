@@ -334,8 +334,9 @@ published, and a release or expiry removes the A and PTR answers. TTL is bounded
 by 30 seconds and by the remaining lease lifetime; an unknown local name gets an
 authoritative NXDOMAIN rather than escaping upstream. Configured LAN listeners
 answer UDP and TCP on port 53. Local DHCP and authoritative DNS keep working while
-Tailscale is unavailable; recursive queries through Tailscale's Quad100 resolver,
-and the remote control API, still require it.
+Tailscale is unavailable; recursive queries need a reachable upstream (Quad100, or
+the public fallback described under the container resolver), and the remote control
+API still requires the tailnet.
 
 The daemon separately runs a container resolver on port 53 **of its own tailnet
 address**, described in [operations.md](operations.md). It never binds a public
@@ -347,7 +348,12 @@ most 30 seconds. It never binds UDP 5353, so no mDNS daemon has to be running on
 host; only if no interface can send does it fall back to the host's NSS via
 `getent`. DNS-SD questions (PTR/SRV/TXT for `_type._proto.local`) are answered the
 same way, with the instance's SRV/TXT/address records attached. Other queries go to
-Quad100 and are cached for at most 30 seconds.
+Quad100 first and, if it answers a definite error (SERVFAIL or REFUSED), to a public
+fallback resolver in turn (Cloudflare, then Google); every answer is cached for at
+most 30 seconds, and a SERVFAIL for only 5. Quad100 stays authoritative and first, so
+a name it denies rather than fails is never replaced by a public opinion, and a
+tailnet that serves MagicDNS only no longer leaves containers without the public
+internet.
 
 An mDNS query must be able to come back: `mdns` in a firewall zone's `services` also
 admits UDP source port 5353 to unprivileged destination ports (see

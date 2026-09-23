@@ -53,6 +53,15 @@ const (
 	TailnetULA6   = "fd7a:115c:a1e0::/48"
 )
 
+// Public resolvers the container resolver falls back to when the tailnet
+// resolver answers a definite error (SERVFAIL or REFUSED) for a name rather
+// than resolving it. Quad100 stays authoritative and first; these are only
+// reached after it has answered and been rejected.
+const (
+	CloudflareResolver = "1.1.1.1"
+	GoogleResolver     = "8.8.8.8"
+)
+
 // HostPort is the "host:port" form net takes, with a well-known port named
 // rather than formatted at each call site.
 func HostPort(host string, port int) string {
