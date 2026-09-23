@@ -16,11 +16,11 @@ import (
 	"github.com/miekg/dns"
 )
 
-// ConfigFile is the persisted advertisement target (the mdns-v2 domain). The v1
-// shape (mdns-v1's {lan, network} rules and its mdns-config.json) is deliberately
-// not read: a v1 document would parse into the wrong topology, so the domain and
-// the key both moved and a host boots unconfigured until the new target is
-// applied.
+// ConfigFile is the persisted advertisement target (the mdns-v2 domain). The key
+// carries the domain's version deliberately: a document from an earlier rule
+// shape would decode into a different topology, and boot restore treats a parse
+// error as fatal, so key and domain move together and a host boots unconfigured
+// until the target for this version is applied.
 const ConfigFile = "mdns-config-v2.json"
 
 // Config declares what ghostd advertises on behalf of things that cannot do it

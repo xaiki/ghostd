@@ -13,10 +13,8 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// mdns-v2 is the directed relay and translation domain. mdns-v1 described one
-// LAN and one container bridge per rule with fixed directions; v2 rules are
-// per-direction, so the version moved rather than a v1 document being read as a
-// different topology.
+// mdns-v2 is the directed relay and translation domain: one rule is one
+// direction between two mDNS domains (see internal/mdns/reflect.go).
 const domainMDNS = "mdns-v2"
 
 // mdnsState is the mdns feature's part of Server.

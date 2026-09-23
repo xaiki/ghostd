@@ -197,15 +197,6 @@ same JSON shape shown above) — empty when the `mdns` feature is not built in
 or nothing is configured. This is what lets a caller diff its desired set
 against what is actually live instead of blindly re-applying every run.
 
-The domain moved from `mdns-v1` to `mdns-v2` when reflection became directional,
-and **a v1 target is not read**: the domain and its config key both changed, so an
-upgraded daemon boots with mDNS unconfigured and the host is out of the relay
-until the new target is applied. That is deliberate — a v1 rule
-(`{"lan": ..., "network": ...}`) describes a different topology, and reading it as
-v2 would silently relay the wrong thing. The old `mdns-config.json` and
-`mdns-v1-transaction.json` are inert once the new target is confirmed and can be
-deleted.
-
 ### Relaying mDNS between domains (reflect)
 
 `reflect` relays mDNS between **domains** — one interface each: a VLAN, the
