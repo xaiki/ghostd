@@ -34,13 +34,6 @@ func NewService() *Service { return &Service{Addrs: InterfaceAddrs} }
 
 func (s *Service) Config() Config { s.mu.Lock(); defer s.mu.Unlock(); return s.cfg }
 
-// reflectRule is a ReflectRule resolved to interface indexes with its filter.
-type reflectRule struct {
-	cfg      ReflectRule
-	f        *filter
-	lan, net int
-}
-
 type running struct {
 	a      answerer
 	ifaces map[int]net.Interface
@@ -55,7 +48,11 @@ type running struct {
 	testForward func(ifIndex int, m *dns.Msg)
 
 	advertise map[int]bool
-	rules     []*reflectRule
+	// relays are the effective from->to pairs a path connects, indexed by the
+	// interface a record is heard on and the interface a question is heard on.
+	relays    []*relay
+	byFrom    map[int][]*relay
+	byTo      map[int][]*relay
 	nats      []*natRule
 	natRunner NATRunner
 	// testEmit captures everything sent outward (interface index, message).
@@ -113,7 +110,8 @@ func (s *Service) start(cfg Config) (*running, error) {
 	if addrsFor == nil {
 		addrsFor = InterfaceAddrs
 	}
-	r := &running{a: answerer{cfg: cfg, addrs: addrsFor}, ifaces: map[int]net.Interface{}, advertise: map[int]bool{}, done: make(chan struct{})}
+	r := &running{a: answerer{cfg: cfg, addrs: addrsFor}, ifaces: map[int]net.Interface{}, advertise: map[int]bool{}, done: make(chan struct{}),
+		byFrom: map[int][]*relay{}, byTo: map[int][]*relay{}}
 	lookup := func(name string) (*net.Interface, error) {
 		i, err := net.InterfaceByName(name)
 		if err != nil {
@@ -139,26 +137,41 @@ func (s *Service) start(cfg Config) (*running, error) {
 			r.advertise[i.Index] = true
 		}
 	}
+	var edges []*relaying
+	pools := map[int]*ports{}
 	for _, rule := range cfg.Reflect {
-		lan, err := lookup(rule.LAN)
+		from, err := lookup(rule.From)
 		if err != nil {
 			return nil, err
 		}
-		ctr, err := lookup(rule.Network)
+		to, err := lookup(rule.To)
 		if err != nil {
 			return nil, err
 		}
-		r.rules = append(r.rules, &reflectRule{cfg: rule, f: newFilter(rule.AllowServices), lan: lan.Index, net: ctr.Index})
-		if rule.Advertise != nil {
-			n, err := newNATRule(rule, lan.Index, func() []netip.Prefix {
-				subnet, _ := addrsFor(rule.Network)
-				return subnet
-			}, reserved)
-			if err != nil {
-				return nil, err
-			}
-			r.nats = append(r.nats, n)
+		if rule.Advertise == nil {
+			edges = append(edges, &relaying{cfg: rule, from: from.Index, to: to.Index})
+			continue
 		}
+		// One port namespace per published-on interface: every rule publishing
+		// there allocates from it, so two sources can never share a DNAT port.
+		pool := pools[to.Index]
+		if pool == nil {
+			pool = newPorts()
+			pools[to.Index] = pool
+		}
+		n, err := newNATRule(rule, from.Index, to.Index, pool, func() []netip.Prefix {
+			subnet, _ := addrsFor(rule.From)
+			return subnet
+		}, reserved)
+		if err != nil {
+			return nil, err
+		}
+		r.nats = append(r.nats, n)
+	}
+	r.relays = planRelays(edges)
+	for _, p := range r.relays {
+		r.byFrom[p.from] = append(r.byFrom[p.from], p)
+		r.byTo[p.to] = append(r.byTo[p.to], p)
 	}
 	pc4, err := net.ListenPacket("udp4", wellknown.HostPort("0.0.0.0", wellknown.PortMDNS))
 	if err != nil {
@@ -405,21 +418,22 @@ func (r *running) serve6() {
 	}
 }
 
-// reflect relays one packet between a LAN and the container networks attached to
-// it, through each network's own filter.
+// reflect relays one packet out of the domain it was heard on, through every
+// pair that domain composes into. A record goes out to every domain its source
+// reaches; a question goes back along every pair that reaches the domain it was
+// asked on. Nothing is re-received, so there is no path for a packet to loop on.
 func (r *running) reflect(m *dns.Msg, ifIndex int, v6 bool) {
-	for _, rule := range r.rules {
-		switch {
-		case ifIndex == rule.net && !m.Response:
-			// A container asking: only what the network may ask goes to the LAN.
-			if q := rule.f.Queries(m); q != nil {
-				r.forward(q, rule.lan, v6)
+	if m.Response {
+		for _, p := range r.byFrom[ifIndex] {
+			if resp := p.f.Responses(m); resp != nil {
+				r.forward(resp, p.to, v6)
 			}
-		case ifIndex == rule.lan && m.Response:
-			// The LAN answering or announcing: only what the network may see goes in.
-			if resp := rule.f.Responses(m); resp != nil {
-				r.forward(resp, rule.net, v6)
-			}
+		}
+		return
+	}
+	for _, p := range r.byTo[ifIndex] {
+		if q := p.f.Queries(m); q != nil {
+			r.forward(q, p.from, v6)
 		}
 	}
 }

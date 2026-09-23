@@ -1,6 +1,7 @@
 #!/bin/sh
 # Recreated at every boot, the way netconfig would: a LAN bridge that ghostd
-# serves DHCP/DNS on, and two client network namespaces plugged into it.
+# serves DHCP/DNS on, a second LAN domain (the reflector's other end, a stand-in
+# for a VLAN), and two client network namespaces plugged into the first.
 set -eu
 ip link add lab0 type bridge 2>/dev/null || true
 ip addr replace 10.77.0.1/24 dev lab0
@@ -38,6 +39,24 @@ if ! ip netns list | grep -qw printer; then
 	nsenter --net=/run/netns/printer -- ip addr add 10.77.0.60/24 dev printerp
 	nsenter --net=/run/netns/printer -- ip link set printerp up
 	nsenter --net=/run/netns/printer -- ip route add 224.0.0.0/4 dev printerp
+fi
+
+# A second LAN domain: a bridge with one client and no responder of its own, so
+# what it hears is only what ghostd exports into it — the other end of a relay
+# rule, standing in for a VLAN.
+ip link add lab1 type bridge 2>/dev/null || true
+ip addr replace 10.78.0.1/24 dev lab1
+ip link set lab1 up
+if ! ip netns list | grep -qw viewer; then
+	ip netns add viewer
+	ip link add viewer type veth peer name viewerp address 02:00:00:00:00:70
+	ip link set viewer master lab1
+	ip link set viewer up
+	ip link set viewerp netns viewer
+	nsenter --net=/run/netns/viewer -- ip link set lo up
+	nsenter --net=/run/netns/viewer -- ip addr add 10.78.0.60/24 dev viewerp
+	nsenter --net=/run/netns/viewer -- ip link set viewerp up
+	nsenter --net=/run/netns/viewer -- ip route add 224.0.0.0/4 dev viewerp
 fi
 
 # Two container networks, each a multicast domain of its own with one "container"

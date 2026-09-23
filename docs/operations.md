@@ -91,8 +91,8 @@ contains:
 | `firewall-transaction.json` | Confirmed ruleset and/or the pending firewall lease |
 | `netconfig-transaction.json` | Confirmed netconfig target and/or its pending lease |
 | `dhcp-v1-transaction.json` | Confirmed DHCP configuration and/or its pending lease |
-| `mdns-v1-transaction.json` | Confirmed mDNS advertisement and/or its pending lease |
-| `mdns-config.json`, `dhcp-config.json` | The live copies of those configurations, converged on by watchers |
+| `mdns-v2-transaction.json` | Confirmed mDNS advertisement and/or its pending lease |
+| `mdns-config-v2.json`, `dhcp-config.json` | The live copies of those configurations, converged on by watchers |
 | `dns-acl.json` | Per-container DNS identities (read at start; see [dhcp.md](dhcp.md#per-container-dns-acl)) |
 | `replica-dhcp-config.json` | A warm standby's mirror of the leader's DHCP configuration |
 | `transaction.lock` | Process-shared lock serialising mutations and recovery |
@@ -169,7 +169,7 @@ built with different values is not what the daemon would apply.
 
 ## mDNS advertisement
 
-The `mdns-v1` domain rides the ordinary Apply/Confirm lease. Its target names the
+The `mdns-v2` domain rides the ordinary Apply/Confirm lease. Its target names the
 LAN interfaces, the `.local` host name (answered with the interface's addresses)
 and the DNS-SD instances to advertise:
 
@@ -197,70 +197,114 @@ same JSON shape shown above) — empty when the `mdns` feature is not built in
 or nothing is configured. This is what lets a caller diff its desired set
 against what is actually live instead of blindly re-applying every run.
 
-### Per-container reflector
+The domain moved from `mdns-v1` to `mdns-v2` when reflection became directional,
+and **a v1 target is not read**: the domain and its config key both changed, so an
+upgraded daemon boots with mDNS unconfigured and the host is out of the relay
+until the new target is applied. That is deliberate — a v1 rule
+(`{"lan": ..., "network": ...}`) describes a different topology, and reading it as
+v2 would silently relay the wrong thing. The old `mdns-config.json` and
+`mdns-v1-transaction.json` are inert once the new target is confirmed and can be
+deleted.
 
-`reflect` in the same target relays mDNS between the LAN and **per-container
-networks** (one Podman network per container or pod, whose bridge is a multicast
-domain of its own), so an application that speaks mDNS itself works on the
-container network with no host networking:
+### Relaying mDNS between domains (reflect)
+
+`reflect` relays mDNS between **domains** — one interface each: a VLAN, the
+physical LAN, a container network's bridge (one Podman network per container or
+pod, whose bridge is a multicast domain of its own). A rule is **one direction**:
 
 ```json
 {"reflect": [
-  {"lan": "eth0", "network": "podman-print", "allow_services": ["_ipp._tcp"]},
-  {"lan": "eth0", "network": "podman-music", "allow_services": ["_googlecast._tcp"]}]}
+  {"from": "vlan-guest", "to": "vlan-media", "allow_services": ["_googlecast._tcp"]},
+  {"from": "vlan-media", "to": "podman-player", "allow_services": ["*"]},
+  {"from": "podman-player", "to": "vlan-guest",
+   "advertise": {"services": ["_ipp._tcp"], "ports": "20000-20999"}}]}
 ```
 
-The permission is the network: each rule has its own filter. Toward the container
-go LAN records for the allowed classes and for the instances they name (PTR, SRV,
-TXT, and the address records of the hosts their SRVs point at, remembered for two
-minutes); nothing else — no other class, no unrelated host. Toward the LAN go only
-the container's *queries* for allowed classes and the hosts those services named.
-A browser that enumerates the service types first is served too: the enumeration
-question names no class of its own, so it is relayed and its answers are filtered
-like any other record — the classes it may see. One rule per network (a network is
-one permission set); `records` and `host` are needed only if you also advertise.
-The container bridge's firewall zone needs the `mdns` service.
+`{"from": a, "to": b}` means **a's services become visible on b**: a record heard
+on `a` is delivered to `b`, and a question heard on `b` is delivered to `a` so a's
+own responders answer it. Writing one direction says nothing about the other —
+`{"from": vlan-media, "to": vlan-guest}` beside the rule above is a second,
+independent permission — and a domain can only discover what is exported *into*
+it, so an interface no rule names takes no part in the relay at all.
 
-#### mDNS NAT: containers advertising to the LAN
+**Rules compose.** If a's services reach b and b's reach c, then a's reach c, and
+the question travels back along the same path. The relation is computed when the
+configuration is applied, not by re-reflecting packets, so a forwarded packet is
+never one ghostd has to hear again and cannot loop. Two consequences are worth
+knowing:
 
-A service a container advertises on its bridge names a bridge-private address, so
-reflecting it as-is would send LAN clients somewhere they cannot reach. Add
-`advertise` to the rule and ghostd does what a router would:
+- **A path carries only the classes every rule on it allows.** `a -> b` allowing
+  `_ipp._tcp` and `b -> c` allowing `_smb._tcp` leaves c with neither of a's
+  classes; `"*"` — which may not be listed beside a class — is every class. A pair
+  that several paths reach sees the union of what each path allows. `"*"` still
+  carries only the hosts a service named, never an unrelated host's address.
+- **A domain never receives its own records back**, so two domains exporting to
+  each other are two rules and not an echo.
+
+Each ordered pair has its own filter: the host names one pair learned to resolve
+are not another pair's business. Toward a destination go the records for the
+allowed classes and the instances they name (PTR, SRV, TXT, and the address records
+of the hosts their SRVs point at, remembered for two minutes); nothing else — no
+other class, no unrelated host. Back the other way go only that domain's *queries*
+for allowed classes and the hosts those services named. A browser that enumerates
+the service types first is served too: the enumeration question names no class of
+its own, so it is relayed and its answers are filtered like any other record — the
+classes it may see. `records` and `host` are needed only if you also advertise.
+Every interface a rule names, and every firewall zone behind it, needs the `mdns`
+service. One direction may not be written twice.
+
+#### mDNS translation: a domain whose addresses do not reach (advertise)
+
+A rule's alternative to `allow_services` is `advertise` — exactly one of the two
+per rule. Instead of relaying the source's records verbatim, which for a container
+bridge would send clients to an address they cannot reach, ghostd translates them:
 
 ```json
-{"lan": "eth0", "network": "podman-print",
+{"from": "podman-print", "to": "vlan-office",
  "advertise": {"services": ["_ipp._tcp"], "ports": "20000-20999"}}
 ```
 
-It learns the container's instances (PTR, SRV, TXT and its host's address, goodbyes
-included) and re-advertises each on the LAN under **ghostd's own LAN address** and
-a **port from the pool** (stable per container address and port), keeping the host
-name the container itself advertised, and installs a DNAT from that port to the
-container's address and port in its own nft table (`ghostd_mdns_nat`, replaced
-atomically, removed on stop). A LAN client browsing `_ipp._tcp` finds the
-container's service, resolves the container's own name to ghostd, and its
-connection lands in the container: no host networking, nothing published by hand,
-and the bridge address is never disclosed. It also answers LAN queries from what it
-learned and relays them to the network so the container refreshes. Records lapse
-with their own TTLs. Only IPv4 is mapped, so only IPv4 is published.
+It learns the source's instances (PTR, SRV, TXT and its host's address, goodbyes
+included) and re-advertises each on the destination interface under **ghostd's own
+address there** and a **port from the pool** (stable per source address and port),
+keeping the host name the source itself advertised, and installs a DNAT from that
+port to the source's address and port in its own nft table (`ghostd_mdns_nat`,
+replaced atomically, removed on stop). A client browsing `_ipp._tcp` finds the
+service, resolves the source's own name to ghostd, and its connection lands in the
+container: no host networking, nothing published by hand, and the bridge address is
+never disclosed. It also answers queries on the destination from what it learned
+and relays them to the source so the container refreshes. Records lapse with their
+own TTLs. Only IPv4 is mapped, so only IPv4 is published.
+
+**Translation is terminal.** A translated record is ghostd's own announcement on
+the destination interface and is not exported onward: rules compose for relays,
+not for translations. If a third domain should also see the container, give it its
+own rule from the container. The DNAT is scoped to the interface the record is
+published on, so an onward copy would advertise a port that could not work.
+
+Rules that publish on the same interface share one port pool — their `ports`
+ranges have to agree — so two sources can never be handed the same port. The DNAT
+table matches on interface and destination port, and the first match would win, so
+a shared port would leave one service silently unreachable.
 
 Nothing is asked of the container: it announces as it always would, on its own
-network, and ghostd learns from that broadcast. Only an address the container
-announced **on its own network** is translated — an address it also announces
-elsewhere (its loopback, another network) is ignored, so a LAN port can never be
-pointed off the container network — and the DNAT is scoped to traffic addressed to
+network, and ghostd learns from that broadcast. Only an address the source
+announced **on its own interface** is translated — an address it also announces
+elsewhere (its loopback, another network) is ignored, so a published port can
+never be pointed off that domain — and the DNAT is scoped to traffic addressed to
 ghostd itself (`fib daddr type local`), so a pool port does not intercept traffic
-meant for another host on the LAN.
+meant for another host.
 
 The firewall must let the translated flows through its default-drop forward
 policy: set `"allow_dnat_forward": true` in the firewall target (it admits only
 connections a DNAT rule actually rewrote, `ct status dnat`), enable IPv4
-forwarding in netconfig, and give the container network's zone the `mdns` service.
-Instance *and host* names learned this way are not conflict-probed on the LAN:
-keep them distinct, and note that a name ghostd advertises itself (`host` above)
-is never taken over by a container — such an instance keeps the network's name
-instead. `records` entries accept their own `"host"` for the same reason a
-container's do: the SRV points at it and the address records follow it.
+forwarding in netconfig, and give both domains' zones the `mdns` service.
+Instance *and host* names learned this way are not conflict-probed on the
+destination: keep them distinct, and note that a name ghostd advertises itself
+(`host` above) is never taken over by a container — such an instance keeps the
+source interface's name instead. `records` entries accept their own `"host"` for
+the same reason a container's do: the SRV points at it and the address records
+follow it.
 
 ## Environment
 

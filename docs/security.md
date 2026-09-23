@@ -171,11 +171,15 @@ to:
   address, so pair each identity with host firewall policy admitting only that
   container to its own address. A missing or unparsable policy makes the listener
   refuse everything rather than fall back to open access.
-- **`mdns-v1`** advertises only what the operator declares, on named interfaces, and
-  refuses to advertise over a name another host already owns. Deployer access lets
-  a caller advertise any record set on the LAN: treat it like the other domains.
+- **`mdns-v2`** advertises only what the operator declares, on named interfaces, and
+  refuses to advertise over a name another host already owns. The `reflect` rules
+  are the same trust boundary as a firewall zone: a rule exports one interface's
+  services to another, rules compose, and the class list decides what crosses.
+  Deployer access lets a caller advertise any record set, or open any direction, on
+  the LAN: treat it like the other domains.
   **`reflect` with `advertise`** additionally re-advertises what a *container*
-  announces on its own network, at ghostd's LAN address and a pooled DNAT port: the
+  announces on its own network, at ghostd's address on the destination interface
+  and a pooled DNAT port: the
   name and instance come from the container, so a container can put a service (or a
   name) in front of the LAN, though only an address it announced on that network is
   ever a translation target and the rule is scoped to traffic addressed to ghostd.

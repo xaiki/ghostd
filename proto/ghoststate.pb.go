@@ -245,7 +245,7 @@ type State struct {
 	NetconfigJson        string `protobuf:"bytes,2,opt,name=netconfig_json,json=netconfigJson,proto3" json:"netconfig_json,omitempty"`
 	AdoptionEvidenceJson string `protobuf:"bytes,3,opt,name=adoption_evidence_json,json=adoptionEvidenceJson,proto3" json:"adoption_evidence_json,omitempty"`
 	DhcpConfigJson       string `protobuf:"bytes,4,opt,name=dhcp_config_json,json=dhcpConfigJson,proto3" json:"dhcp_config_json,omitempty"`
-	// The mdns-v1 domain's current advertised set, empty when the mdns
+	// The mdns-v2 domain's current advertised set, empty when the mdns
 	// feature is not built in or nothing is configured. See
 	// internal/mdns.Config for the shape.
 	MdnsConfigJson string `protobuf:"bytes,5,opt,name=mdns_config_json,json=mdnsConfigJson,proto3" json:"mdns_config_json,omitempty"`

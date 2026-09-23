@@ -3,6 +3,7 @@
 package mdns
 
 import (
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -10,36 +11,44 @@ import (
 	"github.com/miekg/dns"
 )
 
-// The per-container mDNS reflector.
+// The directed mDNS relay.
 //
-// A container network (one Podman network per container or pod) is a multicast
-// domain of its own, so what is reflected into it is exactly what that network
-// is allowed to see: the permission is a property of the network, not of a
-// packet. For each rule ghostd relays, between the LAN interface and the
-// container network's interface,
+// A domain is one interface carrying its own mDNS: a VLAN, a physical LAN, a
+// container network's bridge. A rule {from, to} says that from's services
+// become visible on to — a record heard on from is delivered to to, and a
+// question heard on to is delivered to from so from's own responders answer it.
+// Direction belongs to the rule, so {from: a, to: b} and {from: b, to: a} are
+// independent permissions and writing one says nothing about the other.
 //
-//   - container -> LAN: only *queries* about the service classes the network
-//     allows (and about hosts those services named), plus the service-type
-//     enumeration, whose answers are filtered like any other record;
-//   - LAN -> container: only *records* for those classes, plus the SRV, TXT and
-//     address records of the instances they name.
+// Rules compose into a reachability relation: if a's services reach b and b's
+// reach c then a's reach c, and the same rules carry the question back the other
+// way. That relation is computed once per applied configuration rather than by
+// re-reflecting packets, so a forwarded packet is never one ghostd has to hear
+// again and cannot loop. Every ordered pair a path connects gets its own filter
+// carrying only the classes allowed on *every* rule along a path (permissions
+// intersect as they compose, and a pair several paths reach sees the union of
+// what each path allows), so the host names one pair has learned to resolve are
+// not another pair's business. A domain never receives its own records back, so
+// two domains exporting to each other cannot echo.
 //
-// Everything else stays where it is. A container's own advertisement is not
-// relayed outward either — its address is private to the bridge — but with
-// `advertise` it is re-advertised from the LAN under ghostd's own address, with
-// a DNAT into the container: see nat.go.
+// A rule with `advertise` is not a relay: it translates the source's records
+// onto the destination instead (nat.go), because the addresses they name are not
+// reachable there. That translation is terminal — a translated record is
+// ghostd's own announcement on that interface, not something it exports onward,
+// and the DNAT it installs is scoped to the interface it is published on, so an
+// onward copy would advertise a port that could not work.
 
-// ReflectRule connects one container network to a LAN.
+// ReflectRule connects two mDNS domains, directionally.
 type ReflectRule struct {
-	// LAN is the LAN interface whose mDNS is reflected.
-	LAN string `json:"lan"`
-	// Network is the container network's bridge interface. One rule per
-	// network: a network is one permission set.
-	Network string `json:"network"`
-	// AllowServices are the DNS-SD classes (_ipp._tcp) this network may browse.
-	AllowServices []string `json:"allow_services"`
-	// Advertise re-advertises the container network's own service instances on the
-	// LAN under ghostd's address, with DNAT into the container (see nat.go).
+	// From is the interface whose services this rule exports.
+	From string `json:"from"`
+	// To is the interface they become visible on.
+	To string `json:"to"`
+	// AllowServices are the DNS-SD classes exported; ["*"] is every class.
+	AllowServices []string `json:"allow_services,omitempty"`
+	// Advertise translates instead of relaying: the source's records are
+	// re-advertised on the destination under ghostd's own address there, with a
+	// DNAT into the source (nat.go). Exactly one of this and AllowServices.
 	Advertise *NATConfig `json:"advertise,omitempty"`
 }
 
@@ -77,9 +86,10 @@ func (f *filter) enumerable(rr dns.RR) bool {
 	return ok && f.allowedName(p.Ptr)
 }
 
-// filter decides what one container network may see.
+// filter decides what one pair — everything one domain may show another — sees.
 type filter struct {
 	allow map[string]bool
+	all   bool
 	mu    sync.Mutex
 	hosts map[string]time.Time // .local hosts named by allowed services
 	now   func() time.Time
@@ -88,6 +98,10 @@ type filter struct {
 func newFilter(services []string) *filter {
 	f := &filter{allow: map[string]bool{}, hosts: map[string]time.Time{}, now: time.Now}
 	for _, s := range services {
+		if s == "*" {
+			f.all = true
+			continue
+		}
 		f.allow[strings.ToLower(s)] = true
 	}
 	return f
@@ -95,7 +109,7 @@ func newFilter(services []string) *filter {
 
 func (f *filter) allowedName(name string) bool {
 	c, ok := classOf(name)
-	return ok && f.allow[c]
+	return ok && (f.all || f.allow[c])
 }
 
 func (f *filter) grant(host string) {
@@ -178,5 +192,153 @@ func (f *filter) Responses(m *dns.Msg) *dns.Msg {
 	if len(out.Answer) == 0 && len(out.Extra) == 0 {
 		return nil
 	}
+	return out
+}
+
+// classSet is what a rule, or a pair reached through several rules, may carry:
+// every class, or a set of them.
+type classSet struct {
+	all bool
+	set map[string]bool
+}
+
+func classesOf(services []string) classSet {
+	cs := classSet{set: map[string]bool{}}
+	for _, s := range services {
+		if s == "*" {
+			cs.all = true
+			continue
+		}
+		cs.set[strings.ToLower(s)] = true
+	}
+	return cs
+}
+
+func (c classSet) empty() bool { return !c.all && len(c.set) == 0 }
+
+// intersect is what composing two rules may carry: a class has to be allowed by
+// both, so the narrower rule bounds the wider one.
+func (c classSet) intersect(o classSet) classSet {
+	switch {
+	case o.all:
+		return c
+	case c.all:
+		return o
+	}
+	out := classSet{set: map[string]bool{}}
+	for k := range c.set {
+		if o.set[k] {
+			out.set[k] = true
+		}
+	}
+	return out
+}
+
+// union is what reaching one pair by two paths may carry.
+func (c classSet) union(o classSet) classSet {
+	if c.all || o.all {
+		return classSet{all: true}
+	}
+	out := classSet{set: map[string]bool{}}
+	for k := range c.set {
+		out.set[k] = true
+	}
+	for k := range o.set {
+		out.set[k] = true
+	}
+	return out
+}
+
+func (c classSet) equal(o classSet) bool {
+	if c.all != o.all || len(c.set) != len(o.set) {
+		return false
+	}
+	for k := range c.set {
+		if !o.set[k] {
+			return false
+		}
+	}
+	return true
+}
+
+func (c classSet) services() []string {
+	if c.all {
+		return []string{"*"}
+	}
+	out := make([]string, 0, len(c.set))
+	for k := range c.set {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// relaying is one relay rule resolved to interface indexes.
+type relaying struct {
+	cfg      ReflectRule
+	from, to int
+}
+
+// relay is one effective pair: the filter deciding what from's domain may show
+// to's domain. Relay rules are the edges; advertise rules are not (they
+// translate, see nat.go), so they take no part in the relation.
+type relay struct {
+	from, to int
+	f        *filter
+}
+
+// planRelays resolves the relay rules into every pair a path connects. Rules
+// compose with an intersecting class set, so for each source the relation is
+// walked outward from it: a pair carries the classes every rule on a path
+// allows, and a pair several paths reach keeps the union of what each path
+// allows. Only a strict improvement is propagated, which ends the walk even
+// when the source is reachable from itself through a cycle — and such a cycle
+// can never widen a pair, because the classes it contributes are the ones a path
+// reaching the same pair without revisiting the source already allows.
+func planRelays(rules []*relaying) []*relay {
+	byFrom := map[int][]*relaying{}
+	for _, e := range rules {
+		byFrom[e.from] = append(byFrom[e.from], e)
+	}
+	var out []*relay
+	for source := range byFrom {
+		best := map[int]classSet{}
+		var queue []int
+		push := func(to int, cs classSet) {
+			if cs.empty() {
+				return
+			}
+			merged := cs
+			if prev, ok := best[to]; ok {
+				if merged = prev.union(cs); prev.equal(merged) {
+					return
+				}
+			}
+			best[to] = merged
+			queue = append(queue, to)
+		}
+		for _, e := range byFrom[source] {
+			push(e.to, classesOf(e.cfg.AllowServices))
+		}
+		for len(queue) > 0 {
+			via := queue[0]
+			queue = queue[1:]
+			for _, e := range byFrom[via] {
+				push(e.to, best[via].intersect(classesOf(e.cfg.AllowServices)))
+			}
+		}
+		for to, cs := range best {
+			if to == source {
+				continue // a domain never receives its own records back
+			}
+			out = append(out, &relay{from: source, to: to, f: newFilter(cs.services())})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].from != out[j].from {
+			return out[i].from < out[j].from
+		}
+		return out[i].to < out[j].to
+	})
 	return out
 }

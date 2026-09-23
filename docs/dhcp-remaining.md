@@ -36,9 +36,9 @@ disposable containers.
 | Production boot path and reboot | The real binary under systemd, container restarted: confirmed firewall, netconfig, handover and mDNS survive; dnsmasq stays masked | **e2e** |
 | Per-container DNS ACL | Listener identity, checked before lease answers and cache, per-identity cache, per-identity host grants | unit; integration (loopback aliases); e2e (avahi + python-zeroconf) |
 | mDNS without avahi on the host | Native legacy-unicast client | unit; e2e |
-| Per-container mDNS reflector | Per-network filters: allowed classes and the hosts they name inward, allowed queries outward | unit; e2e (avahi on the LAN, python-zeroconf inside two container-network namespaces: each sees only its own class, by browse and by name) |
-| mDNS NAT | Container advertisements re-advertised on the LAN at ghostd's address and a pooled port, DNAT into the container, goodbyes and expiry | unit; e2e (python-zeroconf advertiser inside a container network, avahi/zeroconf client on the LAN: found, resolved to ghostd:port, TCP connection lands in the container, withdrawn on goodbye) |
-| LAN advertisement | `mdns-v1` with probing and conflict refusal | unit; e2e (avahi as a competing responder, python-zeroconf as the client, across a reboot) |
+| Per-container mDNS relay | Directed rules between named domains (VLANs, the LAN, container bridges), composing into a reachability relation with the narrower class set: allowed classes and the hosts they name, allowed queries the other way | unit; e2e (avahi on the LAN, python-zeroconf inside two container-network namespaces, and a second bridge: direction allowed and denied, and a two-hop composition) |
+| mDNS translation | A source's advertisements re-advertised on the destination interface at ghostd's address and a pooled port (one pool per interface), DNAT into the container, goodbyes and expiry, terminal at its own rule | unit; e2e (python-zeroconf advertiser inside a container network, avahi/zeroconf client on the LAN: found, resolved to ghostd:port, TCP connection lands in the container, withdrawn on goodbye) |
+| LAN advertisement | `mdns-v2` with probing and conflict refusal | unit; e2e (avahi as a competing responder, python-zeroconf as the client, across a reboot) |
 | TFTP/PXE | `boot` + `tftp`, converter support | unit; e2e (dnsmasq, then ghostd, serve a boot file to busybox tftp behind the firewall) |
 | DHCPv6 prefix delegation | `pd` pool, ledger, attribution, kernel routes | unit; dhcp-lab (`dhclient -6 -P`, route installed and removed) |
 | Replication | Warm standby: `--follow`, mirrored ledger/config, fenced manual `promote` | unit (real gRPC between two ledgers) |
@@ -75,11 +75,13 @@ detection.
 - **A real power cut.** Durability across power loss rests on fsync of each state file
   and of every bolt transaction; it is verified by killing the process (SIGKILL), not by
   cutting power or dropping the disk cache.
-- **NAT and reflector limits.** Per container network by design. The NAT maps IPv4
+- **Relay and translation limits.** Rules are per direction and compose; translation
+  (a rule with `advertise`) is terminal at its own rule, so a domain that should also
+  see a translated service needs its own rule from the source. The NAT maps IPv4
   only, does not conflict-probe the names it re-advertises — instance *or* host
   names, though a name ghostd advertises itself is never taken over — and learns
-  from what a container announces, mapping only an address announced on that
-  network. IPv6 reflection is implemented but lab-tested on IPv4 only.
+  from what a source announces, mapping only an address announced on that source's
+  own interface. IPv6 reflection is implemented but lab-tested on IPv4 only.
 - **DNS ACL identity is a network-path property.** Enforcing that only one container
   can reach its resolver address is host firewall work.
 - **General dnsmasq replacement remains a subset.** Ranges that match on tags,

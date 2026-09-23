@@ -57,7 +57,7 @@ message State {
   string netconfig_json = 2;
   string adoption_evidence_json = 3;
   string dhcp_config_json = 4;
-  // The mdns-v1 domain's current advertised set, empty when the mdns
+  // The mdns-v2 domain's current advertised set, empty when the mdns
   // feature is not built in or nothing is configured. See
   // internal/mdns.Config for the shape.
   string mdns_config_json = 5;

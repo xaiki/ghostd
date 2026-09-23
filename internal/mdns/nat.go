@@ -18,29 +18,30 @@ import (
 	"github.com/miekg/dns"
 )
 
-// mDNS NAT: a container's own advertisements, made findable from the LAN.
+// mDNS NAT: a domain's own advertisements, made findable where their addresses
+// do not reach.
 //
 // A service a container advertises on its bridge names a bridge-private address,
-// so reflecting it as-is would send LAN clients to somewhere they cannot reach.
-// The NAT does what a router would: ghostd re-advertises the instance on the LAN
-// with its own LAN address and a port from a per-network pool, and installs a
-// DNAT (in its own nft table) from that port to the container's address and port.
-// A LAN client browsing _ipp._tcp finds "Printer" at ghostd:20017 and its
-// connection lands in the container, with no host networking and nothing
-// published by hand. The container's own host name comes with it, so the LAN
-// resolves what the container's records already name; only an address the
-// container announced on that network is translated, and the DNAT rewrites only
-// traffic addressed to ghostd itself.
+// so relaying it as-is would send clients on the other domain to somewhere they
+// cannot reach. The NAT does what a router would: ghostd re-advertises the
+// instance on the destination interface with its own address there and a port
+// from a pool, and installs a DNAT (in its own nft table) from that port to the
+// source's address and port. A client browsing _ipp._tcp finds "Printer" at
+// ghostd:20017 and its connection lands in the container, with no host
+// networking and nothing published by hand. The container's own host name comes
+// with it, so the destination resolves what the container's records already
+// name; only an address the source announced on its own interface is translated,
+// and the DNAT rewrites only traffic addressed to ghostd itself.
 //
-// State is learned, not configured: it follows what the container announces
+// State is learned, not configured: it follows what the source announces
 // (including goodbyes) and expires with the records' own lifetimes.
 
-// NATConfig turns on outward advertisement for one container network.
+// NATConfig turns on translation for one relay rule.
 type NATConfig struct {
 	// Services are the DNS-SD classes whose instances are re-advertised.
 	Services []string `json:"services"`
-	// Ports is the pool of LAN-side ports ("20000-20999") the instances are mapped
-	// to; each (container address, port) gets a stable one.
+	// Ports is the pool of ports ("20000-20999") the instances are mapped to on
+	// the published-on interface; each (source address, port) gets a stable one.
 	Ports string `json:"ports"`
 }
 
@@ -70,14 +71,24 @@ func (n NATConfig) validate() error {
 	return err
 }
 
-// natMapping is one DNAT: LAN port to a container endpoint.
+// ports is the DNAT port namespace of one published-on interface. Every rule
+// that publishes there allocates from the same set: the DNAT rules match on
+// interface and destination port, so two rules sharing a port would leave one of
+// them silently unreachable (the first match wins).
+type ports struct {
+	mu   sync.Mutex
+	used map[int]string // port -> owner
+}
+
+func newPorts() *ports { return &ports{used: map[int]string{}} }
+
+// natMapping is one DNAT: a port on the published-on interface, to a source endpoint.
 type natMapping struct {
-	lan     string
-	proto   string // tcp | udp
-	port    int
-	target  netip.Addr
-	tport   int
-	network string
+	to     string
+	proto  string // tcp | udp
+	port   int
+	target netip.Addr
+	tport  int
 }
 
 // NATRunner applies the DNAT table; the default drives nft.
@@ -106,8 +117,8 @@ func renderNAT(maps []natMapping) string {
 		return b.String()
 	}
 	sort.Slice(maps, func(i, j int) bool {
-		if maps[i].lan != maps[j].lan {
-			return maps[i].lan < maps[j].lan
+		if maps[i].to != maps[j].to {
+			return maps[i].to < maps[j].to
 		}
 		if maps[i].proto != maps[j].proto {
 			return maps[i].proto < maps[j].proto
@@ -116,7 +127,7 @@ func renderNAT(maps []natMapping) string {
 	})
 	fmt.Fprintf(&b, "table inet %s {\n  chain prerouting {\n    type nat hook prerouting priority dstnat; policy accept;\n", natTable)
 	for _, m := range maps {
-		fmt.Fprintf(&b, "    iifname %q fib daddr type local %s dport %d dnat ip to %s:%d\n", m.lan, m.proto, m.port, m.target, m.tport)
+		fmt.Fprintf(&b, "    iifname %q fib daddr type local %s dport %d dnat ip to %s:%d\n", m.to, m.proto, m.port, m.target, m.tport)
 	}
 	b.WriteString("  }\n}\n")
 	return b.String()
@@ -138,26 +149,28 @@ type natInstance struct {
 func (i *natInstance) key() string { return norm(i.instance + "." + i.service + ".local.") }
 
 type natRule struct {
-	mu       sync.Mutex
-	cfg      ReflectRule
-	f        *filter
-	lo, hi   int
-	insts    map[string]*natInstance
-	hosts    map[string]natHost
-	used     map[int]string // LAN port -> instance key
-	lanIndex int
-	label    string
-	// subnet is the container network's own addressing, read when a mapping is
-	// made: a container's addresses elsewhere (its loopback, another network)
-	// name somewhere a LAN client must not be sent. Read lazily, so a bridge that
-	// only gains its address later still maps.
+	mu     sync.Mutex
+	cfg    ReflectRule
+	f      *filter
+	lo, hi int
+	insts  map[string]*natInstance
+	hosts  map[string]natHost
+	pool   *ports
+	from   int // the interface whose instances are learned
+	to     int // the interface they are published on
+	label  string
+	// subnet is the source domain's own addressing, read when a mapping is made:
+	// an address a source announced elsewhere (its loopback, another network)
+	// names somewhere a client must not be sent. Read lazily, so an interface
+	// that only gains its address later still maps.
 	subnet func() []netip.Prefix
 	// reserved are the host names ghostd advertises itself: a container may not
-	// take one over on the LAN.
+	// take one over on the published-on interface.
 	reserved map[string]bool
 	now      func() time.Time
 	// removed holds instances that left (goodbye or expiry) since the last
-	// announcement, so the LAN is told with TTL-0 records rather than left to cache.
+	// announcement, so the destination is told with TTL-0 records rather than left
+	// to cache.
 	removed []*natInstance
 }
 
@@ -167,7 +180,7 @@ type natHost struct {
 	exp time.Time
 }
 
-func newNATRule(cfg ReflectRule, lanIndex int, subnet func() []netip.Prefix, reserved map[string]bool) (*natRule, error) {
+func newNATRule(cfg ReflectRule, from, to int, pool *ports, subnet func() []netip.Prefix, reserved map[string]bool) (*natRule, error) {
 	lo, hi, err := cfg.Advertise.portRange()
 	if err != nil {
 		return nil, err
@@ -175,11 +188,18 @@ func newNATRule(cfg ReflectRule, lanIndex int, subnet func() []netip.Prefix, res
 	if subnet == nil {
 		subnet = func() []netip.Prefix { return nil }
 	}
+	if pool == nil {
+		pool = newPorts()
+	}
 	return &natRule{cfg: cfg, f: newFilter(cfg.Advertise.Services), lo: lo, hi: hi, insts: map[string]*natInstance{}, hosts: map[string]natHost{},
-		used: map[int]string{}, lanIndex: lanIndex, label: natLabel(cfg.Network), subnet: subnet, reserved: reserved, now: time.Now}, nil
+		pool: pool, from: from, to: to, label: natLabel(cfg.From), subnet: subnet, reserved: reserved, now: time.Now}, nil
 }
 
-// natLabel is the .local host name the LAN sees for a network's services.
+// owner is what holds a pooled port: the source it is learned from and the
+// instance, so two rules publishing on one interface can never share a port.
+func (n *natRule) owner(i *natInstance) string { return n.cfg.From + "|" + i.key() }
+
+// natLabel is the .local host name the destination sees for a source's services.
 func natLabel(network string) string {
 	var b strings.Builder
 	for _, c := range strings.ToLower(network) {
@@ -206,22 +226,48 @@ func protoOf(service string) string {
 	return "tcp"
 }
 
-// allocate gives an instance a stable LAN port: hashed from what identifies it,
-// probing forward past ports in use.
+// allocate gives an instance a stable port: hashed from what identifies it,
+// probing forward past ports in use. The namespace is the interface's, shared
+// with every other rule publishing there.
 func (n *natRule) allocate(i *natInstance) bool {
 	h := fnv.New32a()
-	fmt.Fprintf(h, "%s|%s|%d", n.cfg.Network, i.ip, i.port)
+	fmt.Fprintf(h, "%s|%s|%d", n.cfg.From, i.ip, i.port)
 	size := n.hi - n.lo + 1
 	start := int(h.Sum32() % uint32(size))
+	owner := n.owner(i)
+	n.pool.mu.Lock()
+	defer n.pool.mu.Unlock()
 	for k := 0; k < size; k++ {
 		p := n.lo + (start+k)%size
-		if owner, taken := n.used[p]; !taken || owner == i.key() {
-			n.used[p] = i.key()
+		if held, taken := n.pool.used[p]; !taken || held == owner {
+			n.pool.used[p] = owner
 			i.hostPort = p
 			return true
 		}
 	}
 	return false
+}
+
+// release frees the pooled port an instance holds, leaving its hostPort as it
+// was so a goodbye can still name the port it is withdrawing.
+func (n *natRule) release(i *natInstance) {
+	if i.hostPort == 0 {
+		return
+	}
+	owner := n.owner(i)
+	n.pool.mu.Lock()
+	if n.pool.used[i.hostPort] == owner {
+		delete(n.pool.used, i.hostPort)
+	}
+	n.pool.mu.Unlock()
+}
+
+// held reports which owner holds a port, for tests and diagnostics.
+func (p *ports) held(port int) (string, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	owner, ok := p.used[port]
+	return owner, ok
 }
 
 // mapTarget is the address a container's service is mapped to: one of the
@@ -343,10 +389,8 @@ func (n *natRule) learn(m *dns.Msg) (changed bool) {
 			continue // nothing announced is on this network: keep the last address we verified
 		}
 		if i.ip != ip || i.hostPort == 0 {
-			if i.hostPort != 0 {
-				delete(n.used, i.hostPort)
-				i.hostPort = 0
-			}
+			n.release(i)
+			i.hostPort = 0
 			i.ip = ip
 			if !n.allocate(i) {
 				continue
@@ -359,7 +403,7 @@ func (n *natRule) learn(m *dns.Msg) (changed bool) {
 
 func (n *natRule) drop(i *natInstance) {
 	if i.hostPort != 0 {
-		delete(n.used, i.hostPort)
+		n.release(i)
 		c := *i
 		n.removed = append(n.removed, &c)
 	}
@@ -413,16 +457,16 @@ func (n *natRule) published() []*natInstance {
 func (n *natRule) mappings() []natMapping {
 	var out []natMapping
 	for _, i := range n.published() {
-		out = append(out, natMapping{lan: n.cfg.LAN, proto: protoOf(i.service), port: i.hostPort, target: i.ip, tport: i.port, network: n.cfg.Network})
+		out = append(out, natMapping{to: n.cfg.To, proto: protoOf(i.service), port: i.hostPort, target: i.ip, tport: i.port})
 	}
 	return out
 }
 
-// hostLabel is the .local host the LAN sees an instance under: the name the
-// container itself advertised, so a LAN client resolves what the container's own
+// hostLabel is the .local host the destination sees an instance under: the name
+// the source itself advertised, so a client resolves what the source's own
 // records — and anything they point at — already name. A name ghostd advertises
 // itself is never taken over, and anything that is not one plain label keeps the
-// network's name instead.
+// source interface's name instead.
 func (n *natRule) hostLabel(i *natInstance) string {
 	label, ok := strings.CutSuffix(i.host, ".local.")
 	if !ok || !hostRE.MatchString(label) || n.reserved[label] {
@@ -431,9 +475,9 @@ func (n *natRule) hostLabel(i *natInstance) string {
 	return label
 }
 
-// answerer builds the LAN-facing view: every instance in its own host name, at
-// ghostd's LAN address and the mapped port. Only IPv4 is mapped, so only IPv4
-// addresses are published.
+// answerer builds the destination-facing view: every instance in its own host
+// name, at ghostd's address on that interface and the mapped port. Only IPv4 is
+// mapped, so only IPv4 addresses are published.
 func (n *natRule) answerer(addrs func(string) ([]netip.Prefix, error)) answerer {
 	return n.answererFor(n.published(), addrs)
 }
@@ -502,21 +546,22 @@ func (r *running) applyNAT() {
 	}
 }
 
-// announceNAT (re)announces a rule's instances on its LAN interface.
+// announceNAT (re)announces a rule's instances on the interface they are
+// published on.
 func (r *running) announceNAT(n *natRule, ttl uint32) {
 	a := n.answerer(r.a.addrs)
 	name := ""
-	if i, ok := r.ifaces[n.lanIndex]; ok {
+	if i, ok := r.ifaces[n.to]; ok {
 		name = i.Name
 	}
 	if rrs := a.all(name, ttl); len(rrs) > 0 {
 		m := new(dns.Msg)
 		m.Response, m.Authoritative = true, true
 		m.Answer = rrs
-		r.emit(n.lanIndex, m)
+		r.emit(n.to, m)
 	}
 	// Whatever left since the last announcement is withdrawn explicitly (TTL 0), so
-	// LAN caches drop it now instead of after its lifetime.
+	// caches on that interface drop it now instead of after its lifetime.
 	if gone := n.takeRemoved(); len(gone) > 0 && ttl != 0 {
 		bye := n.answererFor(gone, r.a.addrs).all(name, 0)
 		var srvOnly []dns.RR
@@ -530,15 +575,15 @@ func (r *running) announceNAT(n *natRule, ttl uint32) {
 			m := new(dns.Msg)
 			m.Response, m.Authoritative = true, true
 			m.Answer = srvOnly
-			r.emit(n.lanIndex, m)
+			r.emit(n.to, m)
 		}
 	}
 }
 
-// natLearn is called for a container network's responses.
+// natLearn is called for a source interface's responses.
 func (r *running) natLearn(m *dns.Msg, ifIndex int) {
 	for _, n := range r.nats {
-		if ifIndex != n.cfgNet(r) || !m.Response {
+		if ifIndex != n.from || !m.Response {
 			continue
 		}
 		if n.learn(m) {
@@ -548,35 +593,25 @@ func (r *running) natLearn(m *dns.Msg, ifIndex int) {
 	}
 }
 
-func (n *natRule) cfgNet(r *running) int {
-	for _, rule := range r.rules {
-		if rule.cfg.Network == n.cfg.Network {
-			return rule.net
-		}
-	}
-	return -1
-}
-
-// natAnswer answers LAN queries for the classes a rule re-advertises, from what
-// it learned, and asks the container network when it has nothing yet.
+// natAnswer answers queries on the published-on interface for the classes a rule
+// re-advertises, from what it learned, and asks the source interface when it has
+// nothing yet.
 func (r *running) natAnswer(m *dns.Msg, src *net.UDPAddr, ifIndex int, v6 bool) {
 	if m.Response {
 		return
 	}
 	for _, n := range r.nats {
-		if ifIndex != n.lanIndex {
+		if ifIndex != n.to {
 			continue
 		}
 		// Answer from what is already known (the service classes and the rule's host
-		// name), and ask the container network to refresh the cache: its answers are
+		// name), and ask the source interface to refresh the cache: its answers are
 		// learned and announced.
 		if resp := n.answerer(r.a.addrs).Answer(m, r.ifaces[ifIndex].Name); resp != nil {
 			r.reply(m, resp, src, ifIndex, v6)
 		}
 		if q := n.f.Queries(m); q != nil {
-			if ctr := n.cfgNet(r); ctr >= 0 {
-				r.forward(q, ctr, v6)
-			}
+			r.forward(q, n.from, v6)
 		}
 	}
 }

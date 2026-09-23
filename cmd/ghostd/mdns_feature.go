@@ -20,11 +20,11 @@ var mdnsIfaces []string
 var mdnsInterfacesFlag *string
 
 func init() {
-	registerDomainHook(domainHook{name: "mdns-v1", key: mdns.ConfigFile, restore: restoreMDNSConfig})
+	registerDomainHook(domainHook{name: "mdns-v2", key: mdns.ConfigFile, restore: restoreMDNSConfig})
 	register(feature{
 		name: "mdns",
 		flags: func() {
-			mdnsInterfacesFlag = flag.String("mdns-interfaces", "", "comma-separated LAN interfaces the native mDNS client queries and the mdns-v1 advertisement uses (default: every up multicast interface for queries)")
+			mdnsInterfacesFlag = flag.String("mdns-interfaces", "", "comma-separated LAN interfaces the native mDNS client queries and the mdns-v2 advertisement uses (default: every up multicast interface for queries)")
 		},
 		cli: func() bool {
 			for _, name := range strings.Split(*mdnsInterfacesFlag, ",") {

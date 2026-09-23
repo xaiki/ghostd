@@ -47,7 +47,7 @@ var (
 	domains   = map[string]bool{"firewall": true, "netconfig": true}
 )
 
-// RegisterDomain admits a domain a compiled-in feature owns (dhcp-v1, mdns-v1).
+// RegisterDomain admits a domain a compiled-in feature owns (dhcp-v1, mdns-v2).
 // A domain whose feature is not built in stays unknown, so a stray transaction
 // record for it can never be read or written.
 func RegisterDomain(name string) {

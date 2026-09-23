@@ -585,6 +585,6 @@ real tailnet. Do those checks on a test VLAN before a production cutover.
 ## Current limits
 
 Multi-master allocation and automatic failover are not built and are excluded by
-design (see [Warm standby](#warm-standby)). The mDNS reflector is built per container
-network ([operations.md](operations.md#per-container-reflector)). Known gaps in what has
-landed are listed in [dhcp-remaining.md](dhcp-remaining.md).
+design (see [Warm standby](#warm-standby)). The mDNS relay is per direction between
+named domains ([operations.md](operations.md#relaying-mdns-between-domains-reflect)).
+Known gaps in what has landed are listed in [dhcp-remaining.md](dhcp-remaining.md).

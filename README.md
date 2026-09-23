@@ -42,7 +42,7 @@ opens only the sockets — it asked for:
 | `coredns` | The container resolver (CoreDNS) on the tailnet address, with the per-container DNS ACL | — |
 | `dhcp` | DHCPv4/v6, authoritative LAN DNS, the identity ledger, prefix delegation, TFTP/PXE, peer suggestions, warm standby, and their RPCs | `coredns` |
 | `dnsmasq` | Takeover from, and conversion of, a dnsmasq install (`--convert-dnsmasq`, the handover RPCs) | `dhcp` |
-| `mdns` | Native mDNS: `.local` and DNS-SD for containers (with `coredns`), and the `mdns-v1` advertisement domain | — |
+| `mdns` | Native mDNS: `.local` and DNS-SD for containers (with `coredns`), and the `mdns-v2` advertisement and relay domain | — |
 
 ```sh
 go build -trimpath -tags tailscale -o bin/ghostd ./cmd/ghostd                         # firewall + netconfig over Tailscale
@@ -141,7 +141,7 @@ With the `dhcp` tag, a separate registry surface serves DHCP, DNS and device ide
 `GetSuggestions`, `ImportLeases`, `ImportObservations`, `ReportHost`,
 `RepairIdentity` and `DHCPHandover` (takeover, verification, history, and warm
 standby promotion; `dnsmasq` adds the handover). See [docs/dhcp.md](docs/dhcp.md). Beyond `firewall` and
-`netconfig`, the optional `dhcp-v1` (`dhcp`) and `mdns-v1` (`mdns`) domains ride the same lease.
+`netconfig`, the optional `dhcp-v1` (`dhcp`) and `mdns-v2` (`mdns`) domains ride the same lease.
 
 A worked `grpcurl`/`jq` example, including the fresh-connection rule for
 confirmation, is in [docs/operations.md](docs/operations.md).

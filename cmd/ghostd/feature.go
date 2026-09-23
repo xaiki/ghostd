@@ -19,7 +19,7 @@ import (
 //	dhcp      DHCPv4/v6 + authoritative LAN DNS + identity ledger, PD, TFTP, standby
 //	          (requires coredns)
 //	dnsmasq   takeover from, and conversion of, a dnsmasq install (requires dhcp)
-//	mdns      native mDNS: .local for containers, and the mdns-v1 advertisement
+//	mdns      native mDNS: .local for containers, and the mdns-v2 advertisement
 //
 // Each feature lives in <name>_feature.go behind its tag and registers itself
 // from init().

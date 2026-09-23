@@ -226,7 +226,7 @@ func bindingFor(address string) map[string]any {
 	return nil
 }
 
-const firewallDoc = `{"allow_dnat_forward":true,"zones":{"trusted":{"interfaces":["tailscale0"]},"ctr":{"interfaces":["ctr0","ctr1"],"services":["mdns"]},"lan":{"interfaces":["lab0"],"services":["dns","dhcp","mdns","tftp"],"ports":[{"port":%d,"proto":"tcp"}]}}}`
+const firewallDoc = `{"allow_dnat_forward":true,"zones":{"trusted":{"interfaces":["tailscale0"]},"ctr":{"interfaces":["ctr0","ctr1"],"services":["mdns"]},"lan":{"interfaces":["lab0","lab1"],"services":["dns","dhcp","mdns","tftp"],"ports":[{"port":%d,"proto":"tcp"}]}}}`
 
 func target(enabled bool) string {
 	return fmt.Sprintf(`{"scopes":[{"id":"lan","interface":"lab0","subnet":"10.77.0.0/24","server":"10.77.0.1","router":"10.77.0.1","start":"10.77.0.10","end":"10.77.0.30","zone":"lab.home.arpa","lease_seconds":600,"enabled":%t}],"devices":[]}`, enabled)
@@ -447,11 +447,35 @@ func dnsPhase() {
 	mdnsPhase()
 }
 
-const mdnsAdvert = `{"interfaces":["lab0"],"host":"nas","reflect":[{"lan":"lab0","network":"ctr0","allow_services":["_ipp._tcp"],"advertise":{"services":["_ipp._tcp"],"ports":"20000-20099"}},{"lan":"lab0","network":"ctr1","allow_services":["_googlecast._tcp"]}],"records":[{"service":"_smb._tcp","instance":"NAS Share","port":445},{"service":"_ipp._tcp","instance":"Shared Queue","port":631,"txt":["rp=ipp/print"],"subtypes":["_universal"]}]}`
+// The lab's relay topology, one rule per direction. lab0 is the LAN the printer
+// and the speaker are on, lab1 a second LAN domain (a stand-in for a VLAN) that
+// has no responder of its own, so everything it hears came through a rule, and
+// ctr0/ctr1 the container networks. mdnsAdvert adds the one hop that carries the
+// speaker into lab1: with it, lab0 -> ctr1 -> lab1 gives lab1's client the
+// speaker through a composed pair, with no rule from lab0 to lab1 for it.
+const (
+	mdnsRecords = `,"records":[{"service":"_smb._tcp","instance":"NAS Share","port":445},{"service":"_ipp._tcp","instance":"Shared Queue","port":631,"txt":["rp=ipp/print"],"subtypes":["_universal"]}]}`
+
+	mdnsRules = `{"from":"lab0","to":"ctr0","allow_services":["_ipp._tcp"]},` +
+		`{"from":"lab0","to":"ctr1","allow_services":["_googlecast._tcp"]},` +
+		`{"from":"ctr0","to":"lab0","advertise":{"services":["_ipp._tcp"],"ports":"20000-20099"}},` +
+		`{"from":"lab0","to":"lab1","allow_services":["_ipp._tcp"]}`
+
+	mdnsHop = `,{"from":"ctr1","to":"lab1","allow_services":["_googlecast._tcp"]}`
+
+	// mdnsAdvertNoHop is the same topology without the ctr1 -> lab1 rule: the
+	// counterfactual the composition check changes exactly one rule against.
+	mdnsAdvertNoHop = `{"interfaces":["lab0"],"host":"nas","reflect":[` + mdnsRules + `]` + mdnsRecords
+	mdnsAdvert      = `{"interfaces":["lab0"],"host":"nas","reflect":[` + mdnsRules + mdnsHop + `]` + mdnsRecords
+)
 
 // zc asks the LAN's multicast DNS as another host would: python-zeroconf, an
 // independent implementation, inside the printer's namespace.
 func zc(args ...string) string { return zcIn("printer", "10.77.0.60", args...) }
+
+// zcViewer asks from the second LAN domain, which has no responder of its own:
+// everything it sees was exported into it by a rule.
+func zcViewer(args ...string) string { return zcIn("viewer", "10.78.0.60", args...) }
 
 // zcIn runs the client inside a namespace, bound to that namespace's address.
 func zcIn(ns, addr string, args ...string) string {
@@ -509,9 +533,9 @@ func natPhase() {
 func mdnsPhase() {
 	const smb, smbName = "_smb._tcp.local.", "NAS Share._smb._tcp.local."
 	step("mDNS advertisement: ghostd answers for the declared record set (no other responder on the host)")
-	lease, err := apply("mdns-v1", mdnsAdvert, 60)
-	must(err, "apply mdns-v1")
-	must(confirm(lease), "confirm mdns-v1")
+	lease, err := apply("mdns-v2", mdnsAdvertNoHop, 60)
+	must(err, "apply mdns-v2")
+	must(confirm(lease), "confirm mdns-v2")
 	var info string
 	eventually("a third-party client to resolve the SMB instance", 30*time.Second, func() bool {
 		info = zc("info", smb, smbName)
@@ -528,7 +552,7 @@ func mdnsPhase() {
 	r := ask("100.64.0.1", "nas.local.", dns.TypeA)
 	check(r != nil && len(r.Answer) == 1, "ghostd's own resolver finds nas.local through the LAN")
 
-	step("mDNS reflector: each container network sees only its own service classes from the LAN")
+	step("mDNS relay: each domain hears only the directions written to it")
 	// ctr0 may browse printers: the avahi printer on the LAN appears in its multicast domain.
 	var seen string
 	eventually("the LAN printer to be reflected into ctr0", 30*time.Second, func() bool {
@@ -543,12 +567,34 @@ func mdnsPhase() {
 	check(strings.Contains(zcIn("cnt1", "10.91.0.10", "browse", "_googlecast._tcp.local."), "Lobby Speaker"), "ctr1 sees the speaker")
 	check(zcIn("cnt1", "10.91.0.10", "browse", "_ipp._tcp.local.") == "", "and not the printer")
 	check(zcIn("cnt1", "10.91.0.10", "info", "_ipp._tcp.local.", "Lobby Printer._ipp._tcp.local.") == "none", "not even by name")
+	// lab1 has no responder of its own, so everything it hears came through a
+	// rule: the class it is allowed, and nothing else.
+	var observer string
+	eventually("the LAN printer to reach the second LAN domain", 30*time.Second, func() bool {
+		observer = zcViewer("browse", "_ipp._tcp.local.")
+		return strings.Contains(observer, "Lobby Printer")
+	})
+	check(zcViewer("browse", smb) == "", "a class no rule exports into it stays out: %q", observer)
+	check(zcViewer("browse", "_googlecast._tcp.local.") == "", "the speaker has no path into it yet")
+
+	step("mDNS relay: a rule composes, and the hop it composes through is the only thing that changes")
+	// The one difference is the ctr1 -> lab1 rule: with it, lab0's speaker reaches
+	// lab1 through a composed pair (lab0 -> ctr1 -> lab1), with no rule from lab0
+	// into lab1 naming that class.
+	l1, err := apply("mdns-v2", mdnsAdvert, 60)
+	must(err, "apply the hop")
+	must(confirm(l1), "confirm the hop")
+	eventually("the speaker to reach lab1 through the container network", 30*time.Second, func() bool {
+		return strings.Contains(zcViewer("browse", "_googlecast._tcp.local."), "Lobby Speaker")
+	})
+	check(strings.Contains(zcViewer("browse", "_ipp._tcp.local."), "Lobby Printer"), "and the class it already had is unchanged")
+	check(zcViewer("browse", smb) == "", "while a class the composed path does not carry still stays out")
 
 	natPhase()
 
 	step("mDNS advertisement: a name another host already owns is refused, and the old set keeps answering")
 	clash := `{"interfaces":["lab0"],"host":"nas","records":[{"service":"_ipp._tcp","instance":"Lobby Printer","port":631}]}`
-	_, err = apply("mdns-v1", clash, 6)
+	_, err = apply("mdns-v2", clash, 6)
 	check(err != nil && strings.Contains(err.Error(), "already advertised"), "advertising over avahi's Lobby Printer is refused (%v)", err)
 	// The failed apply left its lease armed; let it revert on its own, which
 	// also proves the rollback path re-establishes the previous record set.
@@ -557,10 +603,10 @@ func mdnsPhase() {
 	})
 
 	step("mDNS advertisement: an unconfirmed change reverts by itself")
-	eventually("the failed change's lease to lapse", 40*time.Second, func() bool { _, e := apply("mdns-v1", `{}`, 8); return e == nil })
+	eventually("the failed change's lease to lapse", 40*time.Second, func() bool { _, e := apply("mdns-v2", `{}`, 8); return e == nil })
 	check(strings.Contains(zc("info", smb, smbName), "none"), "withdrawn immediately (goodbye)")
 	eventually("timer revert to bring the advertisement back", 60*time.Second, func() bool { return strings.Contains(zc("info", smb, smbName), "port=445") })
-	l2, err := apply("mdns-v1", mdnsAdvert, 60)
+	l2, err := apply("mdns-v2", mdnsAdvert, 60)
 	must(err, "reapply")
 	must(confirm(l2), "confirm reapply")
 }
@@ -705,7 +751,7 @@ func minimalPhase() {
 	must(err, "apply netconfig")
 	must(confirm(lease), "confirm netconfig")
 	step("minimal build: optional domains and RPCs are refused, not half-present")
-	for _, domain := range []string{"dhcp-v1", "mdns-v1"} {
+	for _, domain := range []string{"dhcp-v1", "mdns-v2"} {
 		_, err = apply(domain, `{}`, 30)
 		check(err != nil && strings.Contains(err.Error(), "must be one of"), "%s is not an available domain (%v)", domain, err)
 	}

@@ -33,8 +33,8 @@ func TestServiceApplyValidatesBeforeTouchingTheNetwork(t *testing.T) {
 	if err := s.Apply(Config{Interfaces: []string{"eth0"}, Host: "Bad.Host", Records: bad.Records}); err == nil {
 		t.Fatal("an invalid config reached the sockets")
 	}
-	rule := Config{Reflect: []ReflectRule{{LAN: "ghostd-lan0", Network: "ghostd-ctr0", AllowServices: []string{"_ipp._tcp"}}}}
-	if err := s.Apply(rule); err == nil || !strings.Contains(err.Error(), "ghostd-lan0") {
+	rule := Config{Reflect: []ReflectRule{{From: "ghostd-ctr0", To: "ghostd-lan0", AllowServices: []string{"_ipp._tcp"}}}}
+	if err := s.Apply(rule); err == nil || !strings.Contains(err.Error(), "ghostd-ctr0") {
 		t.Fatal("a reflect rule on a missing interface:", err)
 	}
 	s.Close()
@@ -103,14 +103,14 @@ func TestNATSweeperWithdrawsExpiredInstances(t *testing.T) {
 	natSweep = 20 * time.Millisecond
 	defer func() { natSweep = saved }()
 	fake := &fakeNAT{}
-	rule := ReflectRule{LAN: "lab0", Network: "ctr0", Advertise: &NATConfig{Services: []string{"_ipp._tcp"}, Ports: "20000-20099"}}
-	n, _ := newNATRule(rule, 1, ctrSubnet, nil)
+	rule := ReflectRule{From: "ctr0", To: "lab0", Advertise: &NATConfig{Services: []string{"_ipp._tcp"}, Ports: "20000-20099"}}
+	n, _ := newNATRule(rule, 10, 1, newPorts(), ctrSubnet, nil)
 	r := &running{
 		a: answerer{addrs: func(string) ([]netip.Prefix, error) {
 			return []netip.Prefix{netip.MustParsePrefix("10.77.0.1/24")}, nil
 		}},
 		ifaces: map[int]net.Interface{1: {Index: 1, Name: "lab0"}, 10: {Index: 10, Name: "ctr0"}}, advertise: map[int]bool{}, done: make(chan struct{}),
-		nats: []*natRule{n}, natRunner: fake, rules: []*reflectRule{{cfg: rule, f: newFilter(nil), lan: 1, net: 10}},
+		nats: []*natRule{n}, natRunner: fake,
 	}
 	var goodbyes atomic.Int64
 	r.testEmit = func(idx int, m *dns.Msg) {

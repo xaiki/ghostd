@@ -3,7 +3,9 @@
 package mdns
 
 import (
+	"fmt"
 	"net"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -135,68 +137,228 @@ func TestReflectedQueriesAreLimitedToWhatTheNetworkMayAsk(t *testing.T) {
 	}
 }
 
-func TestRulesAreIndependentPerNetworkAndDirectional(t *testing.T) {
-	r := &running{a: testAnswerer(), ifaces: map[int]net.Interface{}, advertise: map[int]bool{}, done: make(chan struct{})}
-	r.rules = []*reflectRule{
-		{cfg: ReflectRule{LAN: "lab0", Network: "ctr0"}, f: newFilter([]string{"_ipp._tcp"}), lan: 1, net: 10},
-		{cfg: ReflectRule{LAN: "lab0", Network: "ctr1"}, f: newFilter([]string{"_googlecast._tcp"}), lan: 1, net: 11},
+// A wildcard rule carries every class, including the enumeration answer — but
+// still only the hosts an allowed service named, exactly as a narrower rule does.
+func TestWildcardCarriesEveryClass(t *testing.T) {
+	f := newFilter([]string{"*"})
+	if got := f.Responses(lanAnnouncement()); got == nil {
+		t.Fatal("a wildcard rule reflected nothing")
+	} else {
+		all := strings.ToLower(names(got.Answer) + names(got.Extra))
+		for _, want := range []string{"_ipp._tcp", "googlecast", "speaker", "printer"} {
+			if !strings.Contains(all, want) {
+				t.Fatalf("a wildcard rule dropped %q: %s", want, all)
+			}
+		}
+		if strings.Contains(all, "laptop") {
+			t.Fatalf("a wildcard rule carried a host no service named: %s", all)
+		}
 	}
-	r.ifaces[1], r.ifaces[10], r.ifaces[11] = net.Interface{Index: 1, Name: "lab0"}, net.Interface{Index: 10, Name: "ctr0"}, net.Interface{Index: 11, Name: "ctr1"}
+	q := new(dns.Msg)
+	q.SetQuestion("_smb._tcp.local.", dns.TypePTR)
+	if f.Queries(q) == nil {
+		t.Fatal("a wildcard rule blocked a class")
+	}
+	if !f.allowedName("x._anything._tcp.local.") {
+		t.Fatal("a wildcard rule must allow a class it was never told about")
+	}
+}
+
+// packedMsg and srcAt drive running.handle the way a socket would.
+func packedMsg(t *testing.T, m *dns.Msg) []byte {
+	t.Helper()
+	b, err := m.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func srcAt(ip string) *net.UDPAddr {
+	return &net.UDPAddr{IP: net.ParseIP(ip), Port: wellknown.PortMDNS}
+}
+
+// fixtureRunning builds a running over named interfaces with the given relay
+// rules already planned and indexed.
+func fixtureRunning(t *testing.T, ifaces map[int]string, rules ...*relaying) *running {
+	t.Helper()
+	r := &running{a: testAnswerer(), ifaces: map[int]net.Interface{}, advertise: map[int]bool{}, done: make(chan struct{}),
+		byFrom: map[int][]*relay{}, byTo: map[int][]*relay{}}
+	for idx, name := range ifaces {
+		r.ifaces[idx] = net.Interface{Index: idx, Name: name}
+	}
+	r.relays = planRelays(rules)
+	for _, p := range r.relays {
+		r.byFrom[p.from] = append(r.byFrom[p.from], p)
+		r.byTo[p.to] = append(r.byTo[p.to], p)
+	}
+	return r
+}
+
+func forwarded(r *running) map[int][]*dns.Msg {
 	sent := map[int][]*dns.Msg{}
 	r.testForward = func(idx int, m *dns.Msg) { sent[idx] = append(sent[idx], m) }
-	pack := func(m *dns.Msg) []byte { b, _ := m.Pack(); return b }
-	// The LAN announces: each network receives only its own classes.
-	r.handle(pack(lanAnnouncement()), &net.UDPAddr{IP: net.ParseIP("192.0.2.60"), Port: wellknown.PortMDNS}, 1, false)
-	if len(sent[10]) != 1 || !strings.Contains(strings.ToLower(names(sent[10][0].Answer)), "_ipp._tcp") || strings.Contains(strings.ToLower(names(sent[10][0].Answer)+names(sent[10][0].Extra)), "googlecast") {
-		t.Fatal("ctr0 saw the wrong records:", sent[10])
-	}
-	if len(sent[11]) != 1 || !strings.Contains(strings.ToLower(names(sent[11][0].Answer)), "googlecast") || strings.Contains(strings.ToLower(names(sent[11][0].Answer)+names(sent[11][0].Extra)), "ipp") {
-		t.Fatal("ctr1 saw the wrong records:", sent[11])
+	return sent
+}
+
+// A rule is one direction. Exporting a's services to b says nothing about b's to
+// a: b's records stay where they are, and a's clients cannot ask for them.
+func TestARuleExportsOneDirectionOnly(t *testing.T) {
+	r := fixtureRunning(t, map[int]string{1: "vlan-a", 2: "vlan-b"},
+		&relaying{cfg: ReflectRule{From: "vlan-a", To: "vlan-b", AllowServices: []string{"_ipp._tcp"}}, from: 1, to: 2})
+	sent := forwarded(r)
+
+	r.handle(packedMsg(t, lanAnnouncement()), srcAt("192.0.2.60"), 1, false)
+	if len(sent[2]) != 1 || !strings.Contains(strings.ToLower(names(sent[2][0].Answer)), "_ipp._tcp") {
+		t.Fatal("vlan-a's records were not exported to vlan-b:", sent)
 	}
 	if len(sent[1]) != 0 {
-		t.Fatal("LAN traffic was echoed back to the LAN")
+		t.Fatal("vlan-a's records were echoed back into vlan-a:", sent)
 	}
-	// A container asks: its query reaches the LAN, trimmed; the other network hears nothing.
-	sent = map[int][]*dns.Msg{}
+
+	// vlan-b's records do not reach vlan-a.
+	clear(sent)
+	r.handle(packedMsg(t, lanAnnouncement()), srcAt("192.0.2.61"), 2, false)
+	if len(sent) != 0 {
+		t.Fatal("writing one direction opened the other:", sent)
+	}
+
+	// A question on vlan-b reaches vlan-a, whose services are the ones exported.
 	q := new(dns.Msg)
-	q.SetQuestion("_googlecast._tcp.local.", dns.TypePTR)
-	r.handle(pack(q), &net.UDPAddr{IP: net.ParseIP("10.90.0.10"), Port: wellknown.PortMDNS}, 10, false)
-	if len(sent) != 0 {
-		t.Fatal("ctr0 may not browse googlecast, yet a query left:", sent)
-	}
 	q.SetQuestion("_ipp._tcp.local.", dns.TypePTR)
-	r.handle(pack(q), &net.UDPAddr{IP: net.ParseIP("10.90.0.10"), Port: wellknown.PortMDNS}, 10, false)
-	if len(sent[1]) != 1 || len(sent[11]) != 0 {
-		t.Fatal("query not forwarded to the LAN only:", sent)
+	clear(sent)
+	r.handle(packedMsg(t, q), srcAt("10.20.0.5"), 2, false)
+	if len(sent[1]) != 1 || len(sent) != 1 {
+		t.Fatal("a question on vlan-b did not reach vlan-a, or reached more:", sent)
 	}
-	// A container's own response is never reflected outward.
-	sent = map[int][]*dns.Msg{}
-	r.handle(pack(lanAnnouncement()), &net.UDPAddr{IP: net.ParseIP("10.90.0.10"), Port: wellknown.PortMDNS}, 10, false)
+
+	// A question on vlan-a goes nowhere: nothing is exported into it.
+	clear(sent)
+	r.handle(packedMsg(t, q), srcAt("10.10.0.5"), 1, false)
 	if len(sent) != 0 {
-		t.Fatal("a container's advertisement leaked to the LAN:", sent)
+		t.Fatal("a question on vlan-a reached a domain that exports nothing:", sent)
+	}
+}
+
+// planRelays is the reachability closure, with the classes of a path being the
+// ones every rule on it allows.
+func TestRelayPlanComposesWithTheNarrowerClassSet(t *testing.T) {
+	plan := planRelays([]*relaying{
+		{cfg: ReflectRule{From: "a", To: "b", AllowServices: []string{"_ipp._tcp"}}, from: 1, to: 2},
+		{cfg: ReflectRule{From: "b", To: "c", AllowServices: []string{"_ipp._tcp", "_smb._tcp"}}, from: 2, to: 3},
+		{cfg: ReflectRule{From: "c", To: "d", AllowServices: []string{"_smb._tcp"}}, from: 3, to: 4},
+	})
+	classes := func(f *filter) string {
+		if f.all {
+			return "*"
+		}
+		var out []string
+		for k := range f.allow {
+			out = append(out, k)
+		}
+		sort.Strings(out)
+		return strings.Join(out, ",")
+	}
+	got := map[string]string{}
+	for _, p := range plan {
+		got[fmt.Sprintf("%d>%d", p.from, p.to)] = classes(p.f)
+	}
+	want := map[string]string{
+		"1>2": "_ipp._tcp",           // the rule itself
+		"2>3": "_ipp._tcp,_smb._tcp", // the rule itself
+		"3>4": "_smb._tcp",           // the rule itself
+		"1>3": "_ipp._tcp",           // a->b->c: only what both allow
+		"2>4": "_smb._tcp",           // b->c->d: only what both allow
+	}
+	for key, carry := range want {
+		if got[key] != carry {
+			t.Fatalf("%s carries %q, want %q (plan: %v)", key, got[key], carry, got)
+		}
+	}
+	// a->b->c->d carries nothing: _ipp dies at c->d, _smb was never at a.
+	if _, ok := got["1>4"]; ok {
+		t.Fatalf("a path whose classes all die still carries a pair: %v", got)
+	}
+	// No direction was opened by composition, and no domain has a pair to itself.
+	for _, absent := range []string{"2>1", "3>2", "4>3", "1>1", "2>2", "3>3", "4>4"} {
+		if _, ok := got[absent]; ok {
+			t.Fatalf("plan invented %s: %v", absent, got)
+		}
+	}
+	if len(plan) != len(want) {
+		t.Fatalf("plan has %d pairs, want %d: %v", len(plan), len(want), got)
+	}
+}
+
+// Two domains exporting to each other are two rules, and the cycle must not
+// become a pair that echoes a domain's own records back into it.
+func TestAMutualPairDoesNotEchoADomainIntoItself(t *testing.T) {
+	r := fixtureRunning(t, map[int]string{1: "a", 2: "b"},
+		&relaying{cfg: ReflectRule{From: "a", To: "b", AllowServices: []string{"*"}}, from: 1, to: 2},
+		&relaying{cfg: ReflectRule{From: "b", To: "a", AllowServices: []string{"*"}}, from: 2, to: 1})
+	if len(r.relays) != 2 {
+		t.Fatalf("a mutual pair must stay two pairs, not grow a self-pair: %+v", r.relays)
+	}
+	sent := forwarded(r)
+	r.handle(packedMsg(t, lanAnnouncement()), srcAt("192.0.2.60"), 1, false)
+	if len(sent[1]) != 0 {
+		t.Fatal("a's own records were echoed back into a through the cycle:", sent)
+	}
+	if len(sent[2]) != 1 {
+		t.Fatal("a's records did not reach b:", sent)
+	}
+}
+
+// A record's source interface is the domain, not the packet: an interface that
+// is only ever a destination reflects nothing.
+func TestADestinationOnlyDomainReflectsNothing(t *testing.T) {
+	r := fixtureRunning(t, map[int]string{1: "a", 2: "b"},
+		&relaying{cfg: ReflectRule{From: "a", To: "b", AllowServices: []string{"*"}}, from: 1, to: 2})
+	sent := forwarded(r)
+	// A third interface that no rule names is not a domain at all.
+	r.ifaces[3] = net.Interface{Index: 3, Name: "unrelated"}
+	r.handle(packedMsg(t, lanAnnouncement()), srcAt("192.0.2.70"), 3, false)
+	q := new(dns.Msg)
+	q.SetQuestion("_ipp._tcp.local.", dns.TypePTR)
+	r.handle(packedMsg(t, q), srcAt("192.0.2.71"), 3, false)
+	if len(sent) != 0 {
+		t.Fatal("an interface no rule names took part in the relay:", sent)
 	}
 }
 
 func TestReflectConfigValidation(t *testing.T) {
-	good := `{"reflect":[{"lan":"eth0","network":"podman-print","allow_services":["_ipp._tcp"]},{"lan":"eth0","network":"podman-music","allow_services":["_googlecast._tcp"]}]}`
+	good := `{"reflect":[{"from":"eth0","to":"podman-print","allow_services":["_ipp._tcp"]},{"from":"podman-music","to":"eth0","allow_services":["_googlecast._tcp"]},{"from":"podman-print","to":"eth2","advertise":{"services":["_ipp._tcp"],"ports":"20000-20099"}}]}`
 	c, err := ParseConfig([]byte(good))
 	if err != nil || c.Empty() || len(c.Records) != 0 {
-		t.Fatal("a pure reflector needs no records, host or advertising interfaces:", err)
+		t.Fatal("a pure relay needs no records, host or advertising interfaces:", err)
+	}
+	// A wildcard rule needs no class list, and both directions of a pair are two
+	// independent rules.
+	for _, doc := range []string{
+		`{"reflect":[{"from":"a","to":"b","allow_services":["*"]}]}`,
+		`{"reflect":[{"from":"a","to":"b","allow_services":["*"]},{"from":"b","to":"a","allow_services":["*"]}]}`,
+	} {
+		if _, err := ParseConfig([]byte(doc)); err != nil {
+			t.Fatalf("%s rejected: %v", doc, err)
+		}
 	}
 	for name, doc := range map[string]string{
-		"no services":        `{"reflect":[{"lan":"eth0","network":"p","allow_services":[]}]}`,
-		"bad service":        `{"reflect":[{"lan":"eth0","network":"p","allow_services":["ipp"]}]}`,
-		"same interface":     `{"reflect":[{"lan":"eth0","network":"eth0","allow_services":["_ipp._tcp"]}]}`,
-		"network twice":      `{"reflect":[{"lan":"eth0","network":"p","allow_services":["_ipp._tcp"]},{"lan":"eth0","network":"p","allow_services":["_smb._tcp"]}]}`,
-		"lan is a network":   `{"reflect":[{"lan":"eth0","network":"p","allow_services":["_ipp._tcp"]},{"lan":"p","network":"q","allow_services":["_ipp._tcp"]}]}`,
-		"bad interface name": `{"reflect":[{"lan":"eth 0","network":"p","allow_services":["_ipp._tcp"]}]}`,
+		"neither":                 `{"reflect":[{"from":"eth0","to":"p"}]}`,
+		"both":                    `{"reflect":[{"from":"eth0","to":"p","allow_services":["_ipp._tcp"],"advertise":{"services":["_ipp._tcp"],"ports":"20000-20099"}}]}`,
+		"bad service":             `{"reflect":[{"from":"eth0","to":"p","allow_services":["ipp"]}]}`,
+		"wildcard beside a class": `{"reflect":[{"from":"eth0","to":"p","allow_services":["*","_ipp._tcp"]}]}`,
+		"same interface":          `{"reflect":[{"from":"eth0","to":"eth0","allow_services":["_ipp._tcp"]}]}`,
+		"direction twice":         `{"reflect":[{"from":"eth0","to":"p","allow_services":["_ipp._tcp"]},{"from":"eth0","to":"p","allow_services":["_smb._tcp"]}]}`,
+		"bad interface name":      `{"reflect":[{"from":"eth 0","to":"p","allow_services":["_ipp._tcp"]}]}`,
+		"missing to":              `{"reflect":[{"from":"eth0","allow_services":["_ipp._tcp"]}]}`,
+		"one pool disagrees":      `{"reflect":[{"from":"a","to":"eth0","advertise":{"services":["_ipp._tcp"],"ports":"20000-20099"}},{"from":"b","to":"eth0","advertise":{"services":["_ipp._tcp"],"ports":"20100-20199"}}]}`,
 	} {
 		if _, err := ParseConfig([]byte(doc)); err == nil {
 			t.Errorf("%s accepted", name)
 		}
 	}
 	// Advertising still validates as before when records are present.
-	if _, err := ParseConfig([]byte(`{"host":"nas","records":[{"service":"_smb._tcp","instance":"N","port":445}],"reflect":[{"lan":"eth0","network":"p","allow_services":["_ipp._tcp"]}]}`)); err == nil {
+	if _, err := ParseConfig([]byte(`{"host":"nas","records":[{"service":"_smb._tcp","instance":"N","port":445}],"reflect":[{"from":"eth0","to":"p","allow_services":["_ipp._tcp"]}]}`)); err == nil {
 		t.Fatal("records without interfaces accepted")
 	}
 }

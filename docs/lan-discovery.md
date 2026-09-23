@@ -1,9 +1,9 @@
 # LAN discovery on behalf of containers — design
 
-Build tags: `mdns` (native client, `mdns-v1`) and `coredns` (container resolver,
+Build tags: `mdns` (native client, `mdns-v2`) and `coredns` (container resolver,
 ACL); the two together give containers native `.local`.
 
-Status: **built, including the per-container multicast reflector.** The
+Status: **built, including the directed relay and translation between domains.** The
 decisions this document left open are settled in [What was decided and built](#what-was-decided-and-built)
 below; the analysis after it is kept because it is why those decisions were made.
 
@@ -13,12 +13,12 @@ below; the analysis after it is kept because it is why those decisions were made
 | --- | --- | --- |
 | Retiring avahi breaks `.local` | ghostd owns mDNS **queries** natively: legacy-unicast queries from an ephemeral port, so it never binds UDP 5353. `getent` remains only as a fallback when no interface can send. Lab: no avahi on the host, a third-party responder on the LAN, `.local` still resolves. | `internal/mdns/query.go`, `internal/resolver/resolver.go` |
 | Which ACL shape | **Authenticated unicast browsing.** The identity of a query is the resolver *listener* it arrived on, never a source address. Per-container networks and one shared permission were rejected: the first costs a network per permission set, the second is not an ACL. | `internal/resolver/acl.go` |
-| Reflector | **Built, per container network.** Reflecting into a *shared* bridge cannot carry a per-container permission, but a network per container (or pod) can: the permission is then a property of the network. ghostd relays between the LAN and each container network's bridge through that network's own filter — LAN records for the allowed service classes (plus the SRV/TXT/address records of the instances they name) inward, and only allowed *queries* outward, plus the service-type enumeration, whose answers are filtered like any other record. An app that speaks mDNS itself needs no host networking. Shape (a) remains the escape hatch. | `internal/mdns/reflect.go` |
-| Where the record set is declared | The `mdns-v1` domain: an explicit, reviewable list, riding the ordinary lease, confirmation and rollback. | `internal/mdns/advertise.go`, `internal/rpc/addressbook.go` |
+| Relay | **Built, directional and between named domains.** A rule exports one interface's services to another (`{"from": a, "to": b}`); a record heard on `a` is delivered to `b` and a question heard on `b` is delivered to `a`. Direction is a property of the rule, so one direction says nothing about the other. Rules **compose** into a reachability relation computed at apply time (not by re-reflecting packets, so a forwarded packet can never loop), carrying only the classes every rule on a path allows, with a filter per ordered pair. A domain never receives its own records back. An app that speaks mDNS itself needs no host networking; shape (a) remains the escape hatch. | `internal/mdns/reflect.go` |
+| Where the record set is declared | The `mdns-v2` domain: an explicit, reviewable list, riding the ordinary lease, confirmation and rollback. | `internal/mdns/advertise.go`, `internal/rpc/addressbook.go` |
 | Conflicts | Before advertising, ghostd **probes** each name; a name another host already owns refuses the apply and leaves the previous set running. Lab: avahi owns "Lobby Printer"; advertising over it is refused. | `internal/mdns/service.go` |
 | Records are captured, not recalled | Unchanged. ghostd ships **no** Time Machine record set: supply one captured from a known-good advertisement. | — |
 
-A container's own advertisements go out through an **mDNS NAT**: ghostd re-advertises each instance on the LAN under its own address and a pooled port — keeping the container's own host name, and mapping only an address the container announced on its own network — with a DNAT (in its own nft table, scoped to traffic addressed to ghostd) into the container, so LAN clients find and reach a container service with no host networking. Nothing is asked of the container: it announces as it always would. (`records` still declares what ghostd itself serves.) The ACL, the reflector, the NAT and the mDNS domain are described for operators in [dhcp.md](dhcp.md#per-container-dns-acl)
+A container's own advertisements go out through **translation** (a rule with `advertise`): ghostd re-advertises each instance on the destination interface under its own address there and a pooled port — keeping the container's own host name, and mapping only an address the container announced on its own interface — with a DNAT (in its own nft table, scoped to traffic addressed to ghostd) into the container, so clients on that domain find and reach a container service with no host networking. Translation is terminal at its own rule: it is ghostd's announcement on that interface, not something it exports onward. Nothing is asked of the container: it announces as it always would. (`records` still declares what ghostd itself serves.) The ACL, the relay, the translation and the mDNS domain are described for operators in [dhcp.md](dhcp.md#per-container-dns-acl)
 and [operations.md](operations.md#mdns-advertisement).
 
 ## Analysis (why)

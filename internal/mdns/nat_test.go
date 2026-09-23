@@ -35,12 +35,13 @@ func containerAnnouncement(host string, ip string, instance string, port uint16,
 	return m
 }
 
-// ctrSubnet is the container network the announcements below live on.
+// ctrSubnet is the source interface the announcements below live on.
 func ctrSubnet() []netip.Prefix { return []netip.Prefix{netip.MustParsePrefix("10.90.0.0/24")} }
 
+// natRuleFor is one rule exporting ctr0's services onto lab0.
 func natRuleFor(t *testing.T) *natRule {
 	t.Helper()
-	n, err := newNATRule(ReflectRule{LAN: "lab0", Network: "ctr0", Advertise: &NATConfig{Services: []string{"_ipp._tcp"}, Ports: "20000-20099"}}, 1, ctrSubnet, nil)
+	n, err := newNATRule(ReflectRule{From: "ctr0", To: "lab0", Advertise: &NATConfig{Services: []string{"_ipp._tcp"}, Ports: "20000-20099"}}, 10, 1, newPorts(), ctrSubnet, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,7 +77,7 @@ func TestNATLearnsAndMapsContainerServices(t *testing.T) {
 	if pub = n.published(); len(pub) != 1 || pub[0].instance != "Back Office" {
 		t.Fatal(pub)
 	}
-	if _, used := n.used[first]; used {
+	if _, held := n.pool.held(first); held {
 		t.Fatal("goodbye did not free the port")
 	}
 	// Expiry.
@@ -113,7 +114,7 @@ func TestNATIgnoresWhatIsNotAllowedOrIncomplete(t *testing.T) {
 }
 
 func TestNATPortPoolExhaustionAndRange(t *testing.T) {
-	n, _ := newNATRule(ReflectRule{LAN: "lab0", Network: "ctr0", Advertise: &NATConfig{Services: []string{"_ipp._tcp"}, Ports: "20000-20001"}}, 1, ctrSubnet, nil)
+	n, _ := newNATRule(ReflectRule{From: "ctr0", To: "lab0", Advertise: &NATConfig{Services: []string{"_ipp._tcp"}, Ports: "20000-20001"}}, 10, 1, newPorts(), ctrSubnet, nil)
 	for i, ip := range []string{"10.90.0.10", "10.90.0.11", "10.90.0.12"} {
 		n.learn(containerAnnouncement("h"+string(rune('a'+i)), ip, "P"+string(rune('a'+i)), 631, 120))
 	}
@@ -127,13 +128,52 @@ func TestNATPortPoolExhaustionAndRange(t *testing.T) {
 	}
 }
 
+// Two rules publishing on the same interface share one port namespace. With a
+// pool each of its own they could pick the same port, and the DNAT table — which
+// matches on interface and port — would leave one of them unreachable.
+func TestOneInterfacePublishesFromOnePortNamespace(t *testing.T) {
+	pool := newPorts()
+	other := func() []netip.Prefix { return []netip.Prefix{netip.MustParsePrefix("10.91.0.0/24")} }
+	rule := func(from string) ReflectRule {
+		return ReflectRule{From: from, To: "lab0", Advertise: &NATConfig{Services: []string{"_ipp._tcp"}, Ports: "20000-20001"}}
+	}
+	a, _ := newNATRule(rule("ctr0"), 10, 1, pool, ctrSubnet, nil)
+	b, _ := newNATRule(rule("ctr1"), 11, 1, pool, other, nil)
+	// The same instance name and port on two networks: one host name, one port.
+	a.learn(containerAnnouncement("printer", "10.90.0.10", "Office", 631, 120))
+	b.learn(containerAnnouncement("printer", "10.91.0.10", "Office", 631, 120))
+	ap, bp := a.published(), b.published()
+	if len(ap) != 1 || len(bp) != 1 {
+		t.Fatalf("both rules must map their own instance: %+v %+v", ap, bp)
+	}
+	if ap[0].hostPort == bp[0].hostPort {
+		t.Fatalf("two rules on one interface took the same port (%d)", ap[0].hostPort)
+	}
+	var maps []natMapping
+	maps = append(append(maps, a.mappings()...), b.mappings()...)
+	script := renderNAT(maps)
+	if strings.Count(script, `iifname "lab0" fib daddr type local tcp dport `) != 2 {
+		t.Fatal("both mappings must be installed:", script)
+	}
+	// A one-port pool shared by both: the second rule is refused rather than
+	// stealing the first's port.
+	tight := newPorts()
+	c, _ := newNATRule(ReflectRule{From: "ctr0", To: "lab0", Advertise: &NATConfig{Services: []string{"_ipp._tcp"}, Ports: "20000-20000"}}, 10, 1, tight, ctrSubnet, nil)
+	d, _ := newNATRule(ReflectRule{From: "ctr1", To: "lab0", Advertise: &NATConfig{Services: []string{"_ipp._tcp"}, Ports: "20000-20000"}}, 11, 1, tight, other, nil)
+	c.learn(containerAnnouncement("printer", "10.90.0.10", "Office", 631, 120))
+	d.learn(containerAnnouncement("printer", "10.91.0.10", "Office", 631, 120))
+	if len(c.published()) != 1 || len(d.published()) != 0 {
+		t.Fatalf("an exhausted shared pool must refuse the second rule, not collide: %+v %+v", c.published(), d.published())
+	}
+}
+
 func TestRenderNATIsOneAtomicTable(t *testing.T) {
 	if got := renderNAT(nil); !strings.Contains(got, "delete table inet ghostd_mdns_nat") || strings.Contains(got, "chain") {
 		t.Fatal("an empty set must remove the table:", got)
 	}
 	got := renderNAT([]natMapping{
-		{lan: "eth0", proto: "tcp", port: 20002, target: netip.MustParseAddr("10.90.0.11"), tport: 631},
-		{lan: "eth0", proto: "tcp", port: 20001, target: netip.MustParseAddr("10.90.0.10"), tport: 631},
+		{to: "eth0", proto: "tcp", port: 20002, target: netip.MustParseAddr("10.90.0.11"), tport: 631},
+		{to: "eth0", proto: "tcp", port: 20001, target: netip.MustParseAddr("10.90.0.10"), tport: 631},
 	})
 	i1, i2 := strings.Index(got, "dport 20001"), strings.Index(got, "dport 20002")
 	if i1 < 0 || i2 < i1 || !strings.Contains(got, `iifname "eth0" fib daddr type local tcp dport 20001 dnat ip to 10.90.0.10:631`) {
@@ -168,8 +208,8 @@ func (f *fakeNAT) last() string {
 
 func TestContainerServiceIsReadvertisedOnTheLANAndMapped(t *testing.T) {
 	fake := &fakeNAT{}
-	rule := ReflectRule{LAN: "lab0", Network: "ctr0", Advertise: &NATConfig{Services: []string{"_ipp._tcp"}, Ports: "20000-20099"}}
-	n, _ := newNATRule(rule, 1, ctrSubnet, nil)
+	rule := ReflectRule{From: "ctr0", To: "lab0", Advertise: &NATConfig{Services: []string{"_ipp._tcp"}, Ports: "20000-20099"}}
+	n, _ := newNATRule(rule, 10, 1, newPorts(), ctrSubnet, nil)
 	r := &running{
 		a: answerer{cfg: Config{}, addrs: func(iface string) ([]netip.Prefix, error) {
 			if iface == "lab0" {
@@ -179,7 +219,6 @@ func TestContainerServiceIsReadvertisedOnTheLANAndMapped(t *testing.T) {
 		}},
 		ifaces: map[int]net.Interface{1: {Index: 1, Name: "lab0"}, 10: {Index: 10, Name: "ctr0"}}, advertise: map[int]bool{}, done: make(chan struct{}),
 		nats: []*natRule{n}, natRunner: fake,
-		rules: []*reflectRule{{cfg: rule, f: newFilter(nil), lan: 1, net: 10}},
 	}
 	var emitted []*dns.Msg
 	r.testEmit = func(idx int, m *dns.Msg) {
@@ -306,8 +345,8 @@ func TestNATMapsOnlyTheContainersOwnNetworkAddress(t *testing.T) {
 // The LAN sees the instance under the name the container advertised, unless
 // ghostd advertises that name itself or it is not one plain .local label.
 func TestNATKeepsTheContainersOwnName(t *testing.T) {
-	rule := ReflectRule{LAN: "lab0", Network: "ctr0", Advertise: &NATConfig{Services: []string{"_ipp._tcp"}, Ports: "20000-20099"}}
-	n, err := newNATRule(rule, 1, ctrSubnet, map[string]bool{"nas": true})
+	rule := ReflectRule{From: "ctr0", To: "lab0", Advertise: &NATConfig{Services: []string{"_ipp._tcp"}, Ports: "20000-20099"}}
+	n, err := newNATRule(rule, 10, 1, newPorts(), ctrSubnet, map[string]bool{"nas": true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -340,16 +379,16 @@ func TestNATKeepsTheContainersOwnName(t *testing.T) {
 	}
 }
 
-func TestNATConfigValidationAndCoexistenceWithFilteredReflection(t *testing.T) {
-	good := `{"reflect":[{"lan":"eth0","network":"p","advertise":{"services":["_ipp._tcp"],"ports":"20000-20099"}}]}`
+func TestNATConfigValidation(t *testing.T) {
+	good := `{"reflect":[{"from":"p","to":"eth0","advertise":{"services":["_ipp._tcp"],"ports":"20000-20099"}}]}`
 	if c, err := ParseConfig([]byte(good)); err != nil || c.Reflect[0].Advertise == nil {
 		t.Fatal("advertise-only rule (no allow_services):", err)
 	}
 	for name, doc := range map[string]string{
-		"no services": `{"reflect":[{"lan":"eth0","network":"p","advertise":{"services":[],"ports":"20000-20099"}}]}`,
-		"bad ports":   `{"reflect":[{"lan":"eth0","network":"p","advertise":{"services":["_ipp._tcp"],"ports":"80-90"}}]}`,
-		"bad service": `{"reflect":[{"lan":"eth0","network":"p","advertise":{"services":["ipp"],"ports":"20000-20099"}}]}`,
-		"neither":     `{"reflect":[{"lan":"eth0","network":"p"}]}`,
+		"no services": `{"reflect":[{"from":"p","to":"eth0","advertise":{"services":[],"ports":"20000-20099"}}]}`,
+		"bad ports":   `{"reflect":[{"from":"p","to":"eth0","advertise":{"services":["_ipp._tcp"],"ports":"80-90"}}]}`,
+		"bad service": `{"reflect":[{"from":"p","to":"eth0","advertise":{"services":["ipp"],"ports":"20000-20099"}}]}`,
+		"neither":     `{"reflect":[{"from":"p","to":"eth0"}]}`,
 	} {
 		if _, err := ParseConfig([]byte(doc)); err == nil {
 			t.Errorf("%s accepted", name)

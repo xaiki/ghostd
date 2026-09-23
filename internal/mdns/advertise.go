@@ -16,8 +16,12 @@ import (
 	"github.com/miekg/dns"
 )
 
-// ConfigFile is the persisted advertisement target (the mdns-v1 domain).
-const ConfigFile = "mdns-config.json"
+// ConfigFile is the persisted advertisement target (the mdns-v2 domain). The v1
+// shape (mdns-v1's {lan, network} rules and its mdns-config.json) is deliberately
+// not read: a v1 document would parse into the wrong topology, so the domain and
+// the key both moved and a host boots unconfigured until the new target is
+// applied.
+const ConfigFile = "mdns-config-v2.json"
 
 // Config declares what ghostd advertises on behalf of things that cannot do it
 // themselves (a container on a bridge). The record set is data the operator
@@ -30,8 +34,9 @@ type Config struct {
 	// addresses of the advertising interface.
 	Host    string   `json:"host"`
 	Records []Record `json:"records"`
-	// Reflect relays mDNS between the LAN and per-container networks, filtered by
-	// what each network may see (see reflect.go).
+	// Reflect relays mDNS between the named interfaces, per direction: each rule
+	// exports one interface's services to another, and rules compose (see
+	// reflect.go).
 	Reflect []ReflectRule `json:"reflect,omitempty"`
 }
 
@@ -415,37 +420,52 @@ func (c Config) validateReflect() error {
 	if len(c.Reflect) > 32 {
 		return fmt.Errorf("mdns: at most 32 reflect rules")
 	}
-	networks := map[string]bool{}
+	// Publishing ports is the DNAT namespace of the interface they are published
+	// on: two rules that publish there share it, so their ranges have to agree on
+	// what "free" means.
+	pools := map[string]string{}
+	seen := map[[2]string]bool{}
 	for _, r := range c.Reflect {
-		for _, n := range []string{r.LAN, r.Network} {
+		for _, n := range []string{r.From, r.To} {
 			if n == "" || len(n) > 15 || strings.ContainsAny(n, " /") {
 				return fmt.Errorf("mdns: bad reflect interface %q", n)
 			}
 		}
-		if r.LAN == r.Network {
-			return fmt.Errorf("mdns: reflect lan and network are both %s", r.LAN)
+		if r.From == r.To {
+			return fmt.Errorf("mdns: reflect %s exports a domain to itself", r.From)
 		}
-		if networks[r.Network] {
-			return fmt.Errorf("mdns: network %s has two reflect rules; a network is one permission set, list its services once", r.Network)
+		key := [2]string{r.From, r.To}
+		if seen[key] {
+			return fmt.Errorf("mdns: %s to %s has two reflect rules; one direction is one permission set, name both directions to open both", r.From, r.To)
 		}
-		networks[r.Network] = true
-		if (len(r.AllowServices) == 0 && r.Advertise == nil) || len(r.AllowServices) > 32 {
-			return fmt.Errorf("mdns: network %s needs 1..32 allow_services", r.Network)
+		seen[key] = true
+		if (len(r.AllowServices) == 0) == (r.Advertise == nil) {
+			return fmt.Errorf("mdns: %s to %s needs exactly one of allow_services and advertise", r.From, r.To)
 		}
+		if len(r.AllowServices) > 32 {
+			return fmt.Errorf("mdns: %s to %s has more than 32 allow_services", r.From, r.To)
+		}
+		wildcard := false
 		for _, s := range r.AllowServices {
+			if s == "*" {
+				wildcard = true
+				continue
+			}
 			if !serviceRE.MatchString(s) {
 				return fmt.Errorf("mdns: %q is not a service class like _ipp._tcp", s)
 			}
 		}
+		if wildcard && len(r.AllowServices) > 1 {
+			return fmt.Errorf("mdns: %s to %s lists \"*\" beside other classes; \"*\" already is every class", r.From, r.To)
+		}
 		if r.Advertise != nil {
 			if err := r.Advertise.validate(); err != nil {
-				return fmt.Errorf("mdns: network %s: %w", r.Network, err)
+				return fmt.Errorf("mdns: %s to %s: %w", r.From, r.To, err)
 			}
-		}
-	}
-	for _, r := range c.Reflect {
-		if networks[r.LAN] {
-			return fmt.Errorf("mdns: %s is both a LAN and a container network", r.LAN)
+			if prev, ok := pools[r.To]; ok && prev != r.Advertise.Ports {
+				return fmt.Errorf("mdns: %s publishes with ports %s and %s; one interface's pool has one range", r.To, prev, r.Advertise.Ports)
+			}
+			pools[r.To] = r.Advertise.Ports
 		}
 	}
 	return nil

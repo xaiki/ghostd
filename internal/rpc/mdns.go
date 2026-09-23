@@ -13,11 +13,15 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-const domainMDNS = "mdns-v1"
+// mdns-v2 is the directed relay and translation domain. mdns-v1 described one
+// LAN and one container bridge per rule with fixed directions; v2 rules are
+// per-direction, so the version moved rather than a v1 document being read as a
+// different topology.
+const domainMDNS = "mdns-v2"
 
 // mdnsState is the mdns feature's part of Server.
 type mdnsState struct {
-	// MDNS advertises the mdns-v1 record set; nil disables the domain.
+	// MDNS advertises the mdns-v2 record set; nil disables the domain.
 	MDNS *mdns.Service
 }
 
