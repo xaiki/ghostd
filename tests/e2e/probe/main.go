@@ -451,8 +451,12 @@ func dnsPhase() {
 // and the speaker are on, lab1 a second LAN domain (a stand-in for a VLAN) that
 // has no responder of its own, so everything it hears came through a rule, and
 // ctr0/ctr1 the container networks. mdnsAdvert adds the one hop that carries the
-// speaker into lab1: with it, lab0 -> ctr1 -> lab1 gives lab1's client the
-// speaker through a composed pair, with no rule from lab0 to lab1 for it.
+// speaker into lab1: with it, lab0 -> ctr* -> lab1 gives lab1's client the
+// speaker through a composed pair, with no rule from lab0 to lab1 for it. That
+// hop names the container bridges by *pattern* — the way the stack names them,
+// since Podman picks their names — so it also proves the daemon expands an
+// endpoint to every interface it matches: `ctr*` is both container networks, and
+// treating it as a literal name would refuse the apply outright.
 const (
 	mdnsRecords = `,"records":[{"service":"_smb._tcp","instance":"NAS Share","port":445},{"service":"_ipp._tcp","instance":"Shared Queue","port":631,"txt":["rp=ipp/print"],"subtypes":["_universal"]}]}`
 
@@ -461,7 +465,7 @@ const (
 		`{"from":"ctr0","to":"lab0","advertise":{"services":["_ipp._tcp"],"ports":"20000-20099"}},` +
 		`{"from":"lab0","to":"lab1","allow_services":["_ipp._tcp"]}`
 
-	mdnsHop = `,{"from":"ctr1","to":"lab1","allow_services":["_googlecast._tcp"]}`
+	mdnsHop = `,{"from":"ctr*","to":"lab1","allow_services":["_googlecast._tcp"]}`
 
 	// mdnsAdvertNoHop is the same topology without the ctr1 -> lab1 rule: the
 	// counterfactual the composition check changes exactly one rule against.

@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"path"
 	"regexp"
 	"sort"
 	"strings"
@@ -95,6 +96,11 @@ func (c Config) Validate() error {
 	for _, i := range c.Interfaces {
 		if i == "" || len(i) > 15 || strings.ContainsAny(i, " /") {
 			return fmt.Errorf("mdns: bad interface %q", i)
+		}
+		// A pattern is for a reflect endpoint: the advertised half is where ghostd
+		// answers for records an operator supplied, so it names its interfaces.
+		if strings.ContainsAny(i, "*?[") {
+			return fmt.Errorf("mdns: advertised interface %q must be named, not a pattern", i)
 		}
 	}
 	if !hostRE.MatchString(c.Host) {
@@ -430,7 +436,17 @@ func (c Config) validateReflect() error {
 			if n == "" || len(n) > 15 || strings.ContainsAny(n, " /") {
 				return fmt.Errorf("mdns: bad reflect interface %q", n)
 			}
+			// An endpoint may be a pattern — how the container bridges are named,
+			// since Podman picks their names — so its syntax is checked here and
+			// resolved against the interfaces that exist when it is applied.
+			if strings.ContainsAny(n, "*?[") {
+				if _, err := path.Match(n, ""); err != nil {
+					return fmt.Errorf("mdns: bad reflect interface pattern %q", n)
+				}
+			}
 		}
+		// A pattern on both sides would be a rule whose endpoints are the same
+		// token, which is indistinguishable from a domain exporting to itself.
 		if r.From == r.To {
 			return fmt.Errorf("mdns: reflect %s exports a domain to itself", r.From)
 		}

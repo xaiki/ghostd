@@ -18,7 +18,11 @@ import (
 // become visible on to — a record heard on from is delivered to to, and a
 // question heard on to is delivered to from so from's own responders answer it.
 // Direction belongs to the rule, so {from: a, to: b} and {from: b, to: a} are
-// independent permissions and writing one says nothing about the other.
+// independent permissions and writing one says nothing about the other. An
+// endpoint may also be a pattern, resolved when the target is applied to every
+// interface it matches (service.go's endpoints): the container bridges are named
+// that way, since Podman picks their names, and one such rule becomes one rule
+// per bridge.
 //
 // Rules compose into a reachability relation: if a's services reach b and b's
 // reach c then a's reach c, and the same rules carry the question back the other

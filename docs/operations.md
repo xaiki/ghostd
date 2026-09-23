@@ -218,6 +218,22 @@ own responders answer it. Writing one direction says nothing about the other —
 independent permission — and a domain can only discover what is exported *into*
 it, so an interface no rule names takes no part in the relay at all.
 
+An endpoint is one interface, or a **pattern** for the interfaces that exist when
+the target is applied: the stack names the container bridges `podman*`, because
+Podman picks their names and no inventory can hold them, and the daemon resolves
+that to the bridges it matches — the same set its input rule admits container mDNS
+from. One rule naming a pattern becomes one rule per interface it matched, each
+with its own filter (and, for `advertise`, its own published host name and port
+slot). The rule is **stored and read back as written**: resolution never rewrites
+the target, so a caller diffing its own document reads `podman*` and not whichever
+bridge happened to be up. A pattern that matches nothing usable — no interface at
+all, or one that is down or cannot carry multicast — refuses the apply rather than
+quietly relaying nowhere, and the daemon retries it every few seconds until the
+bridge is there. A bridge that first appears after a successful apply is picked up
+on the next apply; the daemon does not re-resolve on its own. Patterns are for
+`reflect` endpoints only: `interfaces` names the interfaces ghostd advertises its
+own records on.
+
 **Rules compose.** If a's services reach b and b's reach c, then a's reach c, and
 the question travels back along the same path. The relation is computed when the
 configuration is applied, not by re-reflecting packets, so a forwarded packet is

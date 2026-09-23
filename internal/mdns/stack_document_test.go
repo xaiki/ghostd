@@ -18,6 +18,18 @@ import (
 // is silent on both sides: the stack sends, the daemon refuses, and nothing in
 // the relay is reached.
 func TestTheStacksMDNSDocumentParses(t *testing.T) {
+	// The relay half of the documents below: the four flows, with the container
+	// bridges named by the daemon's own pattern (the stack cannot name them —
+	// Podman picks the names) and every other endpoint a segment the machine's
+	// zones admit mDNS on.
+	const reflectorRules = `{"from": "podman*", "to": "end0.70", "allow_services": ["*"]},` +
+		`{"from": "podman*", "to": "end0.50", "allow_services": ["*"]},` +
+		`{"from": "end0.70", "to": "podman*", "allow_services": ["*"]},` +
+		`{"from": "end0", "to": "tailscale0", "allow_services": ["*"]},` +
+		`{"from": "end0.70", "to": "tailscale0", "allow_services": ["*"]},` +
+		`{"from": "end0.50", "to": "tailscale0", "allow_services": ["*"]},` +
+		`{"from": "podman*", "to": "tailscale0", "allow_services": ["*"]}`
+
 	const (
 		// desired_document() for a machine that only advertises — the stack's own
 		// DESIRED literal: _adisk/_device-info carry port 0 by convention.
@@ -26,28 +38,16 @@ func TestTheStacksMDNSDocumentParses(t *testing.T) {
 			{"service": "_device-info._tcp", "instance": "nas", "port": 0},
 			{"service": "_adisk._tcp", "instance": "nas", "port": 0}]}`
 
-		// A pure reflector: every class on every flow, and records/host still
-		// spelled out empty because the emitter always writes those keys.
-		pureReflector = `{"interfaces": ["end0.70", "podman1"], "host": "", "records": [],
-			"reflect": [
-			{"from": "podman1", "to": "end0.70", "allow_services": ["*"]},
-			{"from": "end0.70", "to": "podman1", "allow_services": ["*"]},
-			{"from": "end0.70", "to": "tailscale0", "allow_services": ["*"]},
-			{"from": "podman1", "to": "tailscale0", "allow_services": ["*"]}]}`
+		// A pure reflector: the advertised half is empty, because that half is what
+		// the machine declared to advertise and a reflector declares nothing — its
+		// domains are derived, and the container bridges by pattern.
+		pureReflector = `{"interfaces": [], "host": "", "records": [], "reflect": [` + reflectorRules + `]}`
 
-		// Both halves, the four flows of a machine that reflects and advertises:
-		// media (70), guest (50), the container bridge, and the overlay each
-		// domain reaches.
-		bothHalves = `{"interfaces": ["end0", "end0.70", "end0.50", "podman1"], "host": "nas",
-			"records": [{"service": "_smb._tcp", "instance": "nas", "port": 445}],
-			"reflect": [
-			{"from": "podman1", "to": "end0.70", "allow_services": ["*"]},
-			{"from": "podman1", "to": "end0.50", "allow_services": ["*"]},
-			{"from": "end0.70", "to": "podman1", "allow_services": ["*"]},
-			{"from": "end0", "to": "tailscale0", "allow_services": ["*"]},
-			{"from": "end0.70", "to": "tailscale0", "allow_services": ["*"]},
-			{"from": "end0.50", "to": "tailscale0", "allow_services": ["*"]},
-			{"from": "podman1", "to": "tailscale0", "allow_services": ["*"]}]}`
+		// Both halves for the same machine shape, once it also advertises: the
+		// advertised half names its interfaces, the relay half is unchanged.
+		bothHalves = `{"interfaces": ["end0.70"], "host": "router",
+			"records": [{"service": "_smb._tcp", "instance": "router", "port": 445}],
+			"reflect": [` + reflectorRules + `]}`
 	)
 	for name, doc := range map[string]string{"advertising": advertising, "pure reflector": pureReflector, "both halves": bothHalves} {
 		if _, err := ParseConfig([]byte(doc)); err != nil {
@@ -58,8 +58,9 @@ func TestTheStacksMDNSDocumentParses(t *testing.T) {
 	// What the daemon echoes back (GetState's mdns_config_json) is what the stack
 	// diffs a desired document against, reading per rule the names `from`, `to`,
 	// `allow_services` (host_mdns_advertise._reflect_key). A rename on either side
+	// — and just as much an expanded `podman1` where the stack sent `podman*` —
 	// would read as permanent drift on a host that is in fact converged, so the
-	// echo is checked against the stack's names, not just re-parsed here.
+	// echo is checked against the stack's names and its own endpoints.
 	c, err := ParseConfig([]byte(bothHalves))
 	if err != nil {
 		t.Fatal(err)
@@ -94,8 +95,8 @@ func TestTheStacksMDNSDocumentParses(t *testing.T) {
 		got[from+" > "+to] = true
 	}
 	for _, want := range []string{
-		"podman1 > end0.70", "podman1 > end0.50", "end0.70 > podman1",
-		"end0 > tailscale0", "end0.70 > tailscale0", "end0.50 > tailscale0", "podman1 > tailscale0",
+		"podman* > end0.70", "podman* > end0.50", "end0.70 > podman*",
+		"end0 > tailscale0", "end0.70 > tailscale0", "end0.50 > tailscale0", "podman* > tailscale0",
 	} {
 		if !got[want] {
 			t.Errorf("the echo dropped %s: %v", want, got)

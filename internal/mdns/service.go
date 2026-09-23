@@ -7,6 +7,8 @@ import (
 	"log"
 	"net"
 	"net/netip"
+	"path"
+	"strings"
 	"sync"
 	"time"
 
@@ -105,70 +107,157 @@ func (s *Service) Close() {
 	}
 }
 
+// plan is a config's rules resolved against the interfaces the host has: the
+// relay edges a pattern expands to, the interfaces they name, and a NAT rule per
+// translated pair.
+type plan struct {
+	ifaces    map[int]net.Interface
+	advertise map[int]bool
+	edges     []*relaying
+	nats      []*natRule
+}
+
+// endpointLimit bounds what one pattern may stand for. A pattern is how the
+// container bridges are named; a token that matches the whole interface table (a
+// bare "*", or a container host's many veths) would otherwise join the mDNS
+// group on every interface and build a relay pair for each, so it is refused
+// rather than obeyed.
+const endpointLimit = 32
+
+// endpoints returns the interfaces one rule endpoint names: the interface
+// itself, or every interface a pattern matches. A pattern is the same token the
+// input chain admits container mDNS with (internal/nft/render.go matches the
+// bridges with `iifname "podman*"`), resolved here against the interfaces that
+// exist now — Podman picks a bridge's own name, so no inventory can hold it.
+//
+// A pattern that stands for nothing is an error, never an empty relay: the
+// watcher retries an apply that failed every few seconds, so a bridge that is
+// not up yet is picked up when it is, where a silent success would leave the
+// host relaying nothing and read as converged.
+func endpoints(name string, all []net.Interface) ([]net.Interface, error) {
+	if !strings.ContainsAny(name, "*?[") {
+		for _, i := range all {
+			if i.Name != name {
+				continue
+			}
+			if i.Flags&net.FlagMulticast == 0 {
+				return nil, fmt.Errorf("mdns: interface %s is not multicast capable", name)
+			}
+			return []net.Interface{i}, nil
+		}
+		return nil, fmt.Errorf("mdns: interface %s: not found", name)
+	}
+	var out []net.Interface
+	unusable := 0
+	for _, i := range all {
+		matched, err := path.Match(name, i.Name)
+		if err != nil {
+			return nil, fmt.Errorf("mdns: bad interface pattern %q: %w", name, err)
+		}
+		if !matched {
+			continue
+		}
+		if i.Flags&net.FlagMulticast == 0 || i.Flags&net.FlagUp == 0 {
+			unusable++
+			continue
+		}
+		out = append(out, i)
+	}
+	switch {
+	case len(out) > endpointLimit:
+		return nil, fmt.Errorf("mdns: pattern %q matches %d interfaces, more than %d", name, len(out), endpointLimit)
+	case len(out) == 0:
+		return nil, fmt.Errorf("mdns: pattern %q matches no usable interface (%d matched but were not up and multicast capable)", name, unusable)
+	}
+	return out, nil
+}
+
+// planRules resolves a config's rules against the interfaces the host has. An
+// endpoint names an interface, or a pattern that stands for every interface it
+// matches, so one rule naming `podman*` becomes one rule per container bridge.
+// Resolution happens here and nowhere else: the config keeps what it was given,
+// which is what the operator — and the stack diffing its own document — reads
+// back.
+func planRules(cfg Config, all []net.Interface, addrs func(string) ([]netip.Prefix, error), reserved map[string]bool) (*plan, error) {
+	pl := &plan{ifaces: map[int]net.Interface{}, advertise: map[int]bool{}}
+	// The advertised half names its interfaces: the records are data an operator
+	// supplies, and where ghostd answers for them is explicit.
+	if len(cfg.Records) > 0 {
+		for _, name := range cfg.Interfaces {
+			matched, err := endpoints(name, all)
+			if err != nil {
+				return nil, err
+			}
+			pl.ifaces[matched[0].Index] = matched[0]
+			pl.advertise[matched[0].Index] = true
+		}
+	}
+	pools := map[int]*ports{}
+	for _, rule := range cfg.Reflect {
+		froms, err := endpoints(rule.From, all)
+		if err != nil {
+			return nil, err
+		}
+		tos, err := endpoints(rule.To, all)
+		if err != nil {
+			return nil, err
+		}
+		for _, resolved := range append(append([]net.Interface{}, froms...), tos...) {
+			pl.ifaces[resolved.Index] = resolved
+		}
+		for _, from := range froms {
+			for _, to := range tos {
+				if from.Index == to.Index {
+					continue // a domain is never its own peer
+				}
+				if rule.Advertise == nil {
+					pl.edges = append(pl.edges, &relaying{cfg: rule, from: from.Index, to: to.Index})
+					continue
+				}
+				// One port namespace per published-on interface: every rule
+				// publishing there allocates from it, so two sources can never be
+				// handed the same DNAT port. Keyed by interface, so two rules that
+				// reach one by different endpoints share it too.
+				pool := pools[to.Index]
+				if pool == nil {
+					pool = newPorts()
+					pools[to.Index] = pool
+				}
+				n, err := newNATRule(rule, from, to, pool, func() []netip.Prefix {
+					subnet, _ := addrs(from.Name)
+					return subnet
+				}, reserved)
+				if err != nil {
+					return nil, err
+				}
+				pl.nats = append(pl.nats, n)
+			}
+		}
+	}
+	return pl, nil
+}
+
 func (s *Service) start(cfg Config) (*running, error) {
 	addrsFor := s.Addrs
 	if addrsFor == nil {
 		addrsFor = InterfaceAddrs
 	}
-	r := &running{a: answerer{cfg: cfg, addrs: addrsFor}, ifaces: map[int]net.Interface{}, advertise: map[int]bool{}, done: make(chan struct{}),
-		byFrom: map[int][]*relay{}, byTo: map[int][]*relay{}}
-	lookup := func(name string) (*net.Interface, error) {
-		i, err := net.InterfaceByName(name)
-		if err != nil {
-			return nil, fmt.Errorf("mdns: interface %s: %w", name, err)
-		}
-		if i.Flags&net.FlagMulticast == 0 {
-			return nil, fmt.Errorf("mdns: interface %s is not multicast capable", name)
-		}
-		r.ifaces[i.Index] = *i
-		return i, nil
+	all, err := net.Interfaces()
+	if err != nil {
+		return nil, fmt.Errorf("mdns: cannot enumerate interfaces: %w", err)
 	}
 	// A name ghostd advertises itself is not one a container may take over.
 	reserved := map[string]bool{}
 	if cfg.Host != "" {
 		reserved[cfg.Host] = true
 	}
-	if len(cfg.Records) > 0 {
-		for _, name := range cfg.Interfaces {
-			i, err := lookup(name)
-			if err != nil {
-				return nil, err
-			}
-			r.advertise[i.Index] = true
-		}
+	pl, err := planRules(cfg, all, addrsFor, reserved)
+	if err != nil {
+		return nil, err
 	}
-	var edges []*relaying
-	pools := map[int]*ports{}
-	for _, rule := range cfg.Reflect {
-		from, err := lookup(rule.From)
-		if err != nil {
-			return nil, err
-		}
-		to, err := lookup(rule.To)
-		if err != nil {
-			return nil, err
-		}
-		if rule.Advertise == nil {
-			edges = append(edges, &relaying{cfg: rule, from: from.Index, to: to.Index})
-			continue
-		}
-		// One port namespace per published-on interface: every rule publishing
-		// there allocates from it, so two sources can never share a DNAT port.
-		pool := pools[to.Index]
-		if pool == nil {
-			pool = newPorts()
-			pools[to.Index] = pool
-		}
-		n, err := newNATRule(rule, from.Index, to.Index, pool, func() []netip.Prefix {
-			subnet, _ := addrsFor(rule.From)
-			return subnet
-		}, reserved)
-		if err != nil {
-			return nil, err
-		}
-		r.nats = append(r.nats, n)
-	}
-	r.relays = planRelays(edges)
+	r := &running{a: answerer{cfg: cfg, addrs: addrsFor}, ifaces: pl.ifaces, advertise: pl.advertise, done: make(chan struct{}),
+		byFrom: map[int][]*relay{}, byTo: map[int][]*relay{}, nats: pl.nats}
+	r.relays = planRelays(pl.edges)
 	for _, p := range r.relays {
 		r.byFrom[p.from] = append(r.byFrom[p.from], p)
 		r.byTo[p.to] = append(r.byTo[p.to], p)

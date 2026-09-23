@@ -156,9 +156,13 @@ type natRule struct {
 	insts  map[string]*natInstance
 	hosts  map[string]natHost
 	pool   *ports
-	from   int // the interface whose instances are learned
-	to     int // the interface they are published on
-	label  string
+	// from and to are the interfaces this rule resolved to: the source whose
+	// instances are learned, and the one they are published on. A rule that named
+	// a pattern has one natRule per pair, each with its own names, so two bridges
+	// never share a published host name or a pool slot.
+	from  net.Interface
+	to    net.Interface
+	label string
 	// subnet is the source domain's own addressing, read when a mapping is made:
 	// an address a source announced elsewhere (its loopback, another network)
 	// names somewhere a client must not be sent. Read lazily, so an interface
@@ -180,7 +184,7 @@ type natHost struct {
 	exp time.Time
 }
 
-func newNATRule(cfg ReflectRule, from, to int, pool *ports, subnet func() []netip.Prefix, reserved map[string]bool) (*natRule, error) {
+func newNATRule(cfg ReflectRule, from, to net.Interface, pool *ports, subnet func() []netip.Prefix, reserved map[string]bool) (*natRule, error) {
 	lo, hi, err := cfg.Advertise.portRange()
 	if err != nil {
 		return nil, err
@@ -192,12 +196,15 @@ func newNATRule(cfg ReflectRule, from, to int, pool *ports, subnet func() []neti
 		pool = newPorts()
 	}
 	return &natRule{cfg: cfg, f: newFilter(cfg.Advertise.Services), lo: lo, hi: hi, insts: map[string]*natInstance{}, hosts: map[string]natHost{},
-		pool: pool, from: from, to: to, label: natLabel(cfg.From), subnet: subnet, reserved: reserved, now: time.Now}, nil
+		pool: pool, from: from, to: to, label: natLabel(from.Name), subnet: subnet, reserved: reserved, now: time.Now}, nil
 }
 
 // owner is what holds a pooled port: the source it is learned from and the
-// instance, so two rules publishing on one interface can never share a port.
-func (n *natRule) owner(i *natInstance) string { return n.cfg.From + "|" + i.key() }
+// instance, so two rules publishing on one interface can never share a port. The
+// source is the resolved interface, not the endpoint as written: two bridges a
+// pattern stood for are two sources, and an instance of the same name on each is
+// not the same instance.
+func (n *natRule) owner(i *natInstance) string { return n.from.Name + "|" + i.key() }
 
 // natLabel is the .local host name the destination sees for a source's services.
 func natLabel(network string) string {
@@ -231,7 +238,7 @@ func protoOf(service string) string {
 // with every other rule publishing there.
 func (n *natRule) allocate(i *natInstance) bool {
 	h := fnv.New32a()
-	fmt.Fprintf(h, "%s|%s|%d", n.cfg.From, i.ip, i.port)
+	fmt.Fprintf(h, "%s|%s|%d", n.from.Name, i.ip, i.port)
 	size := n.hi - n.lo + 1
 	start := int(h.Sum32() % uint32(size))
 	owner := n.owner(i)
@@ -457,7 +464,7 @@ func (n *natRule) published() []*natInstance {
 func (n *natRule) mappings() []natMapping {
 	var out []natMapping
 	for _, i := range n.published() {
-		out = append(out, natMapping{to: n.cfg.To, proto: protoOf(i.service), port: i.hostPort, target: i.ip, tport: i.port})
+		out = append(out, natMapping{to: n.to.Name, proto: protoOf(i.service), port: i.hostPort, target: i.ip, tport: i.port})
 	}
 	return out
 }
@@ -551,14 +558,14 @@ func (r *running) applyNAT() {
 func (r *running) announceNAT(n *natRule, ttl uint32) {
 	a := n.answerer(r.a.addrs)
 	name := ""
-	if i, ok := r.ifaces[n.to]; ok {
+	if i, ok := r.ifaces[n.to.Index]; ok {
 		name = i.Name
 	}
 	if rrs := a.all(name, ttl); len(rrs) > 0 {
 		m := new(dns.Msg)
 		m.Response, m.Authoritative = true, true
 		m.Answer = rrs
-		r.emit(n.to, m)
+		r.emit(n.to.Index, m)
 	}
 	// Whatever left since the last announcement is withdrawn explicitly (TTL 0), so
 	// caches on that interface drop it now instead of after its lifetime.
@@ -575,7 +582,7 @@ func (r *running) announceNAT(n *natRule, ttl uint32) {
 			m := new(dns.Msg)
 			m.Response, m.Authoritative = true, true
 			m.Answer = srvOnly
-			r.emit(n.to, m)
+			r.emit(n.to.Index, m)
 		}
 	}
 }
@@ -583,7 +590,7 @@ func (r *running) announceNAT(n *natRule, ttl uint32) {
 // natLearn is called for a source interface's responses.
 func (r *running) natLearn(m *dns.Msg, ifIndex int) {
 	for _, n := range r.nats {
-		if ifIndex != n.from || !m.Response {
+		if ifIndex != n.from.Index || !m.Response {
 			continue
 		}
 		if n.learn(m) {
@@ -601,7 +608,7 @@ func (r *running) natAnswer(m *dns.Msg, src *net.UDPAddr, ifIndex int, v6 bool) 
 		return
 	}
 	for _, n := range r.nats {
-		if ifIndex != n.to {
+		if ifIndex != n.to.Index {
 			continue
 		}
 		// Answer from what is already known (the service classes and the rule's host
@@ -611,7 +618,7 @@ func (r *running) natAnswer(m *dns.Msg, src *net.UDPAddr, ifIndex int, v6 bool) 
 			r.reply(m, resp, src, ifIndex, v6)
 		}
 		if q := n.f.Queries(m); q != nil {
-			r.forward(q, n.from, v6)
+			r.forward(q, n.from.Index, v6)
 		}
 	}
 }

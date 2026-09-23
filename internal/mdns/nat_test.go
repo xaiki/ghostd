@@ -38,10 +38,16 @@ func containerAnnouncement(host string, ip string, instance string, port uint16,
 // ctrSubnet is the source interface the announcements below live on.
 func ctrSubnet() []netip.Prefix { return []netip.Prefix{netip.MustParsePrefix("10.90.0.0/24")} }
 
+// natIface is one resolved endpoint: a NAT rule carries the interface it
+// resolved to, since a rule naming a pattern becomes one rule per bridge.
+func natIface(index int, name string) net.Interface {
+	return net.Interface{Index: index, Name: name}
+}
+
 // natRuleFor is one rule exporting ctr0's services onto lab0.
 func natRuleFor(t *testing.T) *natRule {
 	t.Helper()
-	n, err := newNATRule(ReflectRule{From: "ctr0", To: "lab0", Advertise: &NATConfig{Services: []string{"_ipp._tcp"}, Ports: "20000-20099"}}, 10, 1, newPorts(), ctrSubnet, nil)
+	n, err := newNATRule(ReflectRule{From: "ctr0", To: "lab0", Advertise: &NATConfig{Services: []string{"_ipp._tcp"}, Ports: "20000-20099"}}, natIface(10, "ctr0"), natIface(1, "lab0"), newPorts(), ctrSubnet, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,7 +120,7 @@ func TestNATIgnoresWhatIsNotAllowedOrIncomplete(t *testing.T) {
 }
 
 func TestNATPortPoolExhaustionAndRange(t *testing.T) {
-	n, _ := newNATRule(ReflectRule{From: "ctr0", To: "lab0", Advertise: &NATConfig{Services: []string{"_ipp._tcp"}, Ports: "20000-20001"}}, 10, 1, newPorts(), ctrSubnet, nil)
+	n, _ := newNATRule(ReflectRule{From: "ctr0", To: "lab0", Advertise: &NATConfig{Services: []string{"_ipp._tcp"}, Ports: "20000-20001"}}, natIface(10, "ctr0"), natIface(1, "lab0"), newPorts(), ctrSubnet, nil)
 	for i, ip := range []string{"10.90.0.10", "10.90.0.11", "10.90.0.12"} {
 		n.learn(containerAnnouncement("h"+string(rune('a'+i)), ip, "P"+string(rune('a'+i)), 631, 120))
 	}
@@ -137,8 +143,8 @@ func TestOneInterfacePublishesFromOnePortNamespace(t *testing.T) {
 	rule := func(from string) ReflectRule {
 		return ReflectRule{From: from, To: "lab0", Advertise: &NATConfig{Services: []string{"_ipp._tcp"}, Ports: "20000-20001"}}
 	}
-	a, _ := newNATRule(rule("ctr0"), 10, 1, pool, ctrSubnet, nil)
-	b, _ := newNATRule(rule("ctr1"), 11, 1, pool, other, nil)
+	a, _ := newNATRule(rule("ctr0"), natIface(10, "ctr0"), natIface(1, "lab0"), pool, ctrSubnet, nil)
+	b, _ := newNATRule(rule("ctr1"), natIface(11, "ctr1"), natIface(1, "lab0"), pool, other, nil)
 	// The same instance name and port on two networks: one host name, one port.
 	a.learn(containerAnnouncement("printer", "10.90.0.10", "Office", 631, 120))
 	b.learn(containerAnnouncement("printer", "10.91.0.10", "Office", 631, 120))
@@ -158,8 +164,8 @@ func TestOneInterfacePublishesFromOnePortNamespace(t *testing.T) {
 	// A one-port pool shared by both: the second rule is refused rather than
 	// stealing the first's port.
 	tight := newPorts()
-	c, _ := newNATRule(ReflectRule{From: "ctr0", To: "lab0", Advertise: &NATConfig{Services: []string{"_ipp._tcp"}, Ports: "20000-20000"}}, 10, 1, tight, ctrSubnet, nil)
-	d, _ := newNATRule(ReflectRule{From: "ctr1", To: "lab0", Advertise: &NATConfig{Services: []string{"_ipp._tcp"}, Ports: "20000-20000"}}, 11, 1, tight, other, nil)
+	c, _ := newNATRule(ReflectRule{From: "ctr0", To: "lab0", Advertise: &NATConfig{Services: []string{"_ipp._tcp"}, Ports: "20000-20000"}}, natIface(10, "ctr0"), natIface(1, "lab0"), tight, ctrSubnet, nil)
+	d, _ := newNATRule(ReflectRule{From: "ctr1", To: "lab0", Advertise: &NATConfig{Services: []string{"_ipp._tcp"}, Ports: "20000-20000"}}, natIface(11, "ctr1"), natIface(1, "lab0"), tight, other, nil)
 	c.learn(containerAnnouncement("printer", "10.90.0.10", "Office", 631, 120))
 	d.learn(containerAnnouncement("printer", "10.91.0.10", "Office", 631, 120))
 	if len(c.published()) != 1 || len(d.published()) != 0 {
@@ -209,7 +215,7 @@ func (f *fakeNAT) last() string {
 func TestContainerServiceIsReadvertisedOnTheLANAndMapped(t *testing.T) {
 	fake := &fakeNAT{}
 	rule := ReflectRule{From: "ctr0", To: "lab0", Advertise: &NATConfig{Services: []string{"_ipp._tcp"}, Ports: "20000-20099"}}
-	n, _ := newNATRule(rule, 10, 1, newPorts(), ctrSubnet, nil)
+	n, _ := newNATRule(rule, natIface(10, "ctr0"), natIface(1, "lab0"), newPorts(), ctrSubnet, nil)
 	r := &running{
 		a: answerer{cfg: Config{}, addrs: func(iface string) ([]netip.Prefix, error) {
 			if iface == "lab0" {
@@ -346,7 +352,7 @@ func TestNATMapsOnlyTheContainersOwnNetworkAddress(t *testing.T) {
 // ghostd advertises that name itself or it is not one plain .local label.
 func TestNATKeepsTheContainersOwnName(t *testing.T) {
 	rule := ReflectRule{From: "ctr0", To: "lab0", Advertise: &NATConfig{Services: []string{"_ipp._tcp"}, Ports: "20000-20099"}}
-	n, err := newNATRule(rule, 10, 1, newPorts(), ctrSubnet, map[string]bool{"nas": true})
+	n, err := newNATRule(rule, natIface(10, "ctr0"), natIface(1, "lab0"), newPorts(), ctrSubnet, map[string]bool{"nas": true})
 	if err != nil {
 		t.Fatal(err)
 	}
